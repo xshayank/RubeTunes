@@ -1,12 +1,12 @@
+# -*- coding: utf-8 -*-
 import os
 import re
-import json
+import asyncio
 import time
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
-from rubpy import Client as RubikaClient
+from rubpy import Client as RubikaClient, filters
 
 
 load_dotenv()
@@ -15,222 +15,145 @@ SESSION = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
-QUEUE_DIR = BASE_DIR / "queue"
-QUEUE_FILE = QUEUE_DIR / "tasks.jsonl"
-PROCESSING_FILE = QUEUE_DIR / "processing.json"
-FAILED_FILE = QUEUE_DIR / "failed.jsonl"
 
-MAX_RETRIES = 5
-RETRY_DELAY = 3
-TARGET = "me"
+YTDLP_BIN = BASE_DIR / "yt-dlp"
+COOKIES_FILE = BASE_DIR / "cookies.txt"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+
+YOUTUBE_RE = re.compile(
+    r'https?://(?:(?:(?:www|m|music)\.)?youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/|v/)|youtu\.be/)[\w\-]+'
+)
+
+PROGRESS_RE = re.compile(
+    r'\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\S+/s)'
+)
+
+UPDATE_INTERVAL = 3.0
 
 
-KEEP_EXTENSIONS = {
-    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v",
-    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
-    ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac",
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-    ".pdf", ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-}
+def make_bar(percent: float, width: int = 10) -> str:
+    filled = round(width * percent / 100)
+    return '\u2588' * filled + '\u2591' * (width - filled)
 
 
-def safe_filename(name: Optional[str]) -> str:
-    name = (name or "file").strip()
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
-    name = name.rstrip(". ")
-    return name[:200] or "file"
-
-
-def remove_extension(name: str) -> str:
-    name = safe_filename(name)
-    if "." in name:
-        name = name.rsplit(".", 1)[0]
-    return name or "file"
-
-
-def unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-
-    stem = path.stem
-    suffix = path.suffix
-    index = 1
-
-    while True:
-        candidate = path.with_name(f"{stem}_{index}{suffix}")
-        if not candidate.exists():
-            return candidate
-        index += 1
-
-
-def has_session(session_name: str) -> bool:
-    candidates = [
-        Path(session_name),
-        Path(f"{session_name}.session"),
-        Path(f"{session_name}.sqlite"),
+def build_ytdlp_cmd(url: str) -> list[str]:
+    ytdlp = str(YTDLP_BIN) if YTDLP_BIN.exists() else "yt-dlp"
+    cmd = [
+        ytdlp,
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "--referer", "https://www.youtube.com/",
+        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]",
+        "--merge-output-format", "mp4",
+        "-o", str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+        "--print", "after_move:filepath",
+        "--newline",
     ]
-    return any(path.exists() for path in candidates)
+    if COOKIES_FILE.exists():
+        cmd += ["--cookies", str(COOKIES_FILE)]
+    cmd.append(url)
+    return cmd
 
 
-def ensure_session():
-    if has_session(SESSION):
+app = RubikaClient(name=SESSION)
+
+
+@app.on_message_updates(filters.is_me, filters.commands("start", prefixes="!"))
+async def start_handler(update):
+    await app.send_message(
+        update.object_guid,
+        "🎬 Welcome!\n\nAvailable commands (send these to Saved Messages):\n"
+        "!download <url> — Download a YouTube video\n"
+        "!start — Show this message"
+    )
+
+
+@app.on_message_updates(filters.is_me, filters.commands("download", prefixes="!"))
+async def download_handler(update):
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    match = YOUTUBE_RE.search(args)
+    object_guid = update.object_guid
+
+    if not match:
+        await app.send_message(
+            object_guid,
+            "❌ Please provide a valid YouTube link.\n"
+            "Example: !download https://youtu.be/abc123"
+        )
         return
 
-    client = RubikaClient(name=SESSION)
+    url = match.group(0)
+    status = await app.send_message(object_guid, "\u23f3 Starting download...")
+    status_id = status.message_id
 
     try:
-        client.start()
-        print("Login successful.")
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
-
-
-def send_document(file_path: str, caption: str = ""):
-    client = RubikaClient(name=SESSION)
-
-    try:
-        client.start()
-        return client.send_document(
-            TARGET,
-            file_path,
-            caption=caption or ""
+        proc = await asyncio.create_subprocess_exec(
+            *build_ytdlp_cmd(url),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
 
+        downloaded_file = None
+        last_update = 0.0
 
-def send_with_retry(file_path: str, caption: str = ""):
-    last_error = None
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            return send_document(file_path, caption)
-        except Exception as e:
-            last_error = e
-            error_text = str(e).lower()
-
-            transient = any(
-                key in error_text
-                for key in [
-                    "502",
-                    "bad gateway",
-                    "timeout",
-                    "cannot connect",
-                    "connection reset",
-                    "temporarily unavailable",
-                    "error uploading chunk",
-                ]
-            )
-
-            if transient and attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY * attempt)
+            if line and not line.startswith("[") and line.endswith(".mp4"):
+                downloaded_file = line
                 continue
 
-            break
+            m = PROGRESS_RE.search(line)
+            if not m:
+                continue
 
-    raise last_error if last_error else RuntimeError("Upload failed.")
+            percent = float(m.group(1))
+            speed = m.group(2)
+            now = time.monotonic()
 
+            if now - last_update >= UPDATE_INTERVAL:
+                last_update = now
+                bar = make_bar(percent)
+                try:
+                    await app.edit_message(
+                        object_guid, status_id,
+                        f"📥 Downloading...\n[{bar}] {percent:.1f}%\n\u26a1 Speed: {speed}"
+                    )
+                except Exception:
+                    pass
 
-def pop_first_task():
-    if not QUEUE_FILE.exists():
-        return None
+        await proc.wait()
 
-    with open(QUEUE_FILE, "r", encoding="utf-8") as file:
-        lines = [line for line in file if line.strip()]
+        if proc.returncode != 0:
+            await app.edit_message(object_guid, status_id, "❌ Download failed. Please try again.")
+            return
 
-    if not lines:
-        return None
+        if not downloaded_file:
+            mp4s = list(DOWNLOAD_DIR.glob("*.mp4"))
+            if mp4s:
+                downloaded_file = str(max(mp4s, key=lambda p: p.stat().st_mtime))
 
-    first_line = lines[0]
-    remaining = lines[1:]
+        if not downloaded_file or not Path(downloaded_file).exists():
+            await app.edit_message(object_guid, status_id, "❌ Downloaded file not found.")
+            return
 
-    with open(QUEUE_FILE, "w", encoding="utf-8") as file:
-        file.writelines(remaining)
-
-    return json.loads(first_line)
-
-
-def save_processing(task: dict) -> None:
-    with open(PROCESSING_FILE, "w", encoding="utf-8") as file:
-        json.dump(task, file, ensure_ascii=False, indent=2)
-
-
-def clear_processing() -> None:
-    if PROCESSING_FILE.exists():
-        PROCESSING_FILE.unlink()
-
-
-def append_failed(task: dict, error: str) -> None:
-    payload = {"task": task, "error": error}
-    with open(FAILED_FILE, "a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def should_keep_extension(filename: str) -> bool:
-    return Path(filename).suffix.lower() in KEEP_EXTENSIONS
-
-
-def process_task(task: dict):
-    task_type = task.get("type")
-    caption = task.get("caption", "")
-
-    if task_type != "local_file":
-        raise RuntimeError("Unknown task type.")
-
-    original_path = Path(task.get("path", ""))
-    if not original_path.exists():
-        raise RuntimeError("Local file not found.")
-
-    if should_keep_extension(original_path.name):
-        send_path = original_path
-    else:
-        clean_name = remove_extension(original_path.name)
-        send_path = unique_path(original_path.parent / clean_name)
+        await app.edit_message(object_guid, status_id, "\u2705 Download complete. Sending...")
+        await app.send_document(object_guid, downloaded_file, caption=url)
 
         try:
-            original_path.rename(send_path)
-        except Exception:
-            send_path = original_path
-
-    try:
-        send_with_retry(str(send_path), caption)
-    finally:
-        try:
-            if send_path.exists():
-                send_path.unlink()
+            Path(downloaded_file).unlink()
         except Exception:
             pass
 
+        await app.edit_message(object_guid, status_id, "\u2705 Done! File sent.")
 
-def worker_loop():
-    ensure_session()
-    print("Rubika worker started.")
-
-    while True:
-        task = pop_first_task()
-
-        if not task:
-            time.sleep(0.2)
-            continue
-
-        save_processing(task)
-
+    except Exception as e:
         try:
-            process_task(task)
-        except Exception as e:
-            append_failed(task, str(e))
-        finally:
-            clear_processing()
+            await app.edit_message(object_guid, status_id, f"❌ Error: {str(e)}")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    worker_loop()
+    app.run()
