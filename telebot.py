@@ -1,8 +1,9 @@
 import os
 import re
 import json
+import asyncio
+import time
 from pathlib import Path
-from typing import Optional
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
@@ -20,6 +21,9 @@ DOWNLOAD_DIR = BASE_DIR / "downloads"
 QUEUE_DIR = BASE_DIR / "queue"
 QUEUE_FILE = QUEUE_DIR / "tasks.jsonl"
 
+YTDLP_BIN = BASE_DIR / "yt-dlp"
+COOKIES_FILE = BASE_DIR / "cookies.txt"
+
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -33,123 +37,131 @@ app = Client(
     bot_token=BOT_TOKEN,
 )
 
+YOUTUBE_RE = re.compile(
+    r'https?://(?:www\.)?(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)[\w\-]+'
+)
 
-def safe_filename(name: Optional[str]) -> str:
-    name = (name or "file.bin").strip()
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
-    name = name.rstrip(". ")
-    return name[:200] or "file.bin"
+PROGRESS_RE = re.compile(
+    r'\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\S+/s)'
+)
 
-
-def split_name(filename: str) -> tuple[str, str]:
-    path = Path(filename)
-    return path.stem, path.suffix
+UPDATE_INTERVAL = 3.0
 
 
-def get_media(message: Message):
-    media_types = [
-        ("document", message.document),
-        ("video", message.video),
-        ("audio", message.audio),
-        ("voice", message.voice),
-        ("photo", message.photo),
-        ("animation", message.animation),
-        ("video_note", message.video_note),
-        ("sticker", message.sticker),
-    ]
-
-    for media_type, media in media_types:
-        if media:
-            return media_type, media
-
-    return None, None
-
-
-def build_download_filename(message: Message, media_type: str, media) -> str:
-    original_name = getattr(media, "file_name", None)
-
-    if not original_name:
-        file_unique_id = getattr(media, "file_unique_id", None) or "file"
-
-        default_extensions = {
-            "document": ".bin",
-            "video": ".mp4",
-            "audio": ".mp3",
-            "voice": ".ogg",
-            "photo": ".jpg",
-            "animation": ".mp4",
-            "video_note": ".mp4",
-            "sticker": ".webp",
-        }
-
-        original_name = f"{file_unique_id}{default_extensions.get(media_type, '.bin')}"
-
-    original_name = safe_filename(original_name)
-    stem, suffix = split_name(original_name)
-
-    unique_name = f"{stem}_{message.id}{suffix or '.bin'}"
-    return safe_filename(unique_name)
+def make_bar(percent: float, width: int = 10) -> str:
+    filled = round(width * percent / 100)
+    return '█' * filled + '░' * (width - filled)
 
 
 def append_task(task: dict) -> None:
-    with open(QUEUE_FILE, "a", encoding="utf-8") as file:
-        file.write(json.dumps(task, ensure_ascii=False) + "\n")
+    with open(QUEUE_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(task, ensure_ascii=False) + "\n")
+
+
+def build_ytdlp_cmd(url: str) -> list[str]:
+    ytdlp = str(YTDLP_BIN) if YTDLP_BIN.exists() else "yt-dlp"
+    cmd = [
+        ytdlp,
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "--referer", "https://www.youtube.com/",
+        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]",
+        "--merge-output-format", "mp4",
+        "-o", str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+        "--print", "after_move:filepath",
+        "--newline",
+    ]
+    if COOKIES_FILE.exists():
+        cmd += ["--cookies", str(COOKIES_FILE)]
+    cmd.append(url)
+    return cmd
 
 
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client: Client, message: Message):
-    await message.reply_text("فایل بفرست.")
-
-
-@app.on_message(
-    filters.private
-    & (
-        filters.document
-        | filters.video
-        | filters.audio
-        | filters.voice
-        | filters.photo
-        | filters.animation
-        | filters.video_note
-        | filters.sticker
+    await message.reply_text(
+        "🎬 لینک یوتیوب رو بفرست تا دانلود و ارسال به روبیکا بشه."
     )
-)
-async def media_handler(client: Client, message: Message):
-    media_type, media = get_media(message)
-    if not media:
-        await message.reply_text("فایل قابل پردازش نیست.")
+
+
+@app.on_message(filters.private & filters.text & ~filters.command("start"))
+async def url_handler(client: Client, message: Message):
+    text = message.text.strip()
+    match = YOUTUBE_RE.search(text)
+
+    if not match:
+        await message.reply_text("❌ لطفاً یک لینک یوتیوب معتبر بفرست.")
         return
 
-    download_name = build_download_filename(message, media_type, media)
-    download_path = DOWNLOAD_DIR / download_name
-
-    status = await message.reply_text("فایل رفت تو صف پردازش و به زودی تو روبیکا ارسال میشه.")
+    url = match.group(0)
+    status = await message.reply_text("⏳ شروع دانلود...")
 
     try:
-        downloaded = await client.download_media(
-            message,
-            file_name=str(download_path)
+        proc = await asyncio.create_subprocess_exec(
+            *build_ytdlp_cmd(url),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
 
-        if not downloaded:
-            raise RuntimeError("Download failed.")
+        downloaded_file = None
+        last_update = 0.0
 
-        downloaded_path = Path(downloaded)
-        if not downloaded_path.exists():
-            raise RuntimeError("Downloaded file not found.")
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
+
+            # yt-dlp prints the final file path via --print after_move:filepath
+            if line and not line.startswith("[") and line.endswith(".mp4"):
+                downloaded_file = line
+                continue
+
+            m = PROGRESS_RE.search(line)
+            if not m:
+                continue
+
+            percent = float(m.group(1))
+            speed = m.group(2)
+            now = time.monotonic()
+
+            if now - last_update >= UPDATE_INTERVAL:
+                last_update = now
+                bar = make_bar(percent)
+                try:
+                    await status.edit_text(
+                        f"📥 در حال دانلود...\n"
+                        f"[{bar}] {percent:.1f}%\n"
+                        f"⚡ سرعت: {speed}"
+                    )
+                except Exception:
+                    pass
+
+        await proc.wait()
+
+        if proc.returncode != 0:
+            await status.edit_text("❌ دانلود با خطا مواجه شد. لطفاً دوباره امتحان کن.")
+            return
+
+        if not downloaded_file:
+            mp4s = list(DOWNLOAD_DIR.glob("*.mp4"))
+            if mp4s:
+                downloaded_file = str(max(mp4s, key=lambda p: p.stat().st_mtime))
+
+        if not downloaded_file or not Path(downloaded_file).exists():
+            await status.edit_text("❌ فایل دانلود شده پیدا نشد.")
+            return
+
+        await status.edit_text("✅ دانلود کامل شد. در صف ارسال به روبیکا قرار گرفت.")
 
         task = {
             "type": "local_file",
-            "path": str(downloaded_path),
-            "caption": message.caption or "",
+            "path": downloaded_file,
+            "caption": url,
             "chat_id": message.chat.id,
             "status_message_id": status.id,
         }
-
         append_task(task)
 
     except Exception as e:
-        await status.edit_text(f"خطا: {str(e)}")
+        await status.edit_text(f"❌ خطا: {str(e)}")
 
 
 if __name__ == "__main__":
