@@ -67,7 +67,7 @@ def build_ytdlp_cmd(url: str) -> list[str]:
 app = RubikaClient(name=SESSION, display_welcome=True)
 
 
-@app.on_message_updates(filters.me & filters.commands("start", prefixes="!"))
+@app.on_message_updates(filters.is_me & filters.commands("start", prefixes="!"))
 async def start_handler(update):
     print("[rub] !start received")
     await app.send_message(
@@ -78,7 +78,7 @@ async def start_handler(update):
     )
 
 
-@app.on_message_updates(filters.me & filters.commands("download", prefixes="!"))
+@app.on_message_updates(filters.is_me & filters.commands("download", prefixes="!"))
 async def download_handler(update):
     print(f"[rub] !download received: {update.text}")
     args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
