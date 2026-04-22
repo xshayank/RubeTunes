@@ -51,7 +51,7 @@ UPDATE_INTERVAL = 3.0
 
 def make_bar(percent: float, width: int = 10) -> str:
     filled = round(width * percent / 100)
-    return '█' * filled + '░' * (width - filled)
+    return '\u2588' * filled + '\u2591' * (width - filled)
 
 
 def append_task(task: dict) -> None:
