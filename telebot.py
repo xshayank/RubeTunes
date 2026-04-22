@@ -81,7 +81,7 @@ def build_ytdlp_cmd(url: str) -> list[str]:
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client: Client, message: Message):
     await message.reply_text(
-        "🎬 لینک یوتیوب رو بفرست تا دانلود و ارسال به روبیکا بشه."
+        "🎬 Send me a YouTube link and I will download it and send it to Rubika."
     )
 
 
@@ -91,11 +91,11 @@ async def url_handler(client: Client, message: Message):
     match = YOUTUBE_RE.search(text)
 
     if not match:
-        await message.reply_text("❌ لطفاً یک لینک یوتیوب معتبر بفرست.")
+        await message.reply_text("❌ Please send a valid YouTube link.")
         return
 
     url = match.group(0)
-    status = await message.reply_text("⏳ شروع دانلود...")
+    status = await message.reply_text("\u23f3 Starting download...")
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -128,9 +128,9 @@ async def url_handler(client: Client, message: Message):
                 bar = make_bar(percent)
                 try:
                     await status.edit_text(
-                        f"📥 در حال دانلود...\n"
+                        f"📥 Downloading...\n"
                         f"[{bar}] {percent:.1f}%\n"
-                        f"⚡ سرعت: {speed}"
+                        f"\u26a1 Speed: {speed}"
                     )
                 except Exception:
                     pass
@@ -138,7 +138,7 @@ async def url_handler(client: Client, message: Message):
         await proc.wait()
 
         if proc.returncode != 0:
-            await status.edit_text("❌ دانلود با خطا مواجه شد. لطفاً دوباره امتحان کن.")
+            await status.edit_text("❌ Download failed. Please try again.")
             return
 
         if not downloaded_file:
@@ -147,10 +147,10 @@ async def url_handler(client: Client, message: Message):
                 downloaded_file = str(max(mp4s, key=lambda p: p.stat().st_mtime))
 
         if not downloaded_file or not Path(downloaded_file).exists():
-            await status.edit_text("❌ فایل دانلود شده پیدا نشد.")
+            await status.edit_text("❌ Downloaded file not found.")
             return
 
-        await status.edit_text("✅ دانلود کامل شد. در صف ارسال به روبیکا قرار گرفت.")
+        await status.edit_text("\u2705 Download complete. Queued for sending to Rubika.")
 
         task = {
             "type": "local_file",
@@ -162,7 +162,7 @@ async def url_handler(client: Client, message: Message):
         append_task(task)
 
     except Exception as e:
-        await status.edit_text(f"❌ خطا: {str(e)}")
+        await status.edit_text(f"❌ Error: {str(e)}")
 
 
 if __name__ == "__main__":
