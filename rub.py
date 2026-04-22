@@ -56,11 +56,12 @@ def build_ytdlp_cmd(url: str) -> list[str]:
     return cmd
 
 
-app = RubikaClient(name=SESSION)
+app = RubikaClient(name=SESSION, display_welcome=True)
 
 
-@app.on_message_updates(filters.is_me, filters.commands("start", prefixes="!"))
+@app.on_message_updates(filters.commands("start", prefixes="!"))
 async def start_handler(update):
+    print("[rub] !start received")
     await app.send_message(
         update.object_guid,
         "🎬 Welcome!\n\nAvailable commands (send these to Saved Messages):\n"
@@ -69,8 +70,9 @@ async def start_handler(update):
     )
 
 
-@app.on_message_updates(filters.is_me, filters.commands("download", prefixes="!"))
+@app.on_message_updates(filters.commands("download", prefixes="!"))
 async def download_handler(update):
+    print(f"[rub] !download received: {update.text}")
     args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
     match = YOUTUBE_RE.search(args)
     object_guid = update.object_guid
@@ -156,4 +158,6 @@ async def download_handler(update):
 
 
 if __name__ == "__main__":
+    print("[rub] Connecting to Rubika...")
     app.run()
+    print("[rub] Disconnected.")
