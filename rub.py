@@ -40,7 +40,7 @@ PROGRESS_RE = re.compile(
 
 UPDATE_INTERVAL = 3.0
 SELECTION_TIMEOUT = 300.0          # seconds before a pending quality menu expires
-SIZE_LIMIT_BYTES = 2 * 1024 ** 3   # 2 GB hard limit — options above this are hidden
+SIZE_LIMIT_BYTES = 2 * 1024 ** 3   # 2 GB hard limit \u2014 options above this are hidden
 
 # Per-chat pending quality-selection state.
 # Key: object_guid  Value: {url, choices, title, timeout_task}
@@ -163,7 +163,7 @@ def build_quality_menu(info: dict) -> list:
             continue
 
         size_str = _fmt_size(total_size)
-        label = "🎬 {}p".format(actual_h)
+        label = "\U0001f3ac {}p".format(actual_h)
         if size_str:
             label += "  ({})".format(size_str)
 
@@ -182,7 +182,7 @@ def build_quality_menu(info: dict) -> list:
     # Audio-only MP3
     if best_audio and audio_size <= SIZE_LIMIT_BYTES:
         audio_size_str = _fmt_size(audio_size)
-        label = "🎵 Audio only (MP3)"
+        label = "\U0001f3b5 Audio only (MP3)"
         if audio_size_str:
             label += "  ({})".format(audio_size_str)
         choices.append({
@@ -193,7 +193,7 @@ def build_quality_menu(info: dict) -> list:
             "out_ext": "mp3",
         })
 
-    # Subtitles (negligible size — always include when available)
+    # Subtitles (negligible size \u2014 always include when available)
     subtitles = info.get("subtitles", {})
     auto_captions = info.get("automatic_captions", {})
     all_langs = list(subtitles.keys()) + [
@@ -207,7 +207,7 @@ def build_quality_menu(info: dict) -> list:
             else ""
         )
         choices.append({
-            "label": "📄 Subtitles — {}{}".format(preferred, auto_note),
+            "label": "\U0001f4c4 Subtitles \u2014 {}{}".format(preferred, auto_note),
             "format": None,
             "audio_only": False,
             "subtitle_only": True,
