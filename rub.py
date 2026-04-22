@@ -2,6 +2,7 @@
 import os
 import re
 import asyncio
+import logging
 import time
 from pathlib import Path
 
@@ -11,7 +12,14 @@ from rubpy import Client as RubikaClient, filters
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 SESSION = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
+PHONE_NUMBER = os.getenv("RUBIKA_PHONE", "").strip() or None
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -159,5 +167,9 @@ async def download_handler(update):
 
 if __name__ == "__main__":
     print("[rub] Connecting to Rubika...")
-    app.run()
+    try:
+        app.run(phone_number=PHONE_NUMBER)
+    except Exception as exc:
+        print(f"[rub] Connection failed: {exc}")
+        raise
     print("[rub] Disconnected.")

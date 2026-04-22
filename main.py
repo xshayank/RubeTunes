@@ -12,6 +12,8 @@ rubika_proc = None
 try:
     rubika_proc = subprocess.Popen([sys.executable, str(rubika_file)])
     rubika_proc.wait()
+    if rubika_proc.returncode != 0:
+        print(f"[main] rub.py exited with code {rubika_proc.returncode}")
 
 except KeyboardInterrupt:
     pass
