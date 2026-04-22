@@ -39,7 +39,7 @@ app = Client(
 )
 
 YOUTUBE_RE = re.compile(
-    r'https?://(?:www\.)?(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)[\w\-]+'
+    r'https?://(?:(?:(?:www|m|music)\.)?youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/|v/)|youtu\.be/)[\w\-]+'
 )
 
 PROGRESS_RE = re.compile(
