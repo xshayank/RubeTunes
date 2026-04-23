@@ -56,6 +56,10 @@ TIDAL_TOKEN           = os.getenv("TIDAL_TOKEN",           "").strip()
 _SPOTIFY_TOTP_SECRET  = "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4DQOJUGQYTAMRRGA2TCMJSHE3TCMBY"
 _SPOTIFY_TOTP_VERSION = 61
 
+# Hardcoded fallback in case open.spotify.com A/B test hides appServerConfig.
+# Ref: SpotiFLAC issue #14 fix
+_SPOTIFY_CLIENT_VERSION_FALLBACK = "1.2.52.442.g55a7e7d3"
+
 # ---------------------------------------------------------------------------
 # Qobuz API — auto-scraped credentials (no account needed)
 # ---------------------------------------------------------------------------
@@ -75,9 +79,10 @@ _QOBUZ_UA                = (
 _qobuz_bundle_re  = re.compile(
     r'<script[^>]+src="([^"]+/js/main\.js|/resources/[^"]+/js/main\.js)"'
 )
-_qobuz_config_re  = re.compile(
-    r'app_id:"(?P<app_id>\d{9})",app_secret:"(?P<app_secret>[a-f0-9]{32})"'
-)
+# More lenient: match app_id and app_secret independently of order/whitespace
+# Ref: SpotiFLAC backend/qobuz_api.go
+_qobuz_app_id_re     = re.compile(r'"?app_id"?\s*[:=]\s*"?(\d{7,12})"?')
+_qobuz_app_secret_re = re.compile(r'"?app_secret"?\s*[:=]\s*"?([a-f0-9]{32})"?')
 
 _qobuz_creds_lock  = threading.Lock()
 _qobuz_creds_cache: dict | None = None  # {"app_id", "app_secret", "source", "fetched_at"}
@@ -142,15 +147,17 @@ def _scrape_qobuz_open_credentials() -> dict | None:
             log.debug("qobuz bundle fetch returned %d", bundle_resp.status_code)
             return None
 
-        cm = _qobuz_config_re.search(bundle_resp.text)
-        if not cm:
+        bundle_text = bundle_resp.text
+        m_id  = _qobuz_app_id_re.search(bundle_text)
+        m_sec = _qobuz_app_secret_re.search(bundle_text)
+        if not m_id or not m_sec:
             log.debug("qobuz app_id/app_secret not found in bundle")
             return None
 
         creds = {
-            "app_id":    cm.group("app_id"),
-            "app_secret": cm.group("app_secret"),
-            "source":    bundle_url,
+            "app_id":     m_id.group(1),
+            "app_secret": m_sec.group(1),
+            "source":     bundle_url,
             "fetched_at": time.time(),
         }
         log.debug("scraped qobuz credentials: app_id=%s from %s", creds["app_id"], bundle_url)
@@ -506,6 +513,24 @@ def _auth_headers() -> dict:
     return {**_HEADERS_BASE, "Authorization": f"Bearer {get_token()}"}
 
 
+def _spclient_file_id_to_hex(fid: str) -> str:
+    """
+    Convert a Spotify file_id to the hex form expected by i.scdn.co.
+    Handles both hex-encoded and base64-encoded variants.
+    Ref: SpotiFLAC backend/isrc_finder.go
+    """
+    fid = fid.strip()
+    if not fid:
+        return ""
+    if re.fullmatch(r'[0-9a-fA-F]{32,40}', fid):
+        return fid.lower()
+    try:
+        decoded = base64.b64decode(fid + "==")
+        return decoded.hex()
+    except Exception:
+        return fid.lower()
+
+
 def _fetch_internal_meta(track_id: str) -> dict:
     """Fetch track metadata from Spotify's internal spclient API (JSON)."""
     gid = track_id_to_gid(track_id)
@@ -537,8 +562,8 @@ def _parse_internal(meta: dict) -> dict:
         best = max(images, key=lambda x: x.get("width", 0))
         fid = best.get("file_id", "")
         if fid:
-            # file_id is base16 hex; some builds encode it as base64
-            cover_url = f"https://i.scdn.co/image/{fid}"
+            hex_fid = _spclient_file_id_to_hex(fid)
+            cover_url = f"https://i.scdn.co/image/{hex_fid}" if hex_fid else ""
 
     # Release date
     date = album.get("date", {})
@@ -761,6 +786,9 @@ class SpotifyClient:
                 self._client_version = cfg.get("clientVersion", "")
             except Exception:
                 pass
+        if not self._client_version:
+            self._client_version = _SPOTIFY_CLIENT_VERSION_FALLBACK
+            log.debug("spotify: using fallback client version %s", self._client_version)
         sp_t = self._session.cookies.get("sp_t")
         if sp_t:
             self._device_id = sp_t
@@ -1474,6 +1502,74 @@ def _isrc_soundplate(track_id: str) -> str | None:
 # Deezer resolution
 # ---------------------------------------------------------------------------
 
+# Spotify CDN size hash constants (Ref: SpotiFLAC backend/cover.go)
+_SPOTIFY_COVER_300 = "ab67616d00001e02"
+_SPOTIFY_COVER_640 = "ab67616d0000b273"
+_SPOTIFY_COVER_MAX = "ab67616d000082c1"
+
+
+def _upgrade_spotify_cover_url(url: str) -> str:
+    """
+    Upgrade a Spotify cover URL to maximum resolution (300px → 640px → max).
+    Ref: SpotiFLAC backend/cover.go getMaxResolutionURL()
+    """
+    if not url:
+        return url
+    if _SPOTIFY_COVER_300 in url:
+        url = url.replace(_SPOTIFY_COVER_300, _SPOTIFY_COVER_MAX)
+    elif _SPOTIFY_COVER_640 in url:
+        url = url.replace(_SPOTIFY_COVER_640, _SPOTIFY_COVER_MAX)
+    return url
+
+
+def _deezer_url_from_isrc(isrc: str) -> str | None:
+    """
+    Resolve a Deezer track URL from an ISRC using the free Deezer public API.
+    No credentials required.  Ref: SpotiFLAC songlink.go lookupDeezerTrackURLByISRC()
+    """
+    try:
+        url = f"https://api.deezer.com/track/isrc:{isrc.upper().strip()}"
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        if resp.ok:
+            data = resp.json()
+            if "error" in data:
+                return None
+            link = data.get("link", "")
+            track_id = data.get("id", 0)
+            if link:
+                return link
+            if track_id:
+                return f"https://www.deezer.com/track/{track_id}"
+    except Exception as exc:
+        log.debug("deezer isrc->url: %s", exc)
+    return None
+
+
+def _deezer_isrc_from_url(deezer_url: str) -> str | None:
+    """
+    Fetch the ISRC from a Deezer track using the public Deezer API.
+    No credentials required. Ref: SpotiFLAC songlink.go getDeezerISRC()
+    """
+    try:
+        m = re.search(r'/track/(\d+)', deezer_url)
+        if not m:
+            return None
+        track_id = m.group(1)
+        resp = requests.get(
+            f"https://api.deezer.com/track/{track_id}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if resp.ok:
+            data = resp.json()
+            isrc = data.get("isrc", "").strip().upper()
+            if isrc:
+                return isrc
+    except Exception as exc:
+        log.debug("deezer url->isrc: %s", exc)
+    return None
+
+
 def _resolve_deezer(isrc: str) -> dict | None:
     """Return Deezer track dict for the given ISRC, or None."""
     try:
@@ -1496,7 +1592,13 @@ def _resolve_deezer(isrc: str) -> dict | None:
 
 def _resolve_qobuz_by_isrc(isrc: str) -> dict | None:
     """Return the first Qobuz track dict matching the ISRC, or None.
-    Uses auto-scraped credentials — no QOBUZ_APP_ID env var required."""
+    Uses auto-scraped credentials — no QOBUZ_APP_ID env var required.
+    If ISRC starts with 'qobuz_', treats the remainder as a direct numeric Qobuz track ID.
+    Ref: SpotiFLAC backend/qobuz.go searchByISRC()
+    """
+    if isrc.startswith("qobuz_"):
+        track_id = isrc[len("qobuz_"):]
+        return _get_qobuz_track(track_id)
     try:
         data = _do_qobuz_signed_json_request(
             "track/search", {"query": isrc, "limit": "5"}
@@ -1894,6 +1996,14 @@ def _resolve_all_platforms(info: dict) -> dict:
         if sg.get("amazon_url") and not info["amazon_url"]:
             info["amazon_url"] = sg["amazon_url"]
 
+    # ── 5b. Deezer ISRC → URL — third fallback if still no Deezer URL ──────
+    # Ref: SpotiFLAC songlink.go lookupDeezerTrackURLByISRC()
+    if isrc and not info["deezer_url"]:
+        dz_url = _deezer_url_from_isrc(isrc)
+        if dz_url:
+            info["deezer_url"] = dz_url
+            log.debug("deezer url from isrc fallback: %s", dz_url)
+
     # ── 6. MusicBrainz genre (non-blocking, best-effort) ──────────────────
     if isrc and not info.get("genre"):
         genre = _musicbrainz_genre(isrc)
@@ -1909,7 +2019,7 @@ def get_track_info(track_id: str) -> dict:
 
     Returns a dict with:
       title, artists (list), album, release_date, cover_url,
-      track_number, disc_number, isrc,
+      track_number, disc_number, isrc, upc, lyrics,
       deezer_id, deezer_url, deezer_preview_url,
       qobuz_id, qobuz_url,
       tidal_id, tidal_url, tidal_alt_url
@@ -1930,6 +2040,7 @@ def get_track_info(track_id: str) -> dict:
         return _resolve_all_platforms(info)
 
     # --- Phase 1: Spotify metadata via GraphQL (primary) ---
+    _internal_raw: dict | None = None
     try:
         raw = _fetch_track_graphql(track_id)
         info = _parse_graphql_track(raw)
@@ -1937,8 +2048,8 @@ def get_track_info(track_id: str) -> dict:
     except Exception as exc:
         log.warning("graphql meta failed (%s) — trying spclient", exc)
         try:
-            raw = _fetch_internal_meta(track_id)
-            info = _parse_internal(raw)
+            _internal_raw = _fetch_internal_meta(track_id)
+            info = _parse_internal(_internal_raw)
             log.debug("internal meta OK  track=%s  title=%r", track_id, info.get("title"))
         except Exception as exc2:
             log.warning("internal meta failed (%s) — trying public API", exc2)
@@ -1956,6 +2067,10 @@ def get_track_info(track_id: str) -> dict:
 
     info["track_id"] = track_id
 
+    # Upgrade cover art to maximum resolution (Ref: SpotiFLAC backend/cover.go)
+    if info.get("cover_url"):
+        info["cover_url"] = _upgrade_spotify_cover_url(info["cover_url"])
+
     # ISRC via Soundplate if still missing
     if not info.get("isrc"):
         info["isrc"] = _isrc_soundplate(track_id)
@@ -1964,8 +2079,65 @@ def get_track_info(track_id: str) -> dict:
     if info.get("isrc"):
         _put_cached_isrc(track_id, info["isrc"])
 
+    # --- Phase 1b: UPC from album GID via spclient (Ref: SpotiFLAC isrc_finder.go) ---
+    if _internal_raw and not info.get("upc"):
+        try:
+            album_gid_bytes = (_internal_raw.get("album") or {}).get("gid")
+            if album_gid_bytes:
+                # gid may be bytes or a hex string; convert to hex
+                if isinstance(album_gid_bytes, (bytes, bytearray)):
+                    album_gid_hex = album_gid_bytes.hex()
+                else:
+                    album_gid_hex = str(album_gid_bytes).lower()
+                album_meta_resp = requests.get(
+                    f"https://spclient.wg.spotify.com/metadata/4/album/{album_gid_hex}?market=from_token",
+                    headers=_auth_headers(),
+                    timeout=10,
+                )
+                if album_meta_resp.ok:
+                    album_meta = album_meta_resp.json()
+                    for eid in album_meta.get("external_id") or []:
+                        if eid.get("type") == "upc":
+                            info["upc"] = eid.get("id", "")
+                            log.debug("upc from album gid: %s", info["upc"])
+                            break
+        except Exception as exc:
+            log.debug("album gid upc fetch: %s", exc)
+
+    # --- Phase 1c: Deezer ISRC fallback (if still no ISRC) ---
+    # If we got a Deezer URL from a previous lookup but no ISRC, extract from Deezer
+    # (will be populated after _resolve_all_platforms if needed — deferred below)
+
     # --- Phase 2: multi-platform resolution ---
-    return _resolve_all_platforms(info)
+    info = _resolve_all_platforms(info)
+
+    # --- Phase 2b: ISRC from Deezer URL if still no ISRC after platform resolution ---
+    if not info.get("isrc") and info.get("deezer_url"):
+        dz_isrc = _deezer_isrc_from_url(info["deezer_url"])
+        if dz_isrc:
+            info["isrc"] = dz_isrc
+            _put_cached_isrc(track_id, dz_isrc)
+            log.debug("isrc from deezer url: %s", dz_isrc)
+
+    # --- Phase 3: Fetch lyrics in background (non-blocking) ---
+    title   = info.get("title", "")
+    artists = info.get("artists") or []
+    album   = info.get("album", "")
+    if title and artists:
+        def _bg_lyrics() -> None:
+            try:
+                artist_str = artists[0] if artists else ""
+                lyrics = get_lyrics(title, artist_str, album)
+                if lyrics:
+                    info["lyrics"] = lyrics
+                    log.debug("lyrics fetched for %r", title)
+            except Exception as exc:
+                log.debug("lyrics fetch: %s", exc)
+        t = threading.Thread(target=_bg_lyrics, daemon=True)
+        t.start()
+        t.join(timeout=15)  # wait up to 15s so lyrics are available before download
+
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -2057,6 +2229,88 @@ def get_amazon_track_info(track_id: str, ytdlp_bin: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Lyrics fetching from lrclib.net (Ref: SpotiFLAC backend/lyrics.go)
+# ---------------------------------------------------------------------------
+
+_LRCLIB_BASE = "https://lrclib.net/api"
+_LRCLIB_UA   = "Tele2Rub/1.0 (https://github.com/xshayank/Tele2Rub)"
+
+
+def _fetch_lyrics_lrclib(track: str, artist: str, album: str = "", duration: int = 0) -> dict | None:
+    """
+    Fetch lyrics from lrclib.net.
+    Returns dict with keys: synced_lyrics, plain_lyrics, is_synced — or None on failure.
+    Ref: SpotiFLAC backend/lyrics.go FetchLyricsWithMetadata()
+    """
+    params: dict = {"artist_name": artist, "track_name": track}
+    if album:
+        params["album_name"] = album
+    if duration:
+        params["duration"] = duration
+
+    try:
+        resp = requests.get(
+            f"{_LRCLIB_BASE}/get",
+            params=params,
+            headers={"User-Agent": _LRCLIB_UA},
+            timeout=10,
+        )
+        if resp.ok:
+            data = resp.json()
+            synced = data.get("syncedLyrics") or ""
+            plain  = data.get("plainLyrics") or ""
+            if synced or plain:
+                return {"synced_lyrics": synced, "plain_lyrics": plain, "is_synced": bool(synced)}
+    except Exception as exc:
+        log.debug("lrclib get: %s", exc)
+
+    # Fallback: search endpoint
+    try:
+        resp = requests.get(
+            f"{_LRCLIB_BASE}/search",
+            params={"artist_name": artist, "track_name": track},
+            headers={"User-Agent": _LRCLIB_UA},
+            timeout=10,
+        )
+        if resp.ok:
+            results = resp.json()
+            if results:
+                for item in results:
+                    if item.get("syncedLyrics"):
+                        return {
+                            "synced_lyrics": item["syncedLyrics"],
+                            "plain_lyrics":  item.get("plainLyrics", ""),
+                            "is_synced":     True,
+                        }
+                item = results[0]
+                return {
+                    "synced_lyrics": "",
+                    "plain_lyrics":  item.get("plainLyrics", ""),
+                    "is_synced":     False,
+                }
+    except Exception as exc:
+        log.debug("lrclib search: %s", exc)
+
+    return None
+
+
+def get_lyrics(track_name: str, artist_name: str, album_name: str = "", duration: int = 0) -> str | None:
+    """
+    Fetch lyrics for a track. Returns LRC-formatted string (synced if available,
+    else plain text), or None if not found.
+    Ref: SpotiFLAC backend/lyrics.go FetchLyricsAllSources() / ConvertToLRC()
+    """
+    result = _fetch_lyrics_lrclib(track_name, artist_name, album_name, duration)
+    if not result:
+        return None
+    if result["is_synced"] and result["synced_lyrics"]:
+        return result["synced_lyrics"]
+    if result["plain_lyrics"]:
+        return result["plain_lyrics"]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Metadata tagging
 # ---------------------------------------------------------------------------
 
@@ -2070,6 +2324,7 @@ def embed_metadata(filepath: Path, info: dict) -> None:
         from mutagen.id3 import (
             ID3, ID3NoHeaderError,
             TIT2, TPE1, TPE2, TALB, TDRC, TRCK, TPOS, APIC, TSRC, TCON, COMM,
+            USLT, TXXX,
         )
         from mutagen.flac import FLAC, Picture
     except ImportError:
@@ -2108,6 +2363,10 @@ def embed_metadata(filepath: Path, info: dict) -> None:
             tags.add(TCON(encoding=3, text=info["genre"]))
         if info.get("isrc"):
             tags.add(COMM(encoding=3, lang="eng", desc="", text=info.get("isrc", "")))
+        if info.get("upc"):
+            tags.add(TXXX(encoding=3, desc="UPC", text=info["upc"]))
+        if info.get("lyrics"):
+            tags.add(USLT(encoding=3, lang="eng", desc="", text=info["lyrics"]))
         if cover_data:
             tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_data))
         tags.save(str(filepath))
@@ -2129,6 +2388,10 @@ def embed_metadata(filepath: Path, info: dict) -> None:
             audio["genre"] = info["genre"]
         if info.get("comment"):
             audio["comment"] = info["comment"]
+        if info.get("upc"):
+            audio["upc"] = [info["upc"]]
+        if info.get("lyrics"):
+            audio["lyrics"] = [info["lyrics"]]
         if cover_data:
             pic = Picture()
             pic.type = 3  # cover front
@@ -2172,6 +2435,7 @@ _QOBUZ_STREAM_PROXIES = [
     "https://dab.yeet.su/api/stream?trackId={id}&quality={q}",
     "https://dabmusic.xyz/api/stream?trackId={id}&quality={q}",
     "https://qobuz.spotbye.qzz.io/api/track/{id}?quality={q}",
+    "https://qobuz2.spotbye.qzz.io/api/track/{id}?quality={q}",
 ]
 
 # Quality level fallback chains
@@ -2185,26 +2449,93 @@ _QOBUZ_QUALITY_CHAIN = {
     QUALITY_MP3:     [],   # Qobuz not used for MP3
 }
 
+# ---------------------------------------------------------------------------
+# Provider priority / success tracking (Ref: SpotiFLAC backend/provider_priority.go)
+# ---------------------------------------------------------------------------
+
+_PROVIDER_STATS_FILE = Path(tempfile.gettempdir()) / "tele2rub" / "provider_stats.json"
+_provider_stats_lock = threading.Lock()
+
+
+def _load_provider_stats() -> dict:
+    try:
+        if _PROVIDER_STATS_FILE.exists():
+            return json.loads(_PROVIDER_STATS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_provider_stats(stats: dict) -> None:
+    try:
+        _PROVIDER_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _PROVIDER_STATS_FILE.write_text(json.dumps(stats, indent=2))
+    except Exception:
+        pass
+
+
+def _record_provider_outcome(service: str, provider: str, success: bool) -> None:
+    with _provider_stats_lock:
+        stats = _load_provider_stats()
+        key = f"{service}|{provider}"
+        entry = stats.get(key, {"success": 0, "failure": 0, "last_success": 0})
+        if success:
+            entry["success"] = entry.get("success", 0) + 1
+            entry["last_success"] = time.time()
+        else:
+            entry["failure"] = entry.get("failure", 0) + 1
+        stats[key] = entry
+        _save_provider_stats(stats)
+
+
+def _prioritize_providers(service: str, providers: list) -> list:
+    """Sort providers by most recent success. Ref: SpotiFLAC backend/provider_priority.go"""
+    try:
+        stats = _load_provider_stats()
+
+        def score(p: str) -> float:
+            entry = stats.get(f"{service}|{p}", {})
+            return entry.get("last_success", 0.0)
+
+        return sorted(providers, key=score, reverse=True)
+    except Exception:
+        return providers
+
 
 def _get_qobuz_stream_url(track_id: str, quality_num: int) -> str | None:
     """
     Try each proxy API in order and return the first signed stream URL found.
     Returns *None* if all proxies fail for this (track_id, quality_num) pair.
     """
-    for template in _QOBUZ_STREAM_PROXIES:
+    ordered = _prioritize_providers("qobuz", list(_QOBUZ_STREAM_PROXIES))
+    for template in ordered:
         url = template.format(id=track_id, q=quality_num)
         try:
+            # Try without following redirects first to catch 30x audio URLs
             resp = requests.get(
                 url,
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=15,
-                allow_redirects=True,
+                allow_redirects=False,
             )
+
+            # Handle HTTP redirects (some proxies redirect to the CDN directly)
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if location.startswith("http") and any(
+                    ext in location for ext in (".flac", ".mp3", ".m4a", "audio", "stream")
+                ):
+                    log.debug("qobuz stream via %s (redirect)", url)
+                    _record_provider_outcome("qobuz", template, True)
+                    return location
+
             if not resp.ok:
                 log.debug("qobuz proxy %s → HTTP %d", url, resp.status_code)
+                _record_provider_outcome("qobuz", template, False)
                 continue
 
             ct = resp.headers.get("content-type", "")
+
             # JSON response — look for a URL field
             if "json" in ct:
                 try:
@@ -2217,17 +2548,26 @@ def _get_qobuz_stream_url(track_id: str, quality_num: int) -> str | None:
                     )
                     if stream_url and str(stream_url).startswith("http"):
                         log.debug("qobuz stream via %s (json)", url)
+                        _record_provider_outcome("qobuz", template, True)
                         return str(stream_url)
                 except Exception:
                     pass
 
             # Plain-text URL
+            if "text/plain" in ct:
+                url_candidate = resp.text.strip()
+                if url_candidate.startswith("http"):
+                    log.debug("qobuz stream via %s (plain)", url)
+                    _record_provider_outcome("qobuz", template, True)
+                    return url_candidate
+
             text = resp.text.strip()
             if text.startswith("http"):
-                log.debug("qobuz stream via %s (plain)", url)
+                log.debug("qobuz stream via %s (text)", url)
+                _record_provider_outcome("qobuz", template, True)
                 return text
 
-            # The proxy might have redirected to the actual CDN URL
+            # The proxy might have redirected to the actual CDN URL (after allow_redirects=True)
             if resp.url != url:
                 try:
                     from urllib.parse import urlparse as _urlparse
@@ -2241,10 +2581,14 @@ def _get_qobuz_stream_url(track_id: str, quality_num: int) -> str | None:
                     or resp.url.endswith(".flac")
                 ):
                     log.debug("qobuz stream via %s (redirect)", url)
+                    _record_provider_outcome("qobuz", template, True)
                     return resp.url
+
+            _record_provider_outcome("qobuz", template, False)
 
         except Exception as exc:
             log.debug("qobuz proxy %s error: %s", url, exc)
+            _record_provider_outcome("qobuz", template, False)
 
     return None
 
@@ -2305,8 +2649,38 @@ async def _download_qobuz(
 
 
 # ---------------------------------------------------------------------------
-# Amazon Music download via proxy (matches SpotiFLAC backend/amazon.go)
+# Amazon Music URL normalization and download
+# Ref: SpotiFLAC backend/songlink.go normalizeAmazonMusicURL()
 # ---------------------------------------------------------------------------
+
+_AMAZON_ALBUM_TRACK_RE = re.compile(r'/albums/[A-Z0-9]{10}/(B[0-9A-Z]{9})')
+_AMAZON_TRACK_RE       = re.compile(r'/tracks/(B[0-9A-Z]{9})')
+
+
+def _normalize_amazon_url(raw_url: str) -> str:
+    """
+    Normalize an Amazon Music URL to the canonical track URL form.
+    Ref: SpotiFLAC backend/songlink.go normalizeAmazonMusicURL()
+    """
+    url = (raw_url or "").strip()
+    if not url:
+        return ""
+
+    if "trackAsin=" in url:
+        m = re.search(r'trackAsin=([A-Z0-9]{10})', url)
+        if m:
+            return f"https://music.amazon.com/tracks/{m.group(1)}?musicTerritory=US"
+
+    m = _AMAZON_ALBUM_TRACK_RE.search(url)
+    if m:
+        return f"https://music.amazon.com/tracks/{m.group(1)}?musicTerritory=US"
+
+    m = _AMAZON_TRACK_RE.search(url)
+    if m:
+        return f"https://music.amazon.com/tracks/{m.group(1)}?musicTerritory=US"
+
+    return ""
+
 
 _AMAZON_PROXY_APIS = [
     "https://afkar.xyz/api/track/{asin}",
