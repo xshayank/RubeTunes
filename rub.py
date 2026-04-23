@@ -519,20 +519,22 @@ async def selection_handler(update):
 
 async def _compress_video(src: Path, log) -> Path:
     """
-    Re-encode *src* with ffmpeg CRF-18 (visually lossless H.264) into a
-    temporary file, then atomically replace *src* with the result.
-    Returns the final path (same as *src* on success, original on failure).
+    Re-encode *src* with ffmpeg CRF-23 H.264 (-preset fast) into a temporary
+    file.  Only replaces the original when the compressed file is actually
+    smaller.  Returns the final path to send (may be unchanged *src*).
     """
     tmp = src.with_suffix(".tmp.mp4")
     cmd = [
         "ffmpeg", "-y",
         "-i", str(src),
-        "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+        "-c:v", "libx264", "-crf", "23", "-preset", "fast",
         "-c:a", "copy",
         "-movflags", "+faststart",
         str(tmp),
     ]
-    log.info("compressing: %s", src.name)
+    before_bytes = src.stat().st_size
+    before_mb = before_bytes / (1024 * 1024)
+    log.info("compressing: %s (%.2f MB)", src.name, before_mb)
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -550,16 +552,23 @@ async def _compress_video(src: Path, log) -> Path:
                 tmp.unlink()
             return src
 
-        before_bytes = src.stat().st_size
         after_bytes = tmp.stat().st_size
-        ratio = (1.0 - after_bytes / before_bytes) * 100.0 if before_bytes else 0.0
-        before_mb = before_bytes / (1024 * 1024)
         after_mb = after_bytes / (1024 * 1024)
+
+        if after_bytes >= before_bytes:
+            # Compressed file is not smaller — discard and send original
+            log.info(
+                "compression skipped: %.2f MB -> %.2f MB (would be larger -- sending original)",
+                before_mb, after_mb,
+            )
+            tmp.unlink()
+            return src
+
+        ratio = (1.0 - after_bytes / before_bytes) * 100.0
         log.info(
             "compression result: %.2f MB -> %.2f MB  (%.1f%% smaller)",
             before_mb, after_mb, ratio,
         )
-
         tmp.replace(src)
         return src
 
@@ -658,7 +667,7 @@ async def _do_download(object_guid: str, url: str, choice: dict, title: str, log
         if not choice.get("audio_only") and not choice.get("subtitle_only"):
             await app.edit_message(
                 object_guid, status_id,
-                "\u2699\ufe0f Compressing video (CRF-18, visually lossless)\u2026"
+                "\u2699\ufe0f Compressing video\u2026"
             )
             file_path = await _compress_video(file_path, log)
             downloaded_file = str(file_path)
