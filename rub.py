@@ -58,6 +58,21 @@ SPOTIFY_RE = re.compile(
     r'|(?<![A-Za-z0-9])([A-Za-z0-9]{22})(?![A-Za-z0-9])'
 )
 
+TIDAL_RE = re.compile(
+    r'https?://(?:www\.|listen\.)?tidal\.com/(?:browse/)?(?:track|album/[^/\s]+/track)/(\d+)'
+    r'|https?://listen\.tidal\.com/album/[^/\s]+/track/(\d+)'
+)
+
+QOBUZ_RE = re.compile(
+    r'https?://open\.qobuz\.com/track/(\d+)'
+    r'|https?://(?:www\.)?qobuz\.com/[^\s]+/track[s]?/(\d+)'
+)
+
+AMAZON_RE = re.compile(
+    r'https?://music\.amazon\.[a-z.]+/tracks/([A-Z0-9]{10,})'
+    r'|[?&]trackAsin=([A-Z0-9]{10,})'
+)
+
 PROGRESS_RE = re.compile(
     r'\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\S+/s)'
 )
@@ -449,14 +464,17 @@ async def start_handler(update):
         "\U0001f3ac Welcome!\n\n"
         "\U0001f4cc Commands:\n"
         "  !download <url> \u2014 Fetch quality options for a YouTube video\n"
-        "  !spotify <url>  \u2014 Download a Spotify track / album / playlist\n"
+        "  !spotify <url>  \u2014 Download a Spotify track\n"
+        "  !tidal <url>    \u2014 Download a Tidal track\n"
+        "  !qobuz <url>    \u2014 Download a Qobuz track\n"
+        "  !amazon <url>   \u2014 Download an Amazon Music track\n"
         "  !cancel         \u2014 Cancel a pending quality selection\n"
         "  !start          \u2014 Show this message\n\n"
         "After sending !download the bot lists available qualities.\n"
         "Reply with !1, !2, \u2026 to pick one. Options above 2 GB are hidden.\n\n"
-        "Spotify: send a track URL, URI, or bare ID.\n"
-        "Downloads as FLAC (if DEEZER_ARL is configured) or MP3 320 k.\n"
-        "Full metadata is embedded automatically."
+        "Music commands download as FLAC (Qobuz or Deezer, if credentials are\n"
+        "configured) or MP3 320 k (YouTube Music fallback). Full metadata and\n"
+        "cover art are embedded automatically."
     )
 
 
@@ -947,46 +965,93 @@ async def admin_handler(update):
 
 
 # ---------------------------------------------------------------------------
-# Spotify downloading  (SpotiFLAC approach via spotify_dl.py)
+# Generic music downloading  (SpotiFLAC approach via spotify_dl.py)
 # ---------------------------------------------------------------------------
 
+_PLATFORM_NAMES = {
+    "spotify": "Spotify",
+    "tidal":   "Tidal",
+    "qobuz":   "Qobuz",
+    "amazon":  "Amazon Music",
+}
 
-async def _do_spotify_download(object_guid: str, url: str, log) -> None:
-    """Download a single Spotify track using the SpotiFLAC approach and send it."""
-    status = await app.send_message(object_guid, "\U0001f50d Looking up Spotify track\u2026")
+
+async def _do_music_download(object_guid: str, url: str, platform: str, log) -> None:
+    """Resolve metadata for *url* from *platform*, pick the best download source, send file."""
+    pname = _PLATFORM_NAMES.get(platform, platform.capitalize())
+    status = await app.send_message(object_guid, "\U0001f50d Looking up {} track\u2026".format(pname))
     status_id = status.message_id
 
     try:
-        # --- Phase 1+2: resolve metadata & Deezer URL ---
-        track_id = _spodl.parse_spotify_track_id(url)
-        if not track_id:
-            await app.edit_message(
-                object_guid, status_id,
-                "\u274c Could not parse a Spotify track ID from: {}".format(url),
-            )
+        loop = asyncio.get_event_loop()
+
+        # --- Fetch metadata ---
+        if platform == "spotify":
+            track_id = _spodl.parse_spotify_track_id(url)
+            if not track_id:
+                await app.edit_message(object_guid, status_id,
+                                        "\u274c Could not parse Spotify track ID from: {}".format(url))
+                return
+            try:
+                await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Spotify metadata\u2026")
+            except Exception:
+                pass
+            info = await loop.run_in_executor(None, _spodl.get_track_info, track_id)
+
+        elif platform == "tidal":
+            track_id = _spodl.parse_tidal_track_id(url)
+            if not track_id:
+                await app.edit_message(object_guid, status_id,
+                                        "\u274c Could not parse Tidal track ID from: {}".format(url))
+                return
+            try:
+                await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Tidal metadata\u2026")
+            except Exception:
+                pass
+            info = await loop.run_in_executor(None, _spodl.get_tidal_track_info, track_id)
+
+        elif platform == "qobuz":
+            track_id = _spodl.parse_qobuz_track_id(url)
+            if not track_id:
+                await app.edit_message(object_guid, status_id,
+                                        "\u274c Could not parse Qobuz track ID from: {}".format(url))
+                return
+            try:
+                await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Qobuz metadata\u2026")
+            except Exception:
+                pass
+            info = await loop.run_in_executor(None, _spodl.get_qobuz_track_info, track_id)
+
+        elif platform == "amazon":
+            track_id = _spodl.parse_amazon_track_id(url)
+            if not track_id:
+                await app.edit_message(object_guid, status_id,
+                                        "\u274c Could not parse Amazon Music track ID from: {}".format(url))
+                return
+            try:
+                await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Amazon Music metadata\u2026")
+            except Exception:
+                pass
+            ytbin = _ytdlp_bin()
+            info = await loop.run_in_executor(None, _spodl.get_amazon_track_info, track_id, ytbin)
+
+        else:
+            await app.edit_message(object_guid, status_id, "\u274c Unknown platform: {}".format(platform))
             return
 
-        try:
-            await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Spotify metadata\u2026")
-        except Exception:
-            pass
-
-        loop = asyncio.get_event_loop()
-        info = await loop.run_in_executor(None, _spodl.get_track_info, track_id)
-
-        title       = info.get("title", "Unknown")
-        artists_str = ", ".join(info.get("artists", []))
-        source_tag  = " [\U0001f1eb\U0001f1f1 FLAC]" if (_spodl.DEEZER_ARL and info.get("deezer_url")) else " [MP3 320k]"
+        title       = info.get("title") or "Unknown"
+        artists_str = ", ".join(info.get("artists") or [])
+        source_label = _spodl.best_source_label(info)
 
         try:
             await app.edit_message(
                 object_guid, status_id,
-                "\U0001f4e5 Downloading{}: {} — {}".format(source_tag, title, artists_str),
+                "\U0001f4e5 Downloading [{}]: {} \u2014 {}".format(source_label, title, artists_str),
             )
         except Exception:
             pass
 
-        # --- Phase 3: download + tag ---
+        # --- Download + tag ---
         fp = await _spodl.download_track(info, DOWNLOAD_DIR, _ytdlp_bin())
 
         try:
@@ -997,8 +1062,9 @@ async def _do_spotify_download(object_guid: str, url: str, log) -> None:
         except Exception:
             pass
 
+        caption = "{} — {}".format(title, artists_str) if artists_str else title
         try:
-            await app.send_document(object_guid, str(fp), caption="{} — {}".format(title, artists_str))
+            await app.send_document(object_guid, str(fp), caption=caption)
             log.info("sent: %s", fp)
         except Exception as exc:
             log.error("send failed: %s", exc)
@@ -1012,12 +1078,16 @@ async def _do_spotify_download(object_guid: str, url: str, log) -> None:
         await app.edit_message(object_guid, status_id, "\u2705 Done!")
 
     except Exception as exc:
-        log.exception("_do_spotify_download error: %s", exc)
+        log.exception("_do_music_download (%s) error: %s", platform, exc)
         try:
             await app.edit_message(object_guid, status_id, "\u274c Error: {}".format(exc))
         except Exception:
             pass
 
+
+# Keep the old name as an alias so queue code can call it unchanged
+async def _do_spotify_download(object_guid: str, url: str, log) -> None:
+    await _do_music_download(object_guid, url, "spotify", log)
 
 
 @app.on_message_updates(filters.commands("spotify", prefixes="!"))
@@ -1048,11 +1118,96 @@ async def spotify_handler(update):
 
     url = args.strip()
     _append_log(object_guid, "spotify_track", url)
+    await _enqueue_music(object_guid, url, "spotify", log)
 
-    # Re-use the shared download queue
+
+@app.on_message_updates(filters.commands("tidal", prefixes="!"))
+async def tidal_handler(update):
+    global is_downloading
+    log = logging.getLogger("tidal")
+    object_guid = update.object_guid
+    log.info("!tidal | guid=%s", object_guid)
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    m = TIDAL_RE.search(args)
+    if not m:
+        await app.send_message(
+            object_guid,
+            "\u274c Please provide a valid Tidal track link.\n"
+            "Example: https://tidal.com/browse/track/12345678"
+        )
+        return
+
+    url = m.group(0)
+    _append_log(object_guid, "tidal_track", url)
+    await _enqueue_music(object_guid, url, "tidal", log)
+
+
+@app.on_message_updates(filters.commands("qobuz", prefixes="!"))
+async def qobuz_handler(update):
+    global is_downloading
+    log = logging.getLogger("qobuz")
+    object_guid = update.object_guid
+    log.info("!qobuz | guid=%s", object_guid)
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    m = QOBUZ_RE.search(args)
+    if not m:
+        await app.send_message(
+            object_guid,
+            "\u274c Please provide a valid Qobuz track link.\n"
+            "Example: https://open.qobuz.com/track/12345678"
+        )
+        return
+
+    url = m.group(0)
+    _append_log(object_guid, "qobuz_track", url)
+    await _enqueue_music(object_guid, url, "qobuz", log)
+
+
+@app.on_message_updates(filters.commands("amazon", prefixes="!"))
+async def amazon_handler(update):
+    global is_downloading
+    log = logging.getLogger("amazon")
+    object_guid = update.object_guid
+    log.info("!amazon | guid=%s", object_guid)
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    m = AMAZON_RE.search(args)
+    if not m:
+        await app.send_message(
+            object_guid,
+            "\u274c Please provide a valid Amazon Music track link.\n"
+            "Example: https://music.amazon.com/tracks/B01N2XLBTT"
+        )
+        return
+
+    url = m.group(0)
+    _append_log(object_guid, "amazon_track", url)
+    await _enqueue_music(object_guid, url, "amazon", log)
+
+
+async def _enqueue_music(object_guid: str, url: str, platform: str, log) -> None:
+    """Add a music download to the queue or start it immediately."""
+    global is_downloading
     if not is_downloading:
         is_downloading = True
-        asyncio.create_task(_run_spotify_and_queue(object_guid, url))
+        asyncio.create_task(_run_music_and_queue(object_guid, url, platform))
     else:
         pos = len(download_queue) + 1
         people = "person" if pos == 1 else "people"
@@ -1064,21 +1219,22 @@ async def spotify_handler(update):
             ),
         )
         download_queue.append({
-            "object_guid": object_guid,
-            "url": url,
-            "choice": None,           # sentinel: Spotify entry
-            "title": url,
+            "object_guid":  object_guid,
+            "url":          url,
+            "choice":       None,       # sentinel: music-platform entry (not YouTube)
+            "platform":     platform,
+            "title":        url,
             "queue_msg_id": queue_msg.message_id,
         })
-        log.info("spotify queued at position %d | guid=%s", pos, object_guid)
+        log.info("%s queued at position %d | guid=%s", platform, pos, object_guid)
 
 
-async def _run_spotify_and_queue(object_guid: str, url: str) -> None:
-    """Run one Spotify download then hand off to the next queue entry."""
+async def _run_music_and_queue(object_guid: str, url: str, platform: str) -> None:
+    """Run one music download then hand off to the next queue entry."""
     global is_downloading
     log = logging.getLogger("queue")
     try:
-        await _do_spotify_download(object_guid, url, log)
+        await _do_music_download(object_guid, url, platform, log)
     finally:
         if download_queue:
             next_entry = download_queue.popleft()
@@ -1093,10 +1249,15 @@ async def _run_spotify_and_queue(object_guid: str, url: str) -> None:
             except Exception:
                 pass
             await asyncio.sleep(1)
-            # Dispatch the next entry — Spotify or YouTube
+            # Dispatch the next entry — music platform or YouTube quality
             if next_entry["choice"] is None:
+                next_platform = next_entry.get("platform", "spotify")
                 asyncio.create_task(
-                    _run_spotify_and_queue(next_entry["object_guid"], next_entry["url"])
+                    _run_music_and_queue(
+                        next_entry["object_guid"],
+                        next_entry["url"],
+                        next_platform,
+                    )
                 )
             else:
                 asyncio.create_task(

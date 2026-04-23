@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-SpotiFLAC-style Spotify track downloader.
+SpotiFLAC-style multi-platform music downloader.
 
-Phase 1 — Retrieve track metadata + ISRC from Spotify (anonymous token via TOTP).
-Phase 2 — Resolve ISRC to Deezer.
-Phase 3 — Download via yt-dlp (Deezer with ARL → FLAC, or YouTube Music → MP3 320 k).
-           Embed full Spotify metadata with mutagen.
+Supported input sources: Spotify, Tidal, Qobuz, Amazon Music.
+
+Resolution chain (ISRC-based):
+  Qobuz FLAC (QOBUZ_EMAIL + QOBUZ_PASSWORD + QOBUZ_APP_ID)
+  → Deezer FLAC (DEEZER_ARL)
+  → YouTube Music MP3 320 k (always available)
 
 Environment variables (all optional):
   SPOTIFY_TOTP_SECRET     Base-32 TOTP secret for anonymous Spotify token.
-  SPOTIFY_CLIENT_ID       } Spotify app credentials; used as fallback
-  SPOTIFY_CLIENT_SECRET   }   if the anonymous token endpoint fails.
-  DEEZER_ARL              Deezer cookie — enables lossless FLAC download.
+  SPOTIFY_CLIENT_ID       } Spotify app credentials; fallback if anon token fails.
+  SPOTIFY_CLIENT_SECRET   }
+  DEEZER_ARL              Deezer account ARL cookie — enables lossless FLAC.
+  QOBUZ_APP_ID            Qobuz application ID (required for Qobuz API).
+  QOBUZ_EMAIL             Qobuz account e-mail (required for Qobuz download).
+  QOBUZ_PASSWORD          Qobuz account password (required for Qobuz download).
+  TIDAL_TOKEN             Tidal client/OAuth token for metadata lookup.
 """
 import asyncio
 import base64
@@ -22,6 +28,7 @@ import logging
 import os
 import re
 import struct
+import subprocess
 import time
 import urllib.request
 from pathlib import Path
@@ -37,6 +44,10 @@ SPOTIFY_TOTP_SECRET   = os.getenv("SPOTIFY_TOTP_SECRET",   "").strip()
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID",     "").strip()
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 DEEZER_ARL            = os.getenv("DEEZER_ARL",            "").strip()
+QOBUZ_APP_ID          = os.getenv("QOBUZ_APP_ID",          "").strip()
+QOBUZ_EMAIL           = os.getenv("QOBUZ_EMAIL",           "").strip()
+QOBUZ_PASSWORD        = os.getenv("QOBUZ_PASSWORD",        "").strip()
+TIDAL_TOKEN           = os.getenv("TIDAL_TOKEN",           "").strip()
 
 # ---------------------------------------------------------------------------
 # Base-62 / GID helpers
@@ -68,6 +79,49 @@ def parse_spotify_track_id(text: str) -> str | None:
             return m.group(1)
     if re.fullmatch(r"[A-Za-z0-9]{22}", text):
         return text
+    return None
+
+
+def parse_tidal_track_id(text: str) -> str | None:
+    """Extract a numeric Tidal track ID from a Tidal URL."""
+    text = text.strip()
+    for pattern in (
+        r"tidal\.com/(?:browse/)?(?:track|album/[^/]+/track)/(\d+)",
+        r"listen\.tidal\.com/(?:album/[^/]+/)?track/(\d+)",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def parse_qobuz_track_id(text: str) -> str | None:
+    """Extract a numeric Qobuz track ID from a Qobuz URL."""
+    text = text.strip()
+    for pattern in (
+        r"open\.qobuz\.com/track/(\d+)",
+        r"qobuz\.com/[a-z\-]+/album/[^/]+/[^/]+/track/(\d+)",
+        r"qobuz\.com/[a-z\-]+/track/[^/]+/(\d+)",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    # bare numeric ID
+    if re.fullmatch(r"\d{5,12}", text):
+        return text
+    return None
+
+
+def parse_amazon_track_id(text: str) -> str | None:
+    """Extract an Amazon Music track ASIN from an Amazon Music URL."""
+    text = text.strip()
+    for pattern in (
+        r"music\.amazon\.[a-z.]+/tracks/([A-Z0-9]{10,})",
+        r"[?&]trackAsin=([A-Z0-9]{10,})",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
     return None
 
 
@@ -293,15 +347,214 @@ def _resolve_deezer(isrc: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Public entry point: get_track_info
+# Qobuz resolution
 # ---------------------------------------------------------------------------
+
+def _resolve_qobuz_by_isrc(isrc: str) -> dict | None:
+    """Return the first Qobuz track dict matching the ISRC, or None."""
+    if not QOBUZ_APP_ID:
+        return None
+    try:
+        resp = requests.get(
+            "https://www.qobuz.com/api.json/0.2/track/search",
+            params={"query": isrc, "limit": "5", "app_id": QOBUZ_APP_ID},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=12,
+        )
+        if resp.ok:
+            data = resp.json()
+            tracks = (data.get("tracks") or {}).get("items") or []
+            for t in tracks:
+                if (t.get("isrc") or "").upper() == isrc.upper():
+                    return t
+    except Exception as exc:
+        log.warning("qobuz ISRC lookup: %s", exc)
+    return None
+
+
+def _get_qobuz_track(track_id: str) -> dict | None:
+    """Fetch a Qobuz track by its numeric ID."""
+    if not QOBUZ_APP_ID:
+        return None
+    try:
+        resp = requests.get(
+            "https://www.qobuz.com/api.json/0.2/track/get",
+            params={"track_id": track_id, "app_id": QOBUZ_APP_ID},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=12,
+        )
+        if resp.ok:
+            data = resp.json()
+            if data.get("id") and not data.get("message"):
+                return data
+    except Exception as exc:
+        log.warning("qobuz track get: %s", exc)
+    return None
+
+
+def _parse_qobuz_track(data: dict) -> dict:
+    """Convert a Qobuz track API dict to the standard info dict."""
+    album = data.get("album") or {}
+    images = album.get("image") or {}
+    cover_url = (
+        images.get("large") or images.get("small") or
+        album.get("cover_big") or album.get("cover") or ""
+    )
+    return {
+        "title": data.get("title", ""),
+        "artists": [data.get("performer", {}).get("name", "")
+                    or data.get("artist", {}).get("name", "")],
+        "album": album.get("title", ""),
+        "release_date": album.get("release_date_original") or album.get("release_date_stream") or "",
+        "cover_url": cover_url,
+        "track_number": data.get("track_number", 1),
+        "disc_number": data.get("media_number", 1),
+        "isrc": data.get("isrc"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tidal resolution
+# ---------------------------------------------------------------------------
+
+_TIDAL_API_BASE = "https://api.tidal.com/v1"
+_TIDAL_COUNTRY  = "US"
+
+
+def _tidal_headers() -> dict:
+    h = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    if TIDAL_TOKEN:
+        h["X-Tidal-Token"] = TIDAL_TOKEN
+    return h
+
+
+def _resolve_tidal_by_isrc(isrc: str) -> dict | None:
+    """Return the first Tidal track dict matching the ISRC, or None."""
+    if not TIDAL_TOKEN:
+        return None
+    try:
+        resp = requests.get(
+            f"{_TIDAL_API_BASE}/tracks",
+            params={"isrc": isrc, "countryCode": _TIDAL_COUNTRY, "limit": 5},
+            headers=_tidal_headers(),
+            timeout=12,
+        )
+        if resp.ok:
+            data = resp.json()
+            items = data.get("items") or []
+            if items:
+                return items[0]
+    except Exception as exc:
+        log.warning("tidal ISRC lookup: %s", exc)
+    return None
+
+
+def _get_tidal_track(track_id: str) -> dict | None:
+    """Fetch a Tidal track by its numeric ID."""
+    if not TIDAL_TOKEN:
+        return None
+    try:
+        resp = requests.get(
+            f"{_TIDAL_API_BASE}/tracks/{track_id}",
+            params={"countryCode": _TIDAL_COUNTRY},
+            headers=_tidal_headers(),
+            timeout=12,
+        )
+        if resp.ok:
+            data = resp.json()
+            if data.get("id"):
+                return data
+    except Exception as exc:
+        log.warning("tidal track get: %s", exc)
+    return None
+
+
+def _parse_tidal_track(data: dict) -> dict:
+    """Convert a Tidal track API dict to the standard info dict."""
+    album = data.get("album") or {}
+    # Cover art: https://resources.tidal.com/images/<uuid-with-dashes>/640x640.jpg
+    cover_id = album.get("cover", "").replace("-", "/")
+    cover_url = f"https://resources.tidal.com/images/{cover_id}/640x640.jpg" if cover_id else ""
+    release_date = album.get("releaseDate") or ""
+    artists = [a.get("name", "") for a in (data.get("artists") or [])]
+    if not artists and data.get("artist"):
+        artists = [data["artist"].get("name", "")]
+    return {
+        "title": data.get("title", ""),
+        "artists": artists,
+        "album": album.get("title", ""),
+        "release_date": release_date,
+        "cover_url": cover_url,
+        "track_number": data.get("trackNumber", 1),
+        "disc_number": data.get("volumeNumber", 1),
+        "isrc": data.get("isrc"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public entry point: get_track_info (Spotify → ISRC → multi-platform)
+# ---------------------------------------------------------------------------
+
+def _resolve_all_platforms(info: dict) -> dict:
+    """
+    Given an info dict that already has an ISRC, resolve it on Deezer, Qobuz,
+    and Tidal and add the results as extra keys.  Always safe to call.
+    """
+    isrc = info.get("isrc") or ""
+
+    info.update({"deezer_id": None, "deezer_url": None, "deezer_preview_url": None})
+    info.update({"qobuz_id": None, "qobuz_url": None})
+    info.update({"tidal_id": None, "tidal_url": None})
+
+    if not isrc:
+        return info
+
+    # Deezer
+    dz = _resolve_deezer(isrc)
+    if dz:
+        info["deezer_id"]          = dz["id"]
+        info["deezer_url"]         = dz.get("link", f"https://www.deezer.com/track/{dz['id']}")
+        info["deezer_preview_url"] = dz.get("preview")
+        if not info.get("title"):
+            info["title"] = dz.get("title", "")
+        if not info.get("artists"):
+            info["artists"] = [dz.get("artist", {}).get("name", "")]
+        if not info.get("album"):
+            info["album"] = dz.get("album", {}).get("title", "")
+        if not info.get("cover_url"):
+            info["cover_url"] = (
+                dz.get("album", {}).get("cover_xl") or
+                dz.get("album", {}).get("cover_big") or ""
+            )
+        log.debug("deezer resolved: id=%s", dz["id"])
+
+    # Qobuz
+    qz = _resolve_qobuz_by_isrc(isrc)
+    if qz:
+        info["qobuz_id"]  = qz["id"]
+        info["qobuz_url"] = f"https://open.qobuz.com/track/{qz['id']}"
+        log.debug("qobuz resolved: id=%s", qz["id"])
+
+    # Tidal (metadata only — not used as download source directly)
+    td = _resolve_tidal_by_isrc(isrc)
+    if td:
+        info["tidal_id"]  = td["id"]
+        info["tidal_url"] = f"https://tidal.com/browse/track/{td['id']}"
+        log.debug("tidal resolved: id=%s", td["id"])
+
+    return info
+
 
 def get_track_info(track_id: str) -> dict:
     """
-    Return a dict with:
+    Fetch Spotify track metadata and resolve ISRC on Deezer / Qobuz / Tidal.
+
+    Returns a dict with:
       title, artists (list), album, release_date, cover_url,
       track_number, disc_number, isrc,
-      deezer_id, deezer_url, deezer_preview_url
+      deezer_id, deezer_url, deezer_preview_url,
+      qobuz_id, qobuz_url,
+      tidal_id, tidal_url
     """
     info: dict = {}
 
@@ -330,31 +583,101 @@ def get_track_info(track_id: str) -> dict:
     if not info.get("isrc"):
         info["isrc"] = _isrc_soundplate(track_id)
 
-    # --- Phase 2: Deezer resolution ---
-    info.update({"deezer_id": None, "deezer_url": None, "deezer_preview_url": None})
+    # --- Phase 2: multi-platform resolution ---
+    return _resolve_all_platforms(info)
 
-    if info.get("isrc"):
-        dz = _resolve_deezer(info["isrc"])
-        if dz:
-            info["deezer_id"] = dz["id"]
-            info["deezer_url"] = dz.get("link", f"https://www.deezer.com/track/{dz['id']}")
-            info["deezer_preview_url"] = dz.get("preview")
-            # Fill in any gaps from Deezer
-            if not info["title"]:
-                info["title"] = dz.get("title", "")
-            if not info["artists"]:
-                info["artists"] = [dz.get("artist", {}).get("name", "")]
-            if not info["album"]:
-                info["album"] = dz.get("album", {}).get("title", "")
-            if not info["cover_url"]:
-                info["cover_url"] = (
-                    dz.get("album", {}).get("cover_xl")
-                    or dz.get("album", {}).get("cover_big")
-                    or ""
-                )
-            log.debug("deezer resolved: id=%s  url=%s", dz["id"], info["deezer_url"])
 
-    return info
+# ---------------------------------------------------------------------------
+# Public entry point: get_tidal_track_info
+# ---------------------------------------------------------------------------
+
+def get_tidal_track_info(track_id: str) -> dict:
+    """
+    Fetch Tidal track metadata and resolve ISRC on Deezer / Qobuz.
+    Raises RuntimeError if TIDAL_TOKEN is not set.
+    """
+    if not TIDAL_TOKEN:
+        raise RuntimeError(
+            "TIDAL_TOKEN env var is required to look up Tidal tracks."
+        )
+
+    data = _get_tidal_track(track_id)
+    if not data:
+        raise RuntimeError(f"Tidal API returned no data for track {track_id!r}")
+
+    info = _parse_tidal_track(data)
+    info["track_id"]  = None
+    info["tidal_id"]  = track_id
+    info["tidal_url"] = f"https://tidal.com/browse/track/{track_id}"
+
+    return _resolve_all_platforms(info)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point: get_qobuz_track_info
+# ---------------------------------------------------------------------------
+
+def get_qobuz_track_info(track_id: str) -> dict:
+    """
+    Fetch Qobuz track metadata and resolve ISRC on Deezer / Tidal.
+    Raises RuntimeError if QOBUZ_APP_ID is not set.
+    """
+    if not QOBUZ_APP_ID:
+        raise RuntimeError(
+            "QOBUZ_APP_ID env var is required to look up Qobuz tracks."
+        )
+
+    data = _get_qobuz_track(track_id)
+    if not data:
+        raise RuntimeError(f"Qobuz API returned no data for track {track_id!r}")
+
+    info = _parse_qobuz_track(data)
+    info["track_id"]  = None
+    info["qobuz_id"]  = track_id
+    info["qobuz_url"] = f"https://open.qobuz.com/track/{track_id}"
+
+    return _resolve_all_platforms(info)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point: get_amazon_track_info
+# ---------------------------------------------------------------------------
+
+def get_amazon_track_info(track_id: str, ytdlp_bin: str) -> dict:
+    """
+    Extract Amazon Music track metadata via yt-dlp and resolve ISRC on
+    Deezer / Qobuz / Tidal.  Falls back to minimal info if extraction fails.
+    """
+    url = f"https://music.amazon.com/tracks/{track_id}"
+    info: dict = {
+        "title": "", "artists": [], "album": "",
+        "release_date": "", "cover_url": "",
+        "track_number": 1, "disc_number": 1, "isrc": None,
+        "track_id": None,
+        "amazon_id": track_id,
+        "amazon_url": url,
+    }
+
+    try:
+        result = subprocess.run(
+            [ytdlp_bin, "--dump-json", "--quiet", "--no-warnings", url],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout.strip())
+            info["title"]        = data.get("title") or ""
+            info["album"]        = data.get("album") or ""
+            info["release_date"] = data.get("release_date") or data.get("upload_date") or ""
+            info["cover_url"]    = data.get("thumbnail") or ""
+            info["isrc"]         = data.get("isrc") or None
+            artist = data.get("artist") or data.get("uploader") or ""
+            if artist:
+                info["artists"] = [artist]
+            log.debug("amazon yt-dlp json OK for %s", track_id)
+    except Exception as exc:
+        log.warning("amazon yt-dlp json failed: %s", exc)
+
+    return _resolve_all_platforms(info)
 
 
 # ---------------------------------------------------------------------------
@@ -435,19 +758,34 @@ def embed_metadata(filepath: Path, info: dict) -> None:
 
 async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path:
     """
-    Download a single track to *download_dir* and embed Spotify metadata.
+    Download a single track to *download_dir* and embed metadata.
     Returns the Path of the downloaded file.
 
-    Strategy:
-      - If DEEZER_ARL is set and a Deezer URL is known → download FLAC from Deezer.
-      - Otherwise → search YouTube Music (ytmsearch1:) and download MP3 320 k.
+    Priority:
+      1. Qobuz FLAC  — if QOBUZ_EMAIL + QOBUZ_PASSWORD set and qobuz_url available
+      2. Deezer FLAC — if DEEZER_ARL set and deezer_url available
+      3. YouTube Music MP3 320 k — always available as fallback
     """
     title       = info.get("title", "Unknown")
     artists_str = ", ".join(info.get("artists", ["Unknown"]))
     safe        = _safe_filename(f"{title} - {artists_str}")
     output_tmpl = str(download_dir / f"{safe}.%(ext)s")
 
-    if DEEZER_ARL and info.get("deezer_url"):
+    if QOBUZ_EMAIL and QOBUZ_PASSWORD and info.get("qobuz_url"):
+        cmd = [
+            ytdlp_bin,
+            info["qobuz_url"],
+            "--extract-audio",
+            "--audio-format", "flac",
+            "--username", QOBUZ_EMAIL,
+            "--password", QOBUZ_PASSWORD,
+            "-o", output_tmpl,
+            "--no-playlist",
+            "--quiet", "--no-warnings",
+        ]
+        source = "Qobuz"
+
+    elif DEEZER_ARL and info.get("deezer_url"):
         cmd = [
             ytdlp_bin,
             info["deezer_url"],
@@ -459,6 +797,7 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
             "--quiet", "--no-warnings",
         ]
         source = "Deezer"
+
     else:
         search = f"{title} {artists_str}"
         cmd = [
@@ -503,3 +842,12 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
         log.warning("metadata embed failed for %s: %s", fp.name, exc)
 
     return fp
+
+
+def best_source_label(info: dict) -> str:
+    """Return a human-readable label for the download source that will be used."""
+    if QOBUZ_EMAIL and QOBUZ_PASSWORD and info.get("qobuz_url"):
+        return "\U0001f1f6\U0001f1ff FLAC"       # 🇶🇿
+    if DEEZER_ARL and info.get("deezer_url"):
+        return "\U0001f1eb\U0001f1f1 FLAC"       # 🇫🇱 (Deezer)
+    return "MP3 320k"
