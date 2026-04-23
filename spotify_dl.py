@@ -25,6 +25,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -672,6 +673,676 @@ def _fetch_playlist_graphql_page(playlist_id: str, offset: int, limit: int) -> d
         },
     })
 
+
+# ---------------------------------------------------------------------------
+# Spotify v2 client (session-based auth: accessToken + clientToken)
+# ---------------------------------------------------------------------------
+
+class SpotifyClient:
+    """
+    Session-based Spotify client that uses the web-player auth flow:
+    1. Scrape clientVersion from open.spotify.com HTML.
+    2. Fetch accessToken + clientId via /api/token (TOTP-authenticated).
+    3. Fetch clientToken from clienttoken.spotify.com.
+    4. POST queries to api-partner.spotify.com/pathfinder/v2/query.
+    """
+
+    _UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self) -> None:
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": self._UA})
+        self._access_token: str = ""
+        self._client_token: str = ""
+        self._client_id: str = ""
+        self._device_id: str = ""
+        self._client_version: str = ""
+
+    # ------------------------------------------------------------------
+    # Auth helpers
+    # ------------------------------------------------------------------
+
+    def _get_session_info(self) -> None:
+        """Scrape clientVersion from the open.spotify.com HTML."""
+        resp = self._session.get("https://open.spotify.com", timeout=30)
+        resp.raise_for_status()
+        m = re.search(
+            r'<script id="appServerConfig" type="text/plain">([^<]+)</script>',
+            resp.text,
+        )
+        if m:
+            try:
+                cfg = json.loads(base64.b64decode(m.group(1)).decode())
+                self._client_version = cfg.get("clientVersion", "")
+            except Exception:
+                pass
+        sp_t = self._session.cookies.get("sp_t")
+        if sp_t:
+            self._device_id = sp_t
+
+    def _get_access_token(self) -> None:
+        """Fetch accessToken + clientId via TOTP-authenticated /api/token."""
+        totp_code = _totp(_SPOTIFY_TOTP_SECRET)
+        resp = self._session.get(
+            "https://open.spotify.com/api/token",
+            params={
+                "reason":      "init",
+                "productType": "web-player",
+                "totp":        totp_code,
+                "totpVer":     str(_SPOTIFY_TOTP_VERSION),
+                "totpServer":  totp_code,
+            },
+            headers={"Content-Type": "application/json;charset=UTF-8"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"spotify access token request failed: HTTP {resp.status_code}"
+            )
+        data = resp.json()
+        self._access_token = data.get("accessToken", "")
+        self._client_id = data.get("clientId", "")
+        sp_t = self._session.cookies.get("sp_t")
+        if sp_t:
+            self._device_id = sp_t
+
+    def _get_client_token(self) -> None:
+        """Fetch clientToken from clienttoken.spotify.com."""
+        if not self._client_id or not self._device_id or not self._client_version:
+            self._get_session_info()
+            self._get_access_token()
+
+        payload = {
+            "client_data": {
+                "client_version": self._client_version,
+                "client_id":      self._client_id,
+                "js_sdk_data": {
+                    "device_brand": "unknown",
+                    "device_model": "unknown",
+                    "os":           "windows",
+                    "os_version":   "NT 10.0",
+                    "device_id":    self._device_id,
+                    "device_type":  "computer",
+                },
+            }
+        }
+        resp = self._session.post(
+            "https://clienttoken.spotify.com/v1/clienttoken",
+            json=payload,
+            headers={
+                "Authority":    "clienttoken.spotify.com",
+                "Content-Type": "application/json",
+                "Accept":       "application/json",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"spotify client token request failed: HTTP {resp.status_code}"
+            )
+        data = resp.json()
+        if data.get("response_type") != "RESPONSE_GRANTED_TOKEN_RESPONSE":
+            raise RuntimeError(
+                f"invalid client token response type: {data.get('response_type')!r}"
+            )
+        self._client_token = (data.get("granted_token") or {}).get("token", "")
+
+    def initialize(self) -> None:
+        """Run the full auth flow: session → access token → client token."""
+        self._get_session_info()
+        self._get_access_token()
+        self._get_client_token()
+
+    def query(self, payload: dict) -> dict:
+        """
+        POST a query to api-partner.spotify.com/pathfinder/v2/query.
+        Auto-initializes auth on the first call.
+        """
+        if not self._access_token or not self._client_token:
+            self.initialize()
+
+        resp = self._session.post(
+            "https://api-partner.spotify.com/pathfinder/v2/query",
+            json=payload,
+            headers={
+                "Authorization":      f"Bearer {self._access_token}",
+                "Client-Token":       self._client_token,
+                "Spotify-App-Version": self._client_version,
+                "Content-Type":       "application/json",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            snippet = resp.text[:200]
+            raise RuntimeError(
+                f"spotify API query failed: HTTP {resp.status_code} | {snippet}"
+            )
+        return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Filter helper utilities (shared by filter_track / filter_album / filter_playlist)
+# ---------------------------------------------------------------------------
+
+def _sp_str(m: dict, key: str) -> str:
+    v = m.get(key)
+    return v if isinstance(v, str) else ""
+
+
+def _sp_map(m: dict, key: str) -> dict:
+    v = m.get(key)
+    return v if isinstance(v, dict) else {}
+
+
+def _sp_list(m: dict, key: str) -> list:
+    v = m.get(key)
+    return v if isinstance(v, list) else []
+
+
+def _sp_float(m: dict, key: str) -> float:
+    v = m.get(key)
+    if isinstance(v, (int, float)):
+        return float(v)
+    return 0.0
+
+
+def _sp_extract_artists(artists_data: dict) -> list[dict]:
+    artists = []
+    for item in _sp_list(artists_data, "items"):
+        if not isinstance(item, dict):
+            continue
+        name = _sp_str(_sp_map(item, "profile"), "name")
+        if name:
+            artists.append({"name": name})
+    return artists
+
+
+def _sp_extract_cover(cover_data: dict) -> dict | None:
+    """Parse a Spotify cover-art block into a {small, medium, large} URL dict."""
+    if not cover_data:
+        return None
+
+    sources: list = []
+    if isinstance(cover_data.get("sources"), list):
+        sources = cover_data["sources"]
+    else:
+        try:
+            sources = cover_data["squareCoverImage"]["image"]["data"]["sources"]
+        except (KeyError, TypeError):
+            pass
+
+    if not sources:
+        return None
+
+    filtered = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        url = _sp_str(s, "url")
+        if not url:
+            continue
+        width  = _sp_float(s, "width")  or _sp_float(s, "maxWidth")
+        height = _sp_float(s, "height") or _sp_float(s, "maxHeight")
+        if (width > 64 and height > 64) or (width == 0 and height == 0):
+            filtered.append({"url": url, "width": width, "height": height})
+
+    if not filtered:
+        return None
+
+    filtered.sort(key=lambda x: x["width"])
+
+    small_url = medium_url = image_id = fallback_url = ""
+    for src in filtered:
+        url   = src["url"]
+        width = src["width"]
+        if width == 300:
+            small_url = url
+        elif width == 640:
+            medium_url = url
+        elif width == 0:
+            fallback_url = url
+
+        if not image_id and url:
+            for marker in ("ab67616d0000b273", "ab67616d00001e02"):
+                if marker in url:
+                    image_id = url.split(marker)[-1]
+                    break
+            else:
+                if "/image/" in url:
+                    img_part = url.split("/image/")[-1].split("?")[0]
+                    if len(img_part) > 20:
+                        for prefix in (
+                            "ab67616d0000b273",
+                            "ab67616d00001e02",
+                            "ab67616d00004851",
+                        ):
+                            if prefix in img_part:
+                                image_id = img_part.split(prefix)[-1]
+                                break
+
+    large_url = (
+        f"https://i.scdn.co/image/ab67616d000082c1{image_id}" if image_id else ""
+    )
+
+    result: dict = {}
+    if small_url:
+        result["small"] = small_url
+    if medium_url:
+        result["medium"] = medium_url
+    if large_url:
+        result["large"] = large_url
+    if not result and fallback_url:
+        result = {"small": fallback_url, "medium": fallback_url, "large": fallback_url}
+
+    return result or None
+
+
+def _sp_extract_duration(ms: float) -> str:
+    total_s = int(ms) // 1000
+    return f"{total_s // 60}:{total_s % 60:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Rich filter functions for v2 GraphQL responses
+# ---------------------------------------------------------------------------
+
+def filter_track(
+    data: dict,
+    separator: str = ", ",
+    album_fetch_data: dict | None = None,
+) -> dict:
+    """
+    Parse a Spotify v2 getTrack GraphQL response into a structured dict.
+
+    Args:
+        data: Raw JSON response from the v2 query endpoint.
+        separator: String used to join multiple artist names.
+        album_fetch_data: Optional raw response from a getAlbum query for the
+            same album — used to fill in label and total-disc information.
+
+    Returns a dict with keys: id, name, artists, album, duration, track, disc,
+    discs, copyright, plays, cover, is_explicit.
+    """
+    track_data = _sp_map(_sp_map(data, "data"), "trackUnion")
+    if not track_data:
+        return {}
+
+    # Artists — try several response shapes
+    artists: list[dict] = _sp_extract_artists(_sp_map(track_data, "artists"))
+    if not artists:
+        for key in ("firstArtist", "otherArtists"):
+            for item in _sp_list(_sp_map(track_data, key), "items"):
+                if not isinstance(item, dict):
+                    continue
+                name = _sp_str(_sp_map(item, "profile"), "name")
+                if name:
+                    artists.append({"name": name})
+    if not artists:
+        artists = _sp_extract_artists(
+            _sp_map(_sp_map(track_data, "albumOfTrack"), "artists")
+        )
+
+    artists_str = separator.join(a["name"] for a in artists)
+
+    # Album data
+    album_data = _sp_map(track_data, "albumOfTrack")
+    album_info: dict | None = None
+    copyright_texts: list[str] = []
+    disc_info_total: int | None = None
+
+    if album_data:
+        # Copyright notices (C-type only)
+        for item in _sp_list(_sp_map(album_data, "copyright"), "items"):
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "P":
+                t = _sp_str(item, "text")
+                if t:
+                    copyright_texts.append(t)
+
+        # Total discs from album track list
+        disc_numbers: set[int] = set()
+        for item in _sp_list(_sp_map(album_data, "tracks"), "items"):
+            if not isinstance(item, dict):
+                continue
+            d = int(_sp_float(_sp_map(item, "track"), "discNumber")) or 1
+            disc_numbers.add(d)
+        if disc_numbers:
+            disc_info_total = max(disc_numbers)
+
+        # Release date
+        date_info = _sp_map(album_data, "date")
+        iso = _sp_str(date_info, "isoString")
+        release_year: int | None
+        if iso:
+            release_date = iso[:10]
+            release_year = int(iso[:4]) if len(iso) >= 4 else None
+        else:
+            y  = _sp_str(date_info, "year")
+            mo = _sp_str(date_info, "month")
+            dy = _sp_str(date_info, "day")
+            if y:
+                release_year = int(y)
+                release_date = (
+                    f"{y}-{int(mo):02d}-{int(dy):02d}" if mo and dy else y
+                )
+            else:
+                release_date = ""
+                release_year = None
+
+        tracks_data  = _sp_map(album_data, "tracks")
+        tracks_count = int(_sp_float(tracks_data, "totalCount"))
+
+        album_uri = _sp_str(album_data, "uri")
+        album_id  = _sp_str(album_data, "id") or (
+            album_uri.split(":")[-1] if ":" in album_uri else ""
+        )
+
+        album_artists_str = ""
+        album_label       = ""
+        if album_fetch_data:
+            album_union = _sp_map(_sp_map(album_fetch_data, "data"), "albumUnion")
+            if album_union:
+                al = _sp_extract_artists(_sp_map(album_union, "artists"))
+                album_artists_str = separator.join(a["name"] for a in al)
+                album_label       = _sp_str(album_union, "label")
+        if not album_artists_str:
+            al = _sp_extract_artists(_sp_map(album_data, "artists"))
+            album_artists_str = separator.join(a["name"] for a in al)
+
+        album_info = {
+            "id":       album_id,
+            "name":     _sp_str(album_data, "name"),
+            "released": release_date,
+            "year":     release_year,
+            "tracks":   tracks_count,
+        }
+        if album_artists_str:
+            album_info["artists"] = album_artists_str
+        if album_label:
+            album_info["label"] = album_label
+
+    # Cover art
+    cover = _sp_extract_cover(_sp_map(track_data, "visualIdentity"))
+    if cover is None and album_data:
+        cover = _sp_extract_cover(_sp_map(album_data, "coverArt"))
+
+    # Duration
+    duration_ms  = _sp_float(_sp_map(track_data, "duration"), "totalMilliseconds")
+    duration_str = _sp_extract_duration(duration_ms)
+
+    # Disc number resolution
+    disc_number = int(_sp_float(track_data, "discNumber")) or 1
+    max_disc_from_album   = 0
+    total_discs_from_album = 0
+    if album_fetch_data:
+        album_union = _sp_map(_sp_map(album_fetch_data, "data"), "albumUnion")
+        if album_union:
+            total_discs_from_album = int(
+                _sp_float(_sp_map(album_union, "discs"), "totalCount")
+            )
+            current_id = _sp_str(track_data, "id")
+            for item in _sp_list(_sp_map(album_union, "tracks"), "items"):
+                if not isinstance(item, dict):
+                    continue
+                ti    = _sp_map(item, "track")
+                d_num = int(_sp_float(ti, "discNumber"))
+                if d_num > max_disc_from_album:
+                    max_disc_from_album = d_num
+                track_uri = _sp_str(ti, "uri")
+                if current_id in track_uri or _sp_str(ti, "id") == current_id:
+                    if d_num > 0:
+                        disc_number = d_num
+
+    if total_discs_from_album > 0:
+        total_discs = total_discs_from_album
+    elif max_disc_from_album > 0:
+        total_discs = max_disc_from_album
+    elif disc_info_total is not None:
+        total_discs = disc_info_total
+    else:
+        total_discs = 1
+
+    content_rating = _sp_map(track_data, "contentRating")
+    is_explicit    = _sp_str(content_rating, "label") == "EXPLICIT"
+
+    return {
+        "id":          _sp_str(track_data, "id"),
+        "name":        _sp_str(track_data, "name"),
+        "artists":     artists_str,
+        "album":       album_info,
+        "duration":    duration_str,
+        "track":       int(_sp_float(track_data, "trackNumber")),
+        "disc":        disc_number,
+        "discs":       total_discs,
+        "copyright":   ", ".join(copyright_texts),
+        "plays":       _sp_str(track_data, "playcount"),
+        "cover":       cover,
+        "is_explicit": is_explicit,
+    }
+
+
+def filter_album(data: dict, separator: str = ", ") -> dict:
+    """
+    Parse a Spotify v2 getAlbum GraphQL response into a structured dict.
+
+    Returns a dict with keys: id, name, artists, cover, releaseDate, count,
+    tracks (list), discs, label.
+    """
+    album_data = _sp_map(_sp_map(data, "data"), "albumUnion")
+    if not album_data:
+        return {}
+
+    artists     = _sp_extract_artists(_sp_map(album_data, "artists"))
+    artists_str = separator.join(a["name"] for a in artists)
+
+    cover_obj = _sp_extract_cover(_sp_map(album_data, "coverArt"))
+    cover: str | None = None
+    if cover_obj:
+        cover = cover_obj.get("small") or cover_obj.get("medium") or cover_obj.get("large")
+
+    tracks: list[dict] = []
+    for item in _sp_list(_sp_map(album_data, "tracksV2"), "items"):
+        if not isinstance(item, dict):
+            continue
+        track = _sp_map(item, "track")
+        if not track:
+            continue
+
+        artists_data     = _sp_map(track, "artists")
+        track_artists    = _sp_extract_artists(artists_data)
+        track_artists_str = separator.join(a["name"] for a in track_artists)
+
+        artist_ids: list[str] = []
+        for ai in _sp_list(artists_data, "items"):
+            if not isinstance(ai, dict):
+                continue
+            uri = _sp_str(ai, "uri")
+            if ":" in uri:
+                artist_ids.append(uri.split(":")[-1])
+
+        track_uri = _sp_str(track, "uri")
+        track_id  = track_uri.split(":")[-1] if ":" in track_uri else ""
+
+        duration_ms = _sp_float(_sp_map(track, "duration"), "totalMilliseconds")
+        disc        = int(_sp_float(track, "discNumber")) or 1
+
+        content_rating = _sp_map(track, "contentRating")
+        is_explicit    = _sp_str(content_rating, "label") == "EXPLICIT"
+
+        tracks.append({
+            "id":          track_id,
+            "name":        _sp_str(track, "name"),
+            "artists":     track_artists_str,
+            "artistIds":   artist_ids,
+            "duration":    _sp_extract_duration(duration_ms),
+            "plays":       _sp_str(track, "playcount"),
+            "is_explicit": is_explicit,
+            "disc_number": disc,
+        })
+
+    date_info    = _sp_map(album_data, "date")
+    iso          = _sp_str(date_info, "isoString")
+    release_date = iso[:10] if iso else ""
+
+    album_uri = _sp_str(album_data, "uri")
+    album_id  = album_uri.split(":")[-1] if ":" in album_uri else ""
+
+    discs_data  = _sp_map(album_data, "discs")
+    total_discs = int(_sp_float(discs_data, "totalCount")) or 1
+
+    return {
+        "id":          album_id,
+        "name":        _sp_str(album_data, "name"),
+        "artists":     artists_str,
+        "cover":       cover,
+        "releaseDate": release_date,
+        "count":       len(tracks),
+        "tracks":      tracks,
+        "discs":       {"totalCount": total_discs},
+        "label":       _sp_str(album_data, "label"),
+    }
+
+
+def filter_playlist(data: dict, separator: str = ", ") -> dict:
+    """
+    Parse a Spotify v2 fetchPlaylist GraphQL response into a structured dict.
+
+    Returns a dict with keys: id, name, description, owner, cover, followers,
+    count, tracks (list).
+    """
+    playlist_data = _sp_map(_sp_map(data, "data"), "playlistV2")
+    if not playlist_data:
+        return {}
+
+    owner_data = _sp_map(_sp_map(playlist_data, "ownerV2"), "data")
+    owner_info: dict | None = None
+    if owner_data:
+        avatar_url: str | None = None
+        avatar_sources = _sp_list(_sp_map(owner_data, "avatar"), "sources")
+        if avatar_sources and isinstance(avatar_sources[0], dict):
+            avatar_url = _sp_str(avatar_sources[0], "url") or None
+        owner_info = {
+            "name":   _sp_str(owner_data, "name"),
+            "avatar": avatar_url,
+        }
+
+    images_data = _sp_map(playlist_data, "images") or _sp_map(playlist_data, "imagesV2")
+    cover: str | None = None
+    image_items = _sp_list(images_data, "items")
+    if image_items and isinstance(image_items[0], dict):
+        first_sources = _sp_list(image_items[0], "sources")
+        if first_sources and isinstance(first_sources[0], dict):
+            cover = _sp_str(first_sources[0], "url") or None
+    if cover is None:
+        img_sources = _sp_list(images_data, "sources")
+        if img_sources and isinstance(img_sources[0], dict):
+            cover = _sp_str(img_sources[0], "url") or None
+
+    tracks: list[dict] = []
+    for item in _sp_list(_sp_map(playlist_data, "content"), "items"):
+        if not isinstance(item, dict):
+            continue
+        track_data = _sp_map(_sp_map(item, "itemV2"), "data")
+        if not track_data:
+            continue
+
+        track_name = _sp_str(track_data, "name")
+        if not track_name:
+            continue
+
+        rank = status = None
+        for attr in _sp_list(item, "attributes"):
+            if not isinstance(attr, dict):
+                continue
+            k = _sp_str(attr, "key")
+            if k == "rank":
+                rank   = _sp_str(attr, "value")
+            elif k == "status":
+                status = _sp_str(attr, "value")
+
+        artists_data      = _sp_map(track_data, "artists")
+        track_artists     = _sp_extract_artists(artists_data)
+        track_artists_str = separator.join(a["name"] for a in track_artists)
+
+        artist_ids: list[str] = []
+        for ai in _sp_list(artists_data, "items"):
+            if not isinstance(ai, dict):
+                continue
+            uri = _sp_str(ai, "uri")
+            if ":" in uri:
+                artist_ids.append(uri.split(":")[-1])
+
+        track_uri = _sp_str(track_data, "uri")
+        track_id  = _sp_str(track_data, "id") or (
+            track_uri.split(":")[-1] if ":" in track_uri else ""
+        )
+
+        album_data       = _sp_map(track_data, "albumOfTrack")
+        album_name       = album_id = album_artists_str = ""
+        track_cover: str | None = None
+        if album_data:
+            album_name  = _sp_str(album_data, "name")
+            album_uri   = _sp_str(album_data, "uri")
+            album_id    = album_uri.split(":")[-1] if ":" in album_uri else ""
+            cover_obj   = _sp_extract_cover(_sp_map(album_data, "coverArt"))
+            if cover_obj:
+                track_cover = (
+                    cover_obj.get("small") or
+                    cover_obj.get("medium") or
+                    cover_obj.get("large")
+                )
+            al = _sp_extract_artists(_sp_map(album_data, "artists"))
+            album_artists_str = separator.join(a["name"] for a in al)
+
+        duration_ms    = _sp_float(_sp_map(track_data, "trackDuration"), "totalMilliseconds")
+        content_rating = _sp_map(track_data, "contentRating")
+        is_explicit    = _sp_str(content_rating, "label") == "EXPLICIT"
+
+        tracks.append({
+            "id":          track_id,
+            "cover":       track_cover,
+            "title":       track_name,
+            "artist":      track_artists_str,
+            "artistIds":   artist_ids,
+            "plays":       rank,
+            "status":      status,
+            "album":       album_name,
+            "albumArtist": album_artists_str,
+            "albumId":     album_id,
+            "duration":    _sp_extract_duration(duration_ms),
+            "is_explicit": is_explicit,
+            "disc_number": int(_sp_float(track_data, "discNumber")),
+        })
+
+    followers_data = playlist_data.get("followers")
+    followers: float | None = None
+    if isinstance(followers_data, dict):
+        v = _sp_float(followers_data, "totalCount")
+        followers = v if v else None
+
+    playlist_uri = _sp_str(playlist_data, "uri")
+    playlist_id  = playlist_uri.split(":")[-1] if ":" in playlist_uri else ""
+
+    return {
+        "id":          playlist_id,
+        "name":        _sp_str(playlist_data, "name"),
+        "description": html.unescape(_sp_str(playlist_data, "description")),
+        "owner":       owner_info,
+        "cover":       cover,
+        "followers":   followers,
+        "count":       len(tracks),
+        "tracks":      tracks,
+    }
+
+
+# ---------------------------------------------------------------------------
+# (existing code continues below)
+# ---------------------------------------------------------------------------
 
 def _isrc_soundplate(track_id: str) -> str | None:
     """Last-resort ISRC lookup via Soundplate."""
