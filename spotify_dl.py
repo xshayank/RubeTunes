@@ -16,7 +16,6 @@ Qobuz metadata API credentials are auto-scraped from open.qobuz.com and
 cached on disk for 24 hours — no account, email, or API key is needed.
 
 Environment variables (all optional):
-  SPOTIFY_TOTP_SECRET     Base-32 TOTP secret for anonymous Spotify token.
   SPOTIFY_CLIENT_ID       } Spotify app credentials; fallback if anon token fails.
   SPOTIFY_CLIENT_SECRET   }
   DEEZER_ARL              Deezer account ARL cookie — enables lossless FLAC.
@@ -45,11 +44,16 @@ log = logging.getLogger("spotify_dl")
 # ---------------------------------------------------------------------------
 # Environment / config
 # ---------------------------------------------------------------------------
-SPOTIFY_TOTP_SECRET   = os.getenv("SPOTIFY_TOTP_SECRET",   "").strip()
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID",     "").strip()
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 DEEZER_ARL            = os.getenv("DEEZER_ARL",            "").strip()
 TIDAL_TOKEN           = os.getenv("TIDAL_TOKEN",           "").strip()
+
+# ---------------------------------------------------------------------------
+# Spotify TOTP — hardcoded secret and version (no env var needed)
+# ---------------------------------------------------------------------------
+_SPOTIFY_TOTP_SECRET  = "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4DQOJUGQYTAMRRGA2TCMJSHE3TCMBY"
+_SPOTIFY_TOTP_VERSION = 61
 
 # ---------------------------------------------------------------------------
 # Qobuz API — auto-scraped credentials (no account needed)
@@ -387,10 +391,14 @@ _HEADERS_BASE = {
 
 def _fetch_anon_token() -> tuple[str, float]:
     """Get an anonymous Spotify access token from the web-player endpoint."""
-    params: dict = {"reason": "transport", "productType": "web_player"}
-    if SPOTIFY_TOTP_SECRET:
-        ts = int(time.time() * 1000)
-        params.update({"totp": _totp(SPOTIFY_TOTP_SECRET), "totpVer": "5", "ts": str(ts)})
+    ts = int(time.time() * 1000)
+    params: dict = {
+        "reason": "transport",
+        "productType": "web_player",
+        "totp": _totp(_SPOTIFY_TOTP_SECRET),
+        "totpVer": str(_SPOTIFY_TOTP_VERSION),
+        "ts": str(ts),
+    }
     resp = requests.get(
         "https://open.spotify.com/get_access_token",
         params=params,
@@ -444,7 +452,7 @@ def get_token() -> str:
 
     raise RuntimeError(
         "Cannot get Spotify token. "
-        "Set SPOTIFY_TOTP_SECRET or SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET."
+        "Set SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET as a fallback."
     )
 
 
