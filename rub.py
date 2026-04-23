@@ -517,6 +517,64 @@ async def selection_handler(update):
         log.info("queued at position %d | guid=%s", pos, object_guid)
 
 
+async def _compress_video(src: Path, log) -> Path:
+    """
+    Re-encode *src* with ffmpeg CRF-18 (visually lossless H.264) into a
+    temporary file, then atomically replace *src* with the result.
+    Returns the final path (same as *src* on success, original on failure).
+    """
+    tmp = src.with_suffix(".tmp.mp4")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(src),
+        "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(tmp),
+    ]
+    log.info("compressing: %s", src.name)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=3600.0)
+        if proc.returncode != 0:
+            log.warning(
+                "ffmpeg compression failed (code %s): %s",
+                proc.returncode,
+                out.decode("utf-8", errors="replace")[-500:],
+            )
+            if tmp.exists():
+                tmp.unlink()
+            return src
+
+        before_bytes = src.stat().st_size
+        after_bytes = tmp.stat().st_size
+        ratio = (1.0 - after_bytes / before_bytes) * 100.0 if before_bytes else 0.0
+        before_mb = before_bytes / (1024 * 1024)
+        after_mb = after_bytes / (1024 * 1024)
+        log.info(
+            "compression result: %.2f MB -> %.2f MB  (%.1f%% smaller)",
+            before_mb, after_mb, ratio,
+        )
+
+        tmp.replace(src)
+        return src
+
+    except asyncio.TimeoutError:
+        log.warning("ffmpeg compression timed out -- sending original")
+        if tmp.exists():
+            tmp.unlink()
+        return src
+    except Exception as exc:
+        log.warning("ffmpeg compression error: %s -- sending original", exc)
+        if tmp.exists():
+            tmp.unlink()
+        return src
+
+
 async def _do_download(object_guid: str, url: str, choice: dict, title: str, log) -> None:
     """Run yt-dlp for the selected choice, stream progress, then send the file."""
     status = await app.send_message(object_guid, "\u23f3 Starting: {}\u2026".format(choice["label"]))
@@ -595,6 +653,17 @@ async def _do_download(object_guid: str, url: str, choice: dict, title: str, log
         file_path = Path(downloaded_file)
         size_mb = file_path.stat().st_size / (1024 * 1024)
         log.info("sending: %s (%.2f MB)", downloaded_file, size_mb)
+
+        # Compress video files (not audio-only, not subtitles)
+        if not choice.get("audio_only") and not choice.get("subtitle_only"):
+            await app.edit_message(
+                object_guid, status_id,
+                "\u2699\ufe0f Compressing video (CRF-18, visually lossless)\u2026"
+            )
+            file_path = await _compress_video(file_path, log)
+            downloaded_file = str(file_path)
+            size_mb = file_path.stat().st_size / (1024 * 1024)
+            log.info("post-compression size: %.2f MB", size_mb)
 
         await app.edit_message(object_guid, status_id, "\u2705 Download complete. Sending\u2026")
         caption = "{}\n{}".format(title, url) if title else url
