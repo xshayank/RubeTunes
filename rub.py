@@ -58,6 +58,16 @@ SPOTIFY_RE = re.compile(
     r'|(?<![A-Za-z0-9])([A-Za-z0-9]{22})(?![A-Za-z0-9])'
 )
 
+SPOTIFY_PLAYLIST_RE = re.compile(
+    r'https?://open\.spotify\.com/playlist/([A-Za-z0-9]{22})'
+    r'|spotify:playlist:([A-Za-z0-9]{22})'
+)
+
+SPOTIFY_ALBUM_RE = re.compile(
+    r'https?://open\.spotify\.com/album/([A-Za-z0-9]{22})'
+    r'|spotify:album:([A-Za-z0-9]{22})'
+)
+
 TIDAL_RE = re.compile(
     r'https?://(?:www\.|listen\.)?tidal\.com/(?:browse/)?(?:track|album/[^/\s]+/track)/(\d+)'
     r'|https?://listen\.tidal\.com/album/[^/\s]+/track/(\d+)'
@@ -79,6 +89,7 @@ PROGRESS_RE = re.compile(
 
 UPDATE_INTERVAL = 3.0
 SELECTION_TIMEOUT = 300.0          # seconds before a pending quality menu expires
+MUSIC_SELECTION_TIMEOUT = 300.0    # same for music quality/platform menus
 SIZE_LIMIT_BYTES = 2 * 1024 ** 3   # 2 GB hard limit — options above this are hidden
 MAX_LOG_ENTRIES = 500               # keep the most recent N log lines
 
@@ -412,9 +423,7 @@ async def _run_download_and_queue(
     finally:
         if download_queue:
             next_entry = download_queue.popleft()
-            # Refresh remaining users' position indicators
             await _notify_queue_positions()
-            # Tell the next user they have reached the front
             try:
                 await app.edit_message(
                     next_entry["object_guid"],
@@ -425,20 +434,7 @@ async def _run_download_and_queue(
             except Exception:
                 pass
             await asyncio.sleep(1)
-            # Dispatch next entry — may be Spotify or YouTube
-            if next_entry["choice"] is None:
-                asyncio.create_task(
-                    _run_spotify_and_queue(next_entry["object_guid"], next_entry["url"])
-                )
-            else:
-                asyncio.create_task(
-                    _run_download_and_queue(
-                        next_entry["object_guid"],
-                        next_entry["url"],
-                        next_entry["choice"],
-                        next_entry["title"],
-                    )
-                )
+            _dispatch_queue_entry(next_entry)
         else:
             is_downloading = False
 
@@ -463,18 +459,23 @@ async def start_handler(update):
         update.object_guid,
         "\U0001f3ac Welcome!\n\n"
         "\U0001f4cc Commands:\n"
-        "  !download <url> \u2014 Fetch quality options for a YouTube video\n"
-        "  !spotify <url>  \u2014 Download a Spotify track\n"
-        "  !tidal <url>    \u2014 Download a Tidal track\n"
-        "  !qobuz <url>    \u2014 Download a Qobuz track\n"
-        "  !amazon <url>   \u2014 Download an Amazon Music track\n"
-        "  !cancel         \u2014 Cancel a pending quality selection\n"
-        "  !start          \u2014 Show this message\n\n"
-        "After sending !download the bot lists available qualities.\n"
-        "Reply with !1, !2, \u2026 to pick one. Options above 2 GB are hidden.\n\n"
-        "Music commands download as FLAC (Qobuz or Deezer, if credentials are\n"
-        "configured) or MP3 320 k (YouTube Music fallback). Full metadata and\n"
-        "cover art are embedded automatically."
+        "  !download <url>  \u2014 Download a YouTube video (choose quality)\n"
+        "  !spotify <url>   \u2014 Download a Spotify track / album / playlist\n"
+        "  !tidal <url>     \u2014 Download a Tidal track\n"
+        "  !qobuz <url>     \u2014 Download a Qobuz track\n"
+        "  !amazon <url>    \u2014 Download an Amazon Music track\n"
+        "  !cancel          \u2014 Cancel any pending selection\n"
+        "  !start           \u2014 Show this message\n\n"
+        "\U0001f3b5 Music download flow:\n"
+        "  1\ufe0f\u20e3 Send a music command with a URL\n"
+        "  2\ufe0f\u20e3 Choose audio quality (MP3 / FLAC CD / FLAC Hi-Res)\n"
+        "  3\ufe0f\u20e3 Choose from the platforms that have the track\n"
+        "  \U0001f4c2 For playlists/albums: quality is asked once, then all tracks\n"
+        "     are downloaded and zipped automatically.\n\n"
+        "Supported lossless sources (when credentials are set):\n"
+        "  \u2022 Qobuz FLAC Hi-Res / CD  (QOBUZ_EMAIL + QOBUZ_PASSWORD)\n"
+        "  \u2022 Deezer FLAC CD          (DEEZER_ARL)\n"
+        "  \u2022 YouTube Music MP3       (always available as fallback)"
     )
 
 
@@ -604,7 +605,7 @@ async def selection_handler(update):
     if not entry:
         await app.send_message(
             object_guid,
-            "\u26a0\ufe0f No active quality menu. Use !download <url> first."
+            "\u26a0\ufe0f No active menu. Use !download or a music command first."
         )
         return
 
@@ -614,6 +615,98 @@ async def selection_handler(update):
         await app.send_message(object_guid, "\u274c Invalid selection.")
         return
 
+    entry_type = entry.get("type", "youtube")
+
+    # ------------------------------------------------------------------
+    # Music quality selection (step 1 of 2 for tracks, step 1 of 1 for
+    # playlists/albums)
+    # ------------------------------------------------------------------
+    if entry_type == "music_quality":
+        choices = entry["choices"]  # QUALITY_MENU list from spotify_dl
+        if idx < 0 or idx >= len(choices):
+            await app.send_message(
+                object_guid,
+                "\u274c Please choose between !1 and !{}, or !cancel.".format(len(choices))
+            )
+            return
+
+        # Consume
+        pending_selections.pop(object_guid, None)
+        if entry.get("timeout_task"):
+            entry["timeout_task"].cancel()
+
+        quality = choices[idx]["quality"]
+        url     = entry["url"]
+        platform = entry["platform"]
+        url_type = entry["url_type"]   # "track" | "playlist" | "album"
+        extra    = entry.get("extra", {})
+
+        _append_log(object_guid, "music_quality_selected", "{} | {}".format(quality, url))
+
+        if url_type == "track":
+            # Resolve platforms then show platform-selection menu
+            asyncio.create_task(
+                _show_platform_menu(object_guid, url, platform, quality, log)
+            )
+        else:
+            # Playlist / album — start batch download directly
+            asyncio.create_task(
+                _do_batch_download(object_guid, url, platform, quality, url_type, extra, log)
+            )
+        return
+
+    # ------------------------------------------------------------------
+    # Music platform selection (step 2 of 2 for single tracks)
+    # ------------------------------------------------------------------
+    if entry_type == "music_platform":
+        choices = entry["choices"]
+        if idx < 0 or idx >= len(choices):
+            await app.send_message(
+                object_guid,
+                "\u274c Please choose between !1 and !{}, or !cancel.".format(len(choices))
+            )
+            return
+
+        # Consume
+        pending_selections.pop(object_guid, None)
+        if entry.get("timeout_task"):
+            entry["timeout_task"].cancel()
+
+        choice = choices[idx]
+        url   = entry["url"]
+        info  = entry["info"]
+        _append_log(object_guid, "music_platform_selected", "{} | {}".format(choice["label"], url))
+
+        if not is_downloading:
+            is_downloading = True
+            asyncio.create_task(
+                _run_music_choice_and_queue(object_guid, info, choice)
+            )
+        else:
+            pos = len(download_queue) + 1
+            people = "person" if pos == 1 else "people"
+            queue_msg = await app.send_message(
+                object_guid,
+                "\u23f3 The bot is busy right now.\n"
+                "There {} {} {} ahead of you.".format(
+                    "is" if pos == 1 else "are", pos, people
+                ),
+            )
+            download_queue.append({
+                "object_guid": object_guid,
+                "url":         url,
+                "choice":      None,          # sentinel: music-choice entry
+                "info":        info,
+                "music_choice": choice,
+                "title":       "{} — {}".format(info.get("title",""), ", ".join(info.get("artists") or [])),
+                "queue_msg_id": queue_msg.message_id,
+            })
+            log.info("music_choice queued at position %d | guid=%s", pos, object_guid)
+        return
+
+    # ------------------------------------------------------------------
+    # YouTube quality selection (original behaviour)
+    # ------------------------------------------------------------------
     choices = entry["choices"]
     if idx < 0 or idx >= len(choices):
         await app.send_message(
@@ -656,6 +749,334 @@ async def selection_handler(update):
         })
         log.info("queued at position %d | guid=%s", pos, object_guid)
 
+
+
+async def _show_platform_menu(
+    object_guid: str, url: str, platform: str, quality: str, log
+) -> None:
+    """
+    Resolve all platforms for *url* and show the user a numbered platform menu.
+    Stores a 'music_platform' entry in pending_selections so the user can pick.
+    """
+    status = await app.send_message(
+        object_guid, "\U0001f50d Checking platforms\u2026"
+    )
+    status_id = status.message_id
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Fetch metadata (reuse existing per-platform fetchers)
+        await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching track info\u2026")
+        if platform == "spotify":
+            track_id = _spodl.parse_spotify_track_id(url)
+            if not track_id:
+                await app.edit_message(object_guid, status_id,
+                                        "\u274c Could not parse Spotify track ID from: {}".format(url))
+                return
+            info = await loop.run_in_executor(None, _spodl.get_track_info, track_id)
+
+        elif platform == "tidal":
+            track_id = _spodl.parse_tidal_track_id(url)
+            if not track_id:
+                await app.edit_message(object_guid, status_id,
+                                        "\u274c Could not parse Tidal track ID from: {}".format(url))
+                return
+            info = await loop.run_in_executor(None, _spodl.get_tidal_track_info, track_id)
+
+        elif platform == "qobuz":
+            track_id = _spodl.parse_qobuz_track_id(url)
+            if not track_id:
+                await app.edit_message(object_guid, status_id,
+                                        "\u274c Could not parse Qobuz track ID from: {}".format(url))
+                return
+            info = await loop.run_in_executor(None, _spodl.get_qobuz_track_info, track_id)
+
+        elif platform == "amazon":
+            track_id = _spodl.parse_amazon_track_id(url)
+            if not track_id:
+                await app.edit_message(object_guid, status_id,
+                                        "\u274c Could not parse Amazon Music track ID from: {}".format(url))
+                return
+            ytbin = _ytdlp_bin()
+            info = await loop.run_in_executor(None, _spodl.get_amazon_track_info, track_id, ytbin)
+
+        else:
+            await app.edit_message(object_guid, status_id,
+                                    "\u274c Unknown platform: {}".format(platform))
+            return
+
+        title       = info.get("title") or "Unknown"
+        artists_str = ", ".join(info.get("artists") or [])
+
+        # Build platform choices for the requested quality
+        choices = _spodl.build_platform_choices(info, quality)
+
+        if not choices:
+            await app.edit_message(
+                object_guid, status_id,
+                "\u274c No download sources found for this track."
+            )
+            return
+
+        quality_label = _spodl._QUALITY_LABELS.get(quality, quality)
+        lines = [
+            "\U0001f3b5 {} \u2014 {}".format(title, artists_str),
+            "\U0001f4c0 Requested: {}".format(quality_label),
+            "",
+            "Available platforms:",
+        ]
+        for i, c in enumerate(choices, 1):
+            lines.append("  !{} \u2014 {}".format(i, c["label"]))
+        lines += ["  !cancel \u2014 Cancel", "", "\u23f0 This menu expires in 5 minutes."]
+
+        await app.edit_message(object_guid, status_id, "\n".join(lines))
+
+        timeout_task = asyncio.create_task(_expire_selection(object_guid))
+        pending_selections[object_guid] = {
+            "type":         "music_platform",
+            "url":          url,
+            "info":         info,
+            "quality":      quality,
+            "choices":      choices,
+            "title":        "{} \u2014 {}".format(title, artists_str),
+            "timeout_task": timeout_task,
+        }
+        log.info("platform menu sent | %d choices | guid=%s", len(choices), object_guid)
+
+    except Exception as exc:
+        log.exception("_show_platform_menu error: %s", exc)
+        try:
+            await app.edit_message(object_guid, status_id,
+                                    "\u274c Error resolving track: {}".format(exc))
+        except Exception:
+            pass
+
+
+async def _do_batch_download(
+    object_guid: str, url: str, platform: str, quality: str,
+    url_type: str, extra: dict, log
+) -> None:
+    """
+    Download all tracks in a playlist or album, zip them, and send the zip.
+    *url_type* is "playlist" or "album".
+    *extra* carries pre-fetched info like collection_name and track_ids.
+    """
+    import zipfile
+    import tempfile
+
+    status = await app.send_message(
+        object_guid, "\U0001f4c2 Starting batch download\u2026"
+    )
+    status_id = status.message_id
+
+    try:
+        loop = asyncio.get_event_loop()
+        collection_name = extra.get("collection_name", "music")
+        track_ids       = extra.get("track_ids", [])
+
+        if not track_ids:
+            await app.edit_message(object_guid, status_id,
+                                    "\u274c No tracks found in the playlist/album.")
+            return
+
+        total = len(track_ids)
+        await app.edit_message(
+            object_guid, status_id,
+            "\U0001f4c2 {} — {} tracks\n\U0001f3b5 Quality: {}".format(
+                collection_name,
+                total,
+                _spodl._QUALITY_LABELS.get(quality, quality),
+            )
+        )
+
+        # Create a temp directory for this batch
+        batch_dir = DOWNLOAD_DIR / _spodl._safe_filename(collection_name)
+        batch_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded: list = []
+        failed: list = []
+        ytbin = _ytdlp_bin()
+
+        for i, track_id in enumerate(track_ids, 1):
+            try:
+                await app.edit_message(
+                    object_guid, status_id,
+                    "\U0001f4e5 [{}/{}] Downloading\u2026".format(i, total)
+                )
+                # Fetch track info
+                info = await loop.run_in_executor(None, _spodl.get_track_info, track_id)
+                # Pick best source for requested quality (first matching choice)
+                choices = _spodl.build_platform_choices(info, quality)
+                choice  = choices[0] if choices else None
+                if not choice:
+                    failed.append(track_id)
+                    continue
+                fp = await _spodl.download_track_from_choice(info, choice, batch_dir, ytbin)
+                downloaded.append(fp)
+            except Exception as exc:
+                log.warning("batch track %s failed: %s", track_id, exc)
+                failed.append(track_id)
+                continue
+
+        if not downloaded:
+            await app.edit_message(object_guid, status_id,
+                                    "\u274c No tracks could be downloaded.")
+            return
+
+        # Zip all downloaded files
+        await app.edit_message(object_guid, status_id, "\U0001f4e6 Zipping {} files\u2026".format(len(downloaded)))
+        safe_name  = _spodl._safe_filename(collection_name)
+        zip_path   = DOWNLOAD_DIR / "{}.zip".format(safe_name)
+        with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+            for fp in downloaded:
+                zf.write(str(fp), fp.name)
+
+        # Clean up individual files
+        for fp in downloaded:
+            try:
+                fp.unlink()
+            except Exception:
+                pass
+        try:
+            batch_dir.rmdir()
+        except Exception:
+            pass
+
+        size_mb = zip_path.stat().st_size / (1024 * 1024)
+        caption = "{}\n{} tracks | {}".format(
+            collection_name, len(downloaded),
+            _spodl._QUALITY_LABELS.get(quality, quality)
+        )
+        if failed:
+            caption += "\n\u26a0\ufe0f {} track(s) failed".format(len(failed))
+
+        await app.edit_message(object_guid, status_id,
+                                "\U0001f4e4 Sending zip ({:.1f} MB)\u2026".format(size_mb))
+        try:
+            await app.send_document(object_guid, str(zip_path), caption=caption)
+            log.info("batch zip sent: %s (%.1f MB)", zip_path.name, size_mb)
+        except Exception as exc:
+            log.error("send zip failed: %s", exc)
+            await app.send_message(object_guid, "\u274c Failed to send zip: {}".format(exc))
+            return
+        finally:
+            try:
+                zip_path.unlink()
+            except Exception:
+                pass
+
+        await app.edit_message(object_guid, status_id, "\u2705 Done! {} tracks sent.".format(len(downloaded)))
+
+    except Exception as exc:
+        log.exception("_do_batch_download error: %s", exc)
+        try:
+            await app.edit_message(object_guid, status_id, "\u274c Error: {}".format(exc))
+        except Exception:
+            pass
+
+
+async def _do_music_from_choice(object_guid: str, info: dict, choice: dict, log) -> None:
+    """Download a single track using a specific platform choice and send it."""
+    title       = info.get("title") or "Unknown"
+    artists_str = ", ".join(info.get("artists") or [])
+    status = await app.send_message(
+        object_guid,
+        "\U0001f4e5 Downloading [{}]: {} \u2014 {}".format(
+            choice["label"], title, artists_str
+        )
+    )
+    status_id = status.message_id
+
+    try:
+        fp = await _spodl.download_track_from_choice(info, choice, DOWNLOAD_DIR, _ytdlp_bin())
+
+        try:
+            await app.edit_message(
+                object_guid, status_id,
+                "\U0001f4e4 Sending {} ({})\u2026".format(
+                    fp.name, fp.suffix.lstrip(".").upper()
+                ),
+            )
+        except Exception:
+            pass
+
+        caption = "{} \u2014 {}".format(title, artists_str) if artists_str else title
+        try:
+            await app.send_document(object_guid, str(fp), caption=caption)
+            log.info("sent: %s", fp)
+        except Exception as exc:
+            log.error("send failed: %s", exc)
+            await app.send_message(object_guid, "\u274c Failed to send file: {}".format(exc))
+        finally:
+            try:
+                fp.unlink()
+            except Exception:
+                pass
+
+        await app.edit_message(object_guid, status_id, "\u2705 Done!")
+
+    except Exception as exc:
+        log.exception("_do_music_from_choice error: %s", exc)
+        try:
+            await app.edit_message(object_guid, status_id, "\u274c Error: {}".format(exc))
+        except Exception:
+            pass
+
+
+async def _run_music_choice_and_queue(
+    object_guid: str, info: dict, choice: dict
+) -> None:
+    """Run one music-from-choice download then hand off to the next queue entry."""
+    global is_downloading
+    log = logging.getLogger("queue")
+    try:
+        await _do_music_from_choice(object_guid, info, choice, log)
+    finally:
+        if download_queue:
+            next_entry = download_queue.popleft()
+            await _notify_queue_positions()
+            try:
+                await app.edit_message(
+                    next_entry["object_guid"], next_entry["queue_msg_id"],
+                    "\U0001f7e2 You are first in the queue!\nStarting your download\u2026",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            _dispatch_queue_entry(next_entry)
+        else:
+            is_downloading = False
+
+
+def _dispatch_queue_entry(entry: dict) -> None:
+    """Create the appropriate asyncio task for a queue entry."""
+    if entry.get("music_choice") is not None:
+        asyncio.create_task(
+            _run_music_choice_and_queue(
+                entry["object_guid"],
+                entry["info"],
+                entry["music_choice"],
+            )
+        )
+    elif entry.get("choice") is None:
+        # Old-style music platform entry
+        asyncio.create_task(
+            _run_music_and_queue(
+                entry["object_guid"],
+                entry["url"],
+                entry.get("platform", "spotify"),
+            )
+        )
+    else:
+        asyncio.create_task(
+            _run_download_and_queue(
+                entry["object_guid"],
+                entry["url"],
+                entry["choice"],
+                entry.get("title", ""),
+            )
+        )
 
 
 async def _do_download(object_guid: str, url: str, choice: dict, title: str, log) -> None:
@@ -976,6 +1397,37 @@ _PLATFORM_NAMES = {
 }
 
 
+def _send_quality_menu(object_guid: str, url: str, platform: str,
+                       url_type: str, extra: dict) -> None:
+    """
+    Store a 'music_quality' pending entry for *object_guid* so the user can
+    choose MP3 / FLAC CD / FLAC Hi-Res.
+    """
+    timeout_task = asyncio.create_task(_expire_selection(object_guid))
+    pending_selections[object_guid] = {
+        "type":         "music_quality",
+        "url":          url,
+        "platform":     platform,
+        "url_type":     url_type,
+        "extra":        extra,
+        "choices":      list(_spodl.QUALITY_MENU),
+        "timeout_task": timeout_task,
+    }
+
+
+async def _ask_quality(object_guid: str, header: str,
+                       url: str, platform: str, url_type: str, extra: dict) -> None:
+    """Send a quality-selection menu to the user."""
+    lines = [header, ""]
+    lines.append("Choose audio quality:")
+    for i, q in enumerate(_spodl.QUALITY_MENU, 1):
+        lines.append("  !{} \u2014 {}".format(i, q["label"]))
+    lines += ["  !cancel \u2014 Cancel", "", "\u23f0 This menu expires in 5 minutes."]
+    await app.send_message(object_guid, "\n".join(lines))
+    _send_quality_menu(object_guid, url, platform, url_type, extra)
+
+
+# Keep the old _do_music_download for backward-compat (used by old queue entries)
 async def _do_music_download(object_guid: str, url: str, platform: str, log) -> None:
     """Resolve metadata for *url* from *platform*, pick the best download source, send file."""
     pname = _PLATFORM_NAMES.get(platform, platform.capitalize())
@@ -985,17 +1437,12 @@ async def _do_music_download(object_guid: str, url: str, platform: str, log) -> 
     try:
         loop = asyncio.get_event_loop()
 
-        # --- Fetch metadata ---
         if platform == "spotify":
             track_id = _spodl.parse_spotify_track_id(url)
             if not track_id:
                 await app.edit_message(object_guid, status_id,
                                         "\u274c Could not parse Spotify track ID from: {}".format(url))
                 return
-            try:
-                await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Spotify metadata\u2026")
-            except Exception:
-                pass
             info = await loop.run_in_executor(None, _spodl.get_track_info, track_id)
 
         elif platform == "tidal":
@@ -1004,10 +1451,6 @@ async def _do_music_download(object_guid: str, url: str, platform: str, log) -> 
                 await app.edit_message(object_guid, status_id,
                                         "\u274c Could not parse Tidal track ID from: {}".format(url))
                 return
-            try:
-                await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Tidal metadata\u2026")
-            except Exception:
-                pass
             info = await loop.run_in_executor(None, _spodl.get_tidal_track_info, track_id)
 
         elif platform == "qobuz":
@@ -1016,10 +1459,6 @@ async def _do_music_download(object_guid: str, url: str, platform: str, log) -> 
                 await app.edit_message(object_guid, status_id,
                                         "\u274c Could not parse Qobuz track ID from: {}".format(url))
                 return
-            try:
-                await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Qobuz metadata\u2026")
-            except Exception:
-                pass
             info = await loop.run_in_executor(None, _spodl.get_qobuz_track_info, track_id)
 
         elif platform == "amazon":
@@ -1028,10 +1467,6 @@ async def _do_music_download(object_guid: str, url: str, platform: str, log) -> 
                 await app.edit_message(object_guid, status_id,
                                         "\u274c Could not parse Amazon Music track ID from: {}".format(url))
                 return
-            try:
-                await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Amazon Music metadata\u2026")
-            except Exception:
-                pass
             ytbin = _ytdlp_bin()
             info = await loop.run_in_executor(None, _spodl.get_amazon_track_info, track_id, ytbin)
 
@@ -1051,7 +1486,6 @@ async def _do_music_download(object_guid: str, url: str, platform: str, log) -> 
         except Exception:
             pass
 
-        # --- Download + tag ---
         fp = await _spodl.download_track(info, DOWNLOAD_DIR, _ytdlp_bin())
 
         try:
@@ -1092,7 +1526,6 @@ async def _do_spotify_download(object_guid: str, url: str, log) -> None:
 
 @app.on_message_updates(filters.commands("spotify", prefixes="!"))
 async def spotify_handler(update):
-    global is_downloading
     log = logging.getLogger("spotify")
     object_guid = update.object_guid
     log.info("!spotify | guid=%s", object_guid)
@@ -1103,27 +1536,80 @@ async def spotify_handler(update):
         return
 
     args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
-    track_id = _spodl.parse_spotify_track_id(args)
-
-    if not track_id:
+    args = args.strip()
+    if not args:
         await app.send_message(
             object_guid,
-            "\u274c Please provide a valid Spotify track link.\n"
-            "Accepted formats:\n"
-            "  https://open.spotify.com/track/<id>\n"
-            "  spotify:track:<id>\n"
-            "  (bare 22-character track ID)"
+            "\u274c Please provide a Spotify track, album, or playlist link.\n"
+            "Example: !spotify https://open.spotify.com/track/<id>"
         )
         return
 
-    url = args.strip()
-    _append_log(object_guid, "spotify_track", url)
-    await _enqueue_music(object_guid, url, "spotify", log)
+    # Detect URL type: playlist > album > track
+    pl_id  = _spodl.parse_spotify_playlist_id(args)
+    alb_id = _spodl.parse_spotify_album_id(args)
+    tr_id  = _spodl.parse_spotify_track_id(args)
+
+    if pl_id:
+        _append_log(object_guid, "spotify_playlist", args)
+        await app.send_message(object_guid, "\U0001f50d Fetching playlist info\u2026")
+        try:
+            loop = asyncio.get_event_loop()
+            pl_info, track_ids = await loop.run_in_executor(
+                None, _spodl.get_spotify_playlist_tracks, pl_id
+            )
+            collection_name = pl_info.get("name", "playlist")
+            header = "\U0001f4c2 Playlist: {} ({} tracks)".format(collection_name, len(track_ids))
+            await _ask_quality(object_guid, header, args, "spotify", "playlist", {
+                "collection_name": collection_name,
+                "track_ids":       track_ids,
+            })
+        except Exception as exc:
+            log.error("playlist fetch failed: %s", exc)
+            await app.send_message(object_guid, "\u274c Could not fetch playlist: {}".format(exc))
+        return
+
+    if alb_id:
+        _append_log(object_guid, "spotify_album", args)
+        await app.send_message(object_guid, "\U0001f50d Fetching album info\u2026")
+        try:
+            loop = asyncio.get_event_loop()
+            alb_info, track_ids = await loop.run_in_executor(
+                None, _spodl.get_spotify_album_tracks, alb_id
+            )
+            collection_name = "{} \u2014 {}".format(
+                alb_info.get("name", "album"),
+                ", ".join(alb_info.get("artists") or []),
+            )
+            header = "\U0001f4bf Album: {} ({} tracks)".format(collection_name, len(track_ids))
+            await _ask_quality(object_guid, header, args, "spotify", "album", {
+                "collection_name": collection_name,
+                "track_ids":       track_ids,
+            })
+        except Exception as exc:
+            log.error("album fetch failed: %s", exc)
+            await app.send_message(object_guid, "\u274c Could not fetch album: {}".format(exc))
+        return
+
+    if tr_id:
+        _append_log(object_guid, "spotify_track", args)
+        await _ask_quality(
+            object_guid, "\U0001f3b5 Spotify track", args, "spotify", "track", {}
+        )
+        return
+
+    await app.send_message(
+        object_guid,
+        "\u274c Please provide a valid Spotify track, album, or playlist link.\n"
+        "Accepted formats:\n"
+        "  https://open.spotify.com/track/<id>\n"
+        "  https://open.spotify.com/album/<id>\n"
+        "  https://open.spotify.com/playlist/<id>"
+    )
 
 
 @app.on_message_updates(filters.commands("tidal", prefixes="!"))
 async def tidal_handler(update):
-    global is_downloading
     log = logging.getLogger("tidal")
     object_guid = update.object_guid
     log.info("!tidal | guid=%s", object_guid)
@@ -1145,12 +1631,11 @@ async def tidal_handler(update):
 
     url = m.group(0)
     _append_log(object_guid, "tidal_track", url)
-    await _enqueue_music(object_guid, url, "tidal", log)
+    await _ask_quality(object_guid, "\U0001f3b5 Tidal track", url, "tidal", "track", {})
 
 
 @app.on_message_updates(filters.commands("qobuz", prefixes="!"))
 async def qobuz_handler(update):
-    global is_downloading
     log = logging.getLogger("qobuz")
     object_guid = update.object_guid
     log.info("!qobuz | guid=%s", object_guid)
@@ -1172,12 +1657,11 @@ async def qobuz_handler(update):
 
     url = m.group(0)
     _append_log(object_guid, "qobuz_track", url)
-    await _enqueue_music(object_guid, url, "qobuz", log)
+    await _ask_quality(object_guid, "\U0001f3b5 Qobuz track", url, "qobuz", "track", {})
 
 
 @app.on_message_updates(filters.commands("amazon", prefixes="!"))
 async def amazon_handler(update):
-    global is_downloading
     log = logging.getLogger("amazon")
     object_guid = update.object_guid
     log.info("!amazon | guid=%s", object_guid)
@@ -1199,11 +1683,11 @@ async def amazon_handler(update):
 
     url = m.group(0)
     _append_log(object_guid, "amazon_track", url)
-    await _enqueue_music(object_guid, url, "amazon", log)
+    await _ask_quality(object_guid, "\U0001f3b5 Amazon Music track", url, "amazon", "track", {})
 
 
 async def _enqueue_music(object_guid: str, url: str, platform: str, log) -> None:
-    """Add a music download to the queue or start it immediately."""
+    """Add a music download (old-style, auto-pick source) to the queue."""
     global is_downloading
     if not is_downloading:
         is_downloading = True
@@ -1221,7 +1705,7 @@ async def _enqueue_music(object_guid: str, url: str, platform: str, log) -> None
         download_queue.append({
             "object_guid":  object_guid,
             "url":          url,
-            "choice":       None,       # sentinel: music-platform entry (not YouTube)
+            "choice":       None,
             "platform":     platform,
             "title":        url,
             "queue_msg_id": queue_msg.message_id,
@@ -1230,7 +1714,7 @@ async def _enqueue_music(object_guid: str, url: str, platform: str, log) -> None
 
 
 async def _run_music_and_queue(object_guid: str, url: str, platform: str) -> None:
-    """Run one music download then hand off to the next queue entry."""
+    """Run one music download (old-style) then hand off to the next queue entry."""
     global is_downloading
     log = logging.getLogger("queue")
     try:
@@ -1249,25 +1733,7 @@ async def _run_music_and_queue(object_guid: str, url: str, platform: str) -> Non
             except Exception:
                 pass
             await asyncio.sleep(1)
-            # Dispatch the next entry — music platform or YouTube quality
-            if next_entry["choice"] is None:
-                next_platform = next_entry.get("platform", "spotify")
-                asyncio.create_task(
-                    _run_music_and_queue(
-                        next_entry["object_guid"],
-                        next_entry["url"],
-                        next_platform,
-                    )
-                )
-            else:
-                asyncio.create_task(
-                    _run_download_and_queue(
-                        next_entry["object_guid"],
-                        next_entry["url"],
-                        next_entry["choice"],
-                        next_entry["title"],
-                    )
-                )
+            _dispatch_queue_entry(next_entry)
         else:
             is_downloading = False
 

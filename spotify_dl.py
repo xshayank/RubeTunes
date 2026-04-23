@@ -414,6 +414,87 @@ def _parse_qobuz_track(data: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Odesli / song.link cross-platform resolution (no auth needed)
+# ---------------------------------------------------------------------------
+
+def _resolve_via_odesli(track_url: str) -> dict:
+    """
+    Resolve a track URL to all platform links via the Odesli / song.link API.
+    Returns a dict of {deezer_url, qobuz_url, tidal_url, amazon_url} (keys absent when
+    the platform was not found).  No API key required.
+    """
+    try:
+        resp = requests.get(
+            "https://api.song.link/v1-alpha.1/links",
+            params={"url": track_url, "userCountry": "US"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        if not resp.ok:
+            return {}
+        data = resp.json()
+        links = data.get("linksByPlatform") or {}
+        result: dict = {}
+        if "deezer" in links:
+            result["deezer_url"] = links["deezer"]["url"]
+        if "tidal" in links:
+            result["tidal_url"] = links["tidal"]["url"]
+        if "qobuz" in links:
+            result["qobuz_url"] = links["qobuz"]["url"]
+        if "amazonMusic" in links:
+            result["amazon_url"] = links["amazonMusic"]["url"]
+        log.debug("odesli resolved: %s", list(result.keys()))
+        return result
+    except Exception as exc:
+        log.warning("odesli resolve: %s", exc)
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Songstats cross-platform resolution (scrape HTML, no auth)
+# ---------------------------------------------------------------------------
+
+def _resolve_via_songstats(isrc: str) -> dict:
+    """
+    Scrape Songstats for a given ISRC and return platform URLs found in the
+    structured-data (application/ld+json sameAs blocks).  No auth required.
+    Returns a dict with any of: deezer_url, tidal_url, amazon_url.
+    """
+    try:
+        resp = requests.get(
+            f"https://songstats.com/{isrc}",
+            params={"ref": "ISRCFinder"},
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            timeout=15,
+        )
+        if not resp.ok:
+            return {}
+        html = resp.text
+        result: dict = {}
+        # Extract all JSON-LD blocks
+        for block in re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
+            try:
+                obj = json.loads(block)
+                same_as = obj.get("sameAs") or []
+                if isinstance(same_as, str):
+                    same_as = [same_as]
+                for u in same_as:
+                    if "tidal.com" in u and "tidal_url" not in result:
+                        result["tidal_url"] = u
+                    elif "deezer.com" in u and "deezer_url" not in result:
+                        result["deezer_url"] = u
+                    elif "music.amazon.com" in u and "amazon_url" not in result:
+                        result["amazon_url"] = u
+            except Exception:
+                pass
+        log.debug("songstats resolved: %s", list(result.keys()))
+        return result
+    except Exception as exc:
+        log.warning("songstats resolve: %s", exc)
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Tidal resolution
 # ---------------------------------------------------------------------------
 
@@ -498,18 +579,29 @@ def _parse_tidal_track(data: dict) -> dict:
 def _resolve_all_platforms(info: dict) -> dict:
     """
     Given an info dict that already has an ISRC, resolve it on Deezer, Qobuz,
-    and Tidal and add the results as extra keys.  Always safe to call.
+    Tidal, and Amazon Music and add the results as extra keys.
+
+    Resolution chain (each step fills in gaps left by previous steps):
+      1. Deezer public ISRC API (always)
+      2. Qobuz ISRC search (if QOBUZ_APP_ID set)
+      3. Tidal ISRC API (if TIDAL_TOKEN set)
+      4. Odesli / song.link API (no auth) — fills in any remaining gaps
+      5. Songstats scrape (no auth) — last-resort Tidal/Amazon fallback
     """
     isrc = info.get("isrc") or ""
 
-    info.update({"deezer_id": None, "deezer_url": None, "deezer_preview_url": None})
-    info.update({"qobuz_id": None, "qobuz_url": None})
-    info.update({"tidal_id": None, "tidal_url": None})
+    info.update({
+        "deezer_id": None, "deezer_url": None, "deezer_preview_url": None,
+        "qobuz_id": None, "qobuz_url": None,
+        "qobuz_bit_depth": None, "qobuz_sample_rate": None,
+        "tidal_id": None, "tidal_url": None,
+        "amazon_url": None,
+    })
 
     if not isrc:
         return info
 
-    # Deezer
+    # ── 1. Deezer ──────────────────────────────────────────────────────────
     dz = _resolve_deezer(isrc)
     if dz:
         info["deezer_id"]          = dz["id"]
@@ -528,19 +620,50 @@ def _resolve_all_platforms(info: dict) -> dict:
             )
         log.debug("deezer resolved: id=%s", dz["id"])
 
-    # Qobuz
+    # ── 2. Qobuz ───────────────────────────────────────────────────────────
     qz = _resolve_qobuz_by_isrc(isrc)
     if qz:
-        info["qobuz_id"]  = qz["id"]
-        info["qobuz_url"] = f"https://open.qobuz.com/track/{qz['id']}"
-        log.debug("qobuz resolved: id=%s", qz["id"])
+        info["qobuz_id"]          = qz["id"]
+        info["qobuz_url"]         = f"https://open.qobuz.com/track/{qz['id']}"
+        info["qobuz_bit_depth"]   = qz.get("maximum_bit_depth") or qz.get("bit_depth") or 16
+        info["qobuz_sample_rate"] = qz.get("maximum_sampling_rate") or qz.get("sampling_rate") or 44100
+        log.debug("qobuz resolved: id=%s bd=%s sr=%s",
+                  qz["id"], info["qobuz_bit_depth"], info["qobuz_sample_rate"])
 
-    # Tidal (metadata only — not used as download source directly)
+    # ── 3. Tidal ───────────────────────────────────────────────────────────
     td = _resolve_tidal_by_isrc(isrc)
     if td:
         info["tidal_id"]  = td["id"]
         info["tidal_url"] = f"https://tidal.com/browse/track/{td['id']}"
         log.debug("tidal resolved: id=%s", td["id"])
+
+    # ── 4. Odesli — fills missing platform URLs (no auth) ─────────────────
+    # Build an input URL for Odesli: prefer a Deezer URL we already have,
+    # otherwise synthesise a Spotify one if we have a track_id.
+    odesli_input = (
+        info.get("deezer_url") or
+        (f"https://open.spotify.com/track/{info['track_id']}" if info.get("track_id") else None)
+    )
+    if odesli_input and (not info["tidal_url"] or not info["deezer_url"] or not info["qobuz_url"]):
+        od = _resolve_via_odesli(odesli_input)
+        if od.get("deezer_url") and not info["deezer_url"]:
+            info["deezer_url"] = od["deezer_url"]
+        if od.get("qobuz_url") and not info["qobuz_url"]:
+            info["qobuz_url"] = od["qobuz_url"]
+        if od.get("tidal_url") and not info["tidal_url"]:
+            info["tidal_url"] = od["tidal_url"]
+        if od.get("amazon_url") and not info["amazon_url"]:
+            info["amazon_url"] = od["amazon_url"]
+
+    # ── 5. Songstats — last-resort (no auth) ──────────────────────────────
+    if isrc and (not info["tidal_url"] or not info["amazon_url"]):
+        sg = _resolve_via_songstats(isrc)
+        if sg.get("tidal_url") and not info["tidal_url"]:
+            info["tidal_url"] = sg["tidal_url"]
+        if sg.get("deezer_url") and not info["deezer_url"]:
+            info["deezer_url"] = sg["deezer_url"]
+        if sg.get("amazon_url") and not info["amazon_url"]:
+            info["amazon_url"] = sg["amazon_url"]
 
     return info
 
@@ -851,3 +974,293 @@ def best_source_label(info: dict) -> str:
     if DEEZER_ARL and info.get("deezer_url"):
         return "\U0001f1eb\U0001f1f1 FLAC"       # 🇫🇱 (Deezer)
     return "MP3 320k"
+
+
+# ---------------------------------------------------------------------------
+# Playlist / album support
+# ---------------------------------------------------------------------------
+
+def parse_spotify_playlist_id(text: str) -> str | None:
+    """Extract a 22-char Spotify playlist ID from a URL, URI, or bare ID."""
+    text = text.strip()
+    for pattern in (
+        r"open\.spotify\.com/playlist/([A-Za-z0-9]{22})",
+        r"spotify:playlist:([A-Za-z0-9]{22})",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def parse_spotify_album_id(text: str) -> str | None:
+    """Extract a 22-char Spotify album ID from a URL, URI, or bare ID."""
+    text = text.strip()
+    for pattern in (
+        r"open\.spotify\.com/album/([A-Za-z0-9]{22})",
+        r"spotify:album:([A-Za-z0-9]{22})",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list]:
+    """
+    Fetch metadata and all tracks for a Spotify playlist.
+    Returns (playlist_info_dict, list_of_track_ids).
+    """
+    headers = _auth_headers()
+
+    # Playlist name / image
+    pl_resp = requests.get(
+        f"https://api.spotify.com/v1/playlists/{playlist_id}",
+        headers=headers,
+        params={"fields": "name,owner,images"},
+        timeout=15,
+    )
+    pl_resp.raise_for_status()
+    pl_data = pl_resp.json()
+
+    playlist_info = {
+        "name": pl_data.get("name", "playlist"),
+        "owner": (pl_data.get("owner") or {}).get("display_name", ""),
+        "cover_url": ((pl_data.get("images") or [{}])[0]).get("url", ""),
+    }
+
+    # Paginate tracks
+    track_ids: list = []
+    url: str | None = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+    params: dict = {
+        "limit": 100,
+        "fields": "items(track(id)),next",
+    }
+    while url:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        for item in data.get("items", []):
+            t = item.get("track")
+            if t and t.get("id"):
+                track_ids.append(t["id"])
+        url = data.get("next")
+        params = {}
+
+    log.info("playlist %s: %d tracks", playlist_id, len(track_ids))
+    return playlist_info, track_ids
+
+
+def get_spotify_album_tracks(album_id: str) -> tuple[dict, list]:
+    """
+    Fetch metadata and all tracks for a Spotify album.
+    Returns (album_info_dict, list_of_track_ids).
+    """
+    headers = _auth_headers()
+
+    al_resp = requests.get(
+        f"https://api.spotify.com/v1/albums/{album_id}",
+        headers=headers,
+        timeout=15,
+    )
+    al_resp.raise_for_status()
+    al_data = al_resp.json()
+
+    album_info = {
+        "name": al_data.get("name", "album"),
+        "artists": [a["name"] for a in al_data.get("artists", [])],
+        "release_date": al_data.get("release_date", ""),
+        "cover_url": ((al_data.get("images") or [{}])[0]).get("url", ""),
+        "total_tracks": al_data.get("total_tracks", 0),
+    }
+
+    track_ids: list = []
+    url: str | None = f"https://api.spotify.com/v1/albums/{album_id}/tracks"
+    params: dict = {"limit": 50}
+    while url:
+        resp = requests.get(url, headers=headers, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        for t in data.get("items", []):
+            if t.get("id"):
+                track_ids.append(t["id"])
+        url = data.get("next")
+        params = {}
+
+    log.info("album %s: %d tracks", album_id, len(track_ids))
+    return album_info, track_ids
+
+
+# ---------------------------------------------------------------------------
+# Quality / platform menu builder
+# ---------------------------------------------------------------------------
+
+# Quality tier constants
+QUALITY_MP3      = "mp3"
+QUALITY_FLAC_CD  = "flac_cd"
+QUALITY_FLAC_HI  = "flac_hi"
+
+_QUALITY_LABELS = {
+    QUALITY_MP3:     "MP3 320k",
+    QUALITY_FLAC_CD: "FLAC CD (16-bit / 44.1 kHz)",
+    QUALITY_FLAC_HI: "FLAC Hi-Res (24-bit)",
+}
+
+QUALITY_MENU = [
+    {"label": "\U0001f3b5 MP3 320k",                  "quality": QUALITY_MP3},
+    {"label": "\U0001f4bf FLAC CD (16-bit / 44.1 kHz)",  "quality": QUALITY_FLAC_CD},
+    {"label": "\u2b50 FLAC Hi-Res (24-bit)",           "quality": QUALITY_FLAC_HI},
+]
+
+
+def build_platform_choices(info: dict, quality: str) -> list:
+    """
+    Build a list of download-source choices for a resolved track given the
+    user's requested quality tier.
+
+    Each choice dict mirrors the structure used by the YouTube quality menu:
+      label      – display string
+      source     – "qobuz" | "deezer" | "ytmusic"
+      quality    – one of the QUALITY_* constants (actual quality of this source)
+      audio_only – True
+      out_ext    – "flac" | "mp3"
+      url        – source URL (None for ytmusic fallback)
+    """
+    choices: list = []
+    want_flac  = quality in (QUALITY_FLAC_CD, QUALITY_FLAC_HI)
+    want_hires = quality == QUALITY_FLAC_HI
+
+    # ── Qobuz ──────────────────────────────────────────────────────────────
+    if QOBUZ_EMAIL and QOBUZ_PASSWORD and info.get("qobuz_url"):
+        bd = info.get("qobuz_bit_depth") or 16
+        sr = info.get("qobuz_sample_rate") or 44100
+        sr_khz = sr / 1000
+
+        if want_hires and bd and int(bd) > 16:
+            # Hi-Res is genuinely available for this track on Qobuz
+            choices.append({
+                "label":      f"\U0001f1f6\U0001f1ff Qobuz FLAC Hi-Res \u2014 {bd}-bit / {sr_khz:.0f} kHz",
+                "source":     "qobuz",
+                "quality":    QUALITY_FLAC_HI,
+                "audio_only": True,
+                "out_ext":    "flac",
+                "url":        info["qobuz_url"],
+            })
+        elif want_flac:
+            # CD quality FLAC on Qobuz (or hi-res requested but not available)
+            note = ""
+            if want_hires:
+                note = " \u26a0\ufe0f (Hi-Res not available for this track)"
+            choices.append({
+                "label":      f"\U0001f1f6\U0001f1ff Qobuz FLAC CD \u2014 16-bit / 44.1 kHz{note}",
+                "source":     "qobuz",
+                "quality":    QUALITY_FLAC_CD,
+                "audio_only": True,
+                "out_ext":    "flac",
+                "url":        info["qobuz_url"],
+            })
+
+    # ── Deezer ─────────────────────────────────────────────────────────────
+    if DEEZER_ARL and info.get("deezer_url") and want_flac:
+        choices.append({
+            "label":      "\U0001f1eb\U0001f1f7 Deezer FLAC CD \u2014 16-bit / 44.1 kHz",
+            "source":     "deezer",
+            "quality":    QUALITY_FLAC_CD,
+            "audio_only": True,
+            "out_ext":    "flac",
+            "url":        info["deezer_url"],
+        })
+
+    # ── YouTube Music MP3 — always available ───────────────────────────────
+    title       = info.get("title", "")
+    artists_str = ", ".join(info.get("artists") or [])
+    choices.append({
+        "label":      "\U0001f3b5 YouTube Music MP3 320k",
+        "source":     "ytmusic",
+        "quality":    QUALITY_MP3,
+        "audio_only": True,
+        "out_ext":    "mp3",
+        "url":        None,
+        "search":     f"{title} {artists_str}".strip(),
+    })
+
+    return choices
+
+
+# ---------------------------------------------------------------------------
+# Download from a specific platform choice
+# ---------------------------------------------------------------------------
+
+async def download_track_from_choice(
+    info: dict, choice: dict, download_dir: Path, ytdlp_bin: str
+) -> Path:
+    """
+    Download a track using a pre-selected platform+quality *choice* dict
+    (as produced by build_platform_choices).  Embeds metadata afterwards.
+    """
+    title       = info.get("title", "Unknown")
+    artists_str = ", ".join(info.get("artists", ["Unknown"]))
+    safe        = _safe_filename(f"{title} - {artists_str}")
+    output_tmpl = str(download_dir / f"{safe}.%(ext)s")
+
+    source = choice.get("source", "ytmusic")
+
+    if source == "qobuz" and QOBUZ_EMAIL and QOBUZ_PASSWORD:
+        cmd = [
+            ytdlp_bin,
+            choice["url"],
+            "--extract-audio", "--audio-format", "flac",
+            "--username", QOBUZ_EMAIL, "--password", QOBUZ_PASSWORD,
+            "-o", output_tmpl,
+            "--no-playlist", "--quiet", "--no-warnings",
+        ]
+    elif source == "deezer" and DEEZER_ARL:
+        cmd = [
+            ytdlp_bin,
+            choice["url"],
+            "--extract-audio", "--audio-format", "flac",
+            "--add-header", f"Cookie: arl={DEEZER_ARL}",
+            "-o", output_tmpl,
+            "--no-playlist", "--quiet", "--no-warnings",
+        ]
+    else:
+        # YouTube Music MP3 fallback
+        search = choice.get("search") or f"{title} {artists_str}"
+        cmd = [
+            ytdlp_bin,
+            f"ytmsearch1:{search}",
+            "--extract-audio", "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "-o", output_tmpl,
+            "--no-playlist", "--quiet", "--no-warnings",
+        ]
+        source = "YouTube Music"
+
+    log.info("download_track_from_choice source=%s title=%r", source, title)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+
+    if proc.returncode != 0:
+        err = stdout.decode(errors="replace")
+        raise RuntimeError(f"yt-dlp ({source}) exit {proc.returncode}: {err[:400]}")
+
+    exts = {".mp3", ".flac", ".m4a", ".opus", ".ogg", ".wav"}
+    candidates = sorted(
+        (p for p in download_dir.iterdir() if p.is_file() and p.suffix.lower() in exts),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise RuntimeError("yt-dlp reported success but no audio file found")
+
+    fp = candidates[0]
+    try:
+        embed_metadata(fp, info)
+    except Exception as exc:
+        log.warning("metadata embed failed for %s: %s", fp.name, exc)
+
+    return fp
