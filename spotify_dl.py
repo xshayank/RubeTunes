@@ -544,6 +544,135 @@ def _parse_public(meta: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Spotify internal GraphQL API (persisted queries)
+# ---------------------------------------------------------------------------
+
+_SPOTIFY_GRAPHQL_ENDPOINT = "https://api-partner.spotify.com/pathfinder/v1/query"
+
+# Persisted query sha256 hashes for Spotify's internal GraphQL operations
+_GRAPHQL_HASH_GET_TRACK       = "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294"
+_GRAPHQL_HASH_GET_ALBUM       = "b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10"
+_GRAPHQL_HASH_FETCH_PLAYLIST  = "bb67e0af06e8d6f52b531f97468ee4acd44cd0f82b988e15c2ea47b1148efc77"
+
+
+def _spotify_graphql_query(payload: dict) -> dict:
+    """
+    Send a persisted GraphQL query to Spotify's internal partner API.
+    Uses a GET request with JSON-encoded variables and extensions as query params.
+    """
+    params = {
+        "operationName": payload["operationName"],
+        "variables":     json.dumps(payload.get("variables", {}), separators=(",", ":")),
+        "extensions":    json.dumps(payload.get("extensions", {}), separators=(",", ":")),
+    }
+    resp = requests.get(
+        _SPOTIFY_GRAPHQL_ENDPOINT,
+        params=params,
+        headers=_auth_headers(),
+        timeout=15,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fetch_track_graphql(track_id: str) -> dict:
+    """Fetch track metadata via Spotify's internal GraphQL getTrack query."""
+    return _spotify_graphql_query({
+        "variables":     {"uri": f"spotify:track:{track_id}"},
+        "operationName": "getTrack",
+        "extensions": {
+            "persistedQuery": {
+                "version":    1,
+                "sha256Hash": _GRAPHQL_HASH_GET_TRACK,
+            }
+        },
+    })
+
+
+def _parse_graphql_track(data: dict) -> dict:
+    """Parse a Spotify GraphQL getTrack response into the standard info dict."""
+    track = ((data.get("data") or {}).get("trackUnion") or {})
+
+    # Artists
+    artist_items = ((track.get("artists") or {}).get("items") or [])
+    artists = [
+        (item.get("profile") or {}).get("name", "")
+        for item in artist_items
+        if (item.get("profile") or {}).get("name")
+    ]
+
+    # Album
+    album = (track.get("albumOfTrack") or {})
+
+    # Release date — isoString is like "2024-01-15T00:00:00Z"
+    release_date = ""
+    date_obj = (album.get("date") or {})
+    iso = date_obj.get("isoString", "")
+    if iso:
+        release_date = iso[:10]  # YYYY-MM-DD
+    elif date_obj.get("year"):
+        release_date = str(date_obj["year"])
+
+    # Cover art — sources ordered largest first
+    cover_url = ""
+    sources = ((album.get("coverArt") or {}).get("sources") or [])
+    if sources:
+        cover_url = sources[0].get("url", "")
+
+    # ISRC
+    isrc = ((track.get("externalIds") or {}).get("isrc") or None)
+
+    return {
+        "title":        track.get("name", ""),
+        "artists":      artists,
+        "album":        (album.get("name") or ""),
+        "release_date": release_date,
+        "cover_url":    cover_url,
+        "track_number": track.get("trackNumber", 1),
+        "disc_number":  track.get("discNumber", 1),
+        "isrc":         isrc,
+    }
+
+
+def _fetch_album_graphql_page(album_id: str, offset: int, limit: int) -> dict:
+    """Fetch a page of album data via Spotify's internal GraphQL getAlbum query."""
+    return _spotify_graphql_query({
+        "variables": {
+            "uri":    f"spotify:album:{album_id}",
+            "locale": "",
+            "offset": offset,
+            "limit":  limit,
+        },
+        "operationName": "getAlbum",
+        "extensions": {
+            "persistedQuery": {
+                "version":    1,
+                "sha256Hash": _GRAPHQL_HASH_GET_ALBUM,
+            }
+        },
+    })
+
+
+def _fetch_playlist_graphql_page(playlist_id: str, offset: int, limit: int) -> dict:
+    """Fetch a page of playlist data via Spotify's internal GraphQL fetchPlaylist query."""
+    return _spotify_graphql_query({
+        "variables": {
+            "uri":                       f"spotify:playlist:{playlist_id}",
+            "offset":                    offset,
+            "limit":                     limit,
+            "enableWatchFeedEntrypoint": False,
+        },
+        "operationName": "fetchPlaylist",
+        "extensions": {
+            "persistedQuery": {
+                "version":    1,
+                "sha256Hash": _GRAPHQL_HASH_FETCH_PLAYLIST,
+            }
+        },
+    })
+
+
 def _isrc_soundplate(track_id: str) -> str | None:
     """Last-resort ISRC lookup via Soundplate."""
     try:
@@ -907,24 +1036,30 @@ def get_track_info(track_id: str) -> dict:
     """
     info: dict = {}
 
-    # --- Phase 1: Spotify metadata ---
+    # --- Phase 1: Spotify metadata via GraphQL (primary) ---
     try:
-        raw = _fetch_internal_meta(track_id)
-        info = _parse_internal(raw)
-        log.debug("internal meta OK  track=%s  title=%r", track_id, info.get("title"))
+        raw = _fetch_track_graphql(track_id)
+        info = _parse_graphql_track(raw)
+        log.debug("graphql meta OK  track=%s  title=%r", track_id, info.get("title"))
     except Exception as exc:
-        log.warning("internal meta failed (%s) — trying public API", exc)
+        log.warning("graphql meta failed (%s) — trying spclient", exc)
         try:
-            raw = _fetch_public_meta(track_id)
-            info = _parse_public(raw)
-            log.debug("public meta OK  track=%s  title=%r", track_id, info.get("title"))
+            raw = _fetch_internal_meta(track_id)
+            info = _parse_internal(raw)
+            log.debug("internal meta OK  track=%s  title=%r", track_id, info.get("title"))
         except Exception as exc2:
-            log.error("public meta also failed: %s", exc2)
-            info = {
-                "title": "", "artists": [], "album": "",
-                "release_date": "", "cover_url": "",
-                "track_number": 1, "disc_number": 1, "isrc": None,
-            }
+            log.warning("internal meta failed (%s) — trying public API", exc2)
+            try:
+                raw = _fetch_public_meta(track_id)
+                info = _parse_public(raw)
+                log.debug("public meta OK  track=%s  title=%r", track_id, info.get("title"))
+            except Exception as exc3:
+                log.error("public meta also failed: %s", exc3)
+                info = {
+                    "title": "", "artists": [], "album": "",
+                    "release_date": "", "cover_url": "",
+                    "track_number": 1, "disc_number": 1, "isrc": None,
+                }
 
     info["track_id"] = track_id
 
@@ -1393,12 +1528,63 @@ def parse_spotify_album_id(text: str) -> str | None:
 
 def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list]:
     """
-    Fetch metadata and all tracks for a Spotify playlist.
+    Fetch metadata and all tracks for a Spotify playlist via GraphQL.
     Returns (playlist_info_dict, list_of_track_ids).
+    Falls back to the public REST API if GraphQL fails.
     """
+    try:
+        all_track_ids: list = []
+        playlist_info: dict = {}
+        offset = 0
+        limit = 300
+
+        while True:
+            data = _fetch_playlist_graphql_page(playlist_id, offset, limit)
+            playlist_v2 = ((data.get("data") or {}).get("playlistV2") or {})
+
+            # Parse playlist info on the first page
+            if not playlist_info:
+                owner_data = ((playlist_v2.get("ownerV2") or {}).get("data") or {})
+                owner_name = owner_data.get("name") or owner_data.get("username") or ""
+                image_items = ((playlist_v2.get("images") or {}).get("items") or [])
+                cover_url = ""
+                if image_items:
+                    img_sources = (image_items[0].get("sources") or [])
+                    if img_sources:
+                        cover_url = img_sources[0].get("url", "")
+                playlist_info = {
+                    "name":      playlist_v2.get("name", "playlist"),
+                    "owner":     owner_name,
+                    "cover_url": cover_url,
+                }
+
+            content = (playlist_v2.get("content") or {})
+            total_count = content.get("totalCount") or 0
+            items = (content.get("items") or [])
+
+            for item in items:
+                item_data = ((item.get("itemV2") or {}).get("data") or {})
+                track_union = (item_data.get("trackUnion") or {})
+                tid = track_union.get("id") or (track_union.get("uri") or "").split(":")[-1]
+                if tid:
+                    all_track_ids.append(tid)
+
+            if not items or len(all_track_ids) >= total_count:
+                break
+            offset += limit
+
+        log.info("playlist %s (graphql): %d tracks", playlist_id, len(all_track_ids))
+        return playlist_info, all_track_ids
+
+    except Exception as exc:
+        log.warning("graphql playlist fetch failed (%s) — falling back to REST API", exc)
+        return _get_spotify_playlist_tracks_rest(playlist_id)
+
+
+def _get_spotify_playlist_tracks_rest(playlist_id: str) -> tuple[dict, list]:
+    """Fallback: fetch playlist tracks via Spotify's public REST API."""
     headers = _auth_headers()
 
-    # Playlist name / image
     pl_resp = requests.get(
         f"https://api.spotify.com/v1/playlists/{playlist_id}",
         headers=headers,
@@ -1409,12 +1595,11 @@ def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list]:
     pl_data = pl_resp.json()
 
     playlist_info = {
-        "name": pl_data.get("name", "playlist"),
-        "owner": (pl_data.get("owner") or {}).get("display_name", ""),
+        "name":      pl_data.get("name", "playlist"),
+        "owner":     (pl_data.get("owner") or {}).get("display_name", ""),
         "cover_url": ((pl_data.get("images") or [{}])[0]).get("url", ""),
     }
 
-    # Paginate tracks
     track_ids: list = []
     url: str | None = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
     params: dict = {
@@ -1432,15 +1617,70 @@ def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list]:
         url = data.get("next")
         params = {}
 
-    log.info("playlist %s: %d tracks", playlist_id, len(track_ids))
+    log.info("playlist %s (rest): %d tracks", playlist_id, len(track_ids))
     return playlist_info, track_ids
 
 
 def get_spotify_album_tracks(album_id: str) -> tuple[dict, list]:
     """
-    Fetch metadata and all tracks for a Spotify album.
+    Fetch metadata and all tracks for a Spotify album via GraphQL.
     Returns (album_info_dict, list_of_track_ids).
+    Falls back to the public REST API if GraphQL fails.
     """
+    try:
+        all_track_ids: list = []
+        album_info: dict = {}
+        offset = 0
+        limit = 300
+
+        while True:
+            data = _fetch_album_graphql_page(album_id, offset, limit)
+            album_union = ((data.get("data") or {}).get("albumUnion") or {})
+
+            # Parse album info on the first page
+            if not album_info:
+                artist_items = ((album_union.get("artists") or {}).get("items") or [])
+                artists = [
+                    (item.get("profile") or {}).get("name", "")
+                    for item in artist_items
+                    if (item.get("profile") or {}).get("name")
+                ]
+                iso = ((album_union.get("date") or {}).get("isoString") or "")
+                release_date = iso[:10] if iso else ""
+                sources = ((album_union.get("coverArt") or {}).get("sources") or [])
+                cover_url = sources[0].get("url", "") if sources else ""
+                album_info = {
+                    "name":         album_union.get("name", "album"),
+                    "artists":      artists,
+                    "release_date": release_date,
+                    "cover_url":    cover_url,
+                    "total_tracks": ((album_union.get("tracksV2") or {}).get("totalCount") or 0),
+                }
+
+            tracks_v2 = (album_union.get("tracksV2") or {})
+            total_count = tracks_v2.get("totalCount") or 0
+            items = (tracks_v2.get("items") or [])
+
+            for item in items:
+                track = (item.get("track") or {})
+                tid = track.get("id") or (track.get("uri") or "").split(":")[-1]
+                if tid:
+                    all_track_ids.append(tid)
+
+            if not items or len(all_track_ids) >= total_count:
+                break
+            offset += limit
+
+        log.info("album %s (graphql): %d tracks", album_id, len(all_track_ids))
+        return album_info, all_track_ids
+
+    except Exception as exc:
+        log.warning("graphql album fetch failed (%s) — falling back to REST API", exc)
+        return _get_spotify_album_tracks_rest(album_id)
+
+
+def _get_spotify_album_tracks_rest(album_id: str) -> tuple[dict, list]:
+    """Fallback: fetch album tracks via Spotify's public REST API."""
     headers = _auth_headers()
 
     al_resp = requests.get(
@@ -1452,10 +1692,10 @@ def get_spotify_album_tracks(album_id: str) -> tuple[dict, list]:
     al_data = al_resp.json()
 
     album_info = {
-        "name": al_data.get("name", "album"),
-        "artists": [a["name"] for a in al_data.get("artists", [])],
+        "name":         al_data.get("name", "album"),
+        "artists":      [a["name"] for a in al_data.get("artists", [])],
         "release_date": al_data.get("release_date", ""),
-        "cover_url": ((al_data.get("images") or [{}])[0]).get("url", ""),
+        "cover_url":    ((al_data.get("images") or [{}])[0]).get("url", ""),
         "total_tracks": al_data.get("total_tracks", 0),
     }
 
@@ -1472,7 +1712,7 @@ def get_spotify_album_tracks(album_id: str) -> tuple[dict, list]:
         url = data.get("next")
         params = {}
 
-    log.info("album %s: %d tracks", album_id, len(track_ids))
+    log.info("album %s (rest): %d tracks", album_id, len(track_ids))
     return album_info, track_ids
 
 
