@@ -3,6 +3,7 @@ import os
 import re
 import json
 import asyncio
+import collections
 import logging
 import time
 from pathlib import Path
@@ -18,6 +19,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+
+
+class _SuppressDataEnc(logging.Filter):
+    """Drop the noisy 'Missing data_enc key' debug lines from rubpy internals."""
+    def filter(self, record):
+        return "data_enc" not in record.getMessage()
+
+
+logging.getLogger("rubpy.network").addFilter(_SuppressDataEnc())
 
 SESSION = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
 PHONE_NUMBER = os.getenv("RUBIKA_PHONE", "").strip() or None
@@ -45,6 +55,11 @@ SIZE_LIMIT_BYTES = 2 * 1024 ** 3   # 2 GB hard limit \u2014 options above this a
 # Per-chat pending quality-selection state.
 # Key: object_guid  Value: {url, choices, title, timeout_task}
 pending_selections: dict = {}
+
+# Download queue -- one download runs at a time.
+# Each entry: {object_guid, url, choice, title, queue_msg_id}
+download_queue: collections.deque = collections.deque()
+is_downloading: bool = False
 
 
 def make_bar(percent: float, width: int = 10) -> str:
@@ -255,6 +270,59 @@ def build_ytdlp_cmd_for_choice(url: str, choice: dict) -> list:
 app = RubikaClient(name=SESSION, display_welcome=True)
 
 
+async def _notify_queue_positions() -> None:
+    """Edit each waiting user's message to show their current queue position."""
+    for pos, entry in enumerate(download_queue, 1):
+        try:
+            people = "person" if pos == 1 else "people"
+            await app.edit_message(
+                entry["object_guid"],
+                entry["queue_msg_id"],
+                "\u23f3 The bot is busy right now.\n"
+                "There {} {} {} ahead of you.".format(
+                    "is" if pos == 1 else "are", pos, people
+                ),
+            )
+        except Exception:
+            pass
+
+
+async def _run_download_and_queue(
+    object_guid: str, url: str, choice: dict, title: str
+) -> None:
+    """Run one download then hand off to the next entry in the queue."""
+    global is_downloading
+    log = logging.getLogger("queue")
+    try:
+        await _do_download(object_guid, url, choice, title, log)
+    finally:
+        if download_queue:
+            next_entry = download_queue.popleft()
+            # Refresh remaining users' position indicators
+            await _notify_queue_positions()
+            # Tell the next user they have reached the front
+            try:
+                await app.edit_message(
+                    next_entry["object_guid"],
+                    next_entry["queue_msg_id"],
+                    "\U0001f7e2 You are the first person in the queue!\n"
+                    "Starting your download\u2026",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            asyncio.create_task(
+                _run_download_and_queue(
+                    next_entry["object_guid"],
+                    next_entry["url"],
+                    next_entry["choice"],
+                    next_entry["title"],
+                )
+            )
+        else:
+            is_downloading = False
+
+
 async def _expire_selection(object_guid: str) -> None:
     """Cancel a pending quality menu after SELECTION_TIMEOUT seconds."""
     await asyncio.sleep(SELECTION_TIMEOUT)
@@ -363,6 +431,7 @@ async def download_handler(update):
     filters.commands(["1", "2", "3", "4", "5", "6", "7", "8", "9", "cancel"], prefixes="!")
 )
 async def selection_handler(update):
+    global is_downloading
     log = logging.getLogger("selection")
     object_guid = update.object_guid
     cmd_name = update.command[0] if update.command else ""
@@ -372,7 +441,23 @@ async def selection_handler(update):
         entry = pending_selections.pop(object_guid, None)
         if entry and entry.get("timeout_task"):
             entry["timeout_task"].cancel()
-        msg = "\u274c Download cancelled." if entry else "\u2139\ufe0f No active download to cancel."
+
+        # Also remove from download queue if the user is waiting there
+        queue_before = len(download_queue)
+        new_queue = collections.deque(
+            e for e in download_queue if e["object_guid"] != object_guid
+        )
+        download_queue.clear()
+        download_queue.extend(new_queue)
+        queue_removed = len(download_queue) < queue_before
+        if queue_removed:
+            asyncio.create_task(_notify_queue_positions())
+
+        msg = (
+            "\u274c Download cancelled."
+            if (entry or queue_removed)
+            else "\u2139\ufe0f No active download to cancel."
+        )
         await app.send_message(object_guid, msg)
         return
 
@@ -404,7 +489,32 @@ async def selection_handler(update):
         entry["timeout_task"].cancel()
 
     choice = choices[idx]
-    await _do_download(object_guid, entry["url"], choice, entry.get("title", ""), log)
+    url = entry["url"]
+    title = entry.get("title", "")
+
+    # -- Queue logic ----------------------------------------------------------
+    # Check and set is_downloading atomically (no await in between -- safe in asyncio).
+    if not is_downloading:
+        is_downloading = True
+        asyncio.create_task(_run_download_and_queue(object_guid, url, choice, title))
+    else:
+        pos = len(download_queue) + 1
+        people = "person" if pos == 1 else "people"
+        queue_msg = await app.send_message(
+            object_guid,
+            "\u23f3 The bot is busy right now.\n"
+            "There {} {} {} ahead of you.".format(
+                "is" if pos == 1 else "are", pos, people
+            ),
+        )
+        download_queue.append({
+            "object_guid": object_guid,
+            "url": url,
+            "choice": choice,
+            "title": title,
+            "queue_msg_id": queue_msg.message_id,
+        })
+        log.info("queued at position %d | guid=%s", pos, object_guid)
 
 
 async def _do_download(object_guid: str, url: str, choice: dict, title: str, log) -> None:
