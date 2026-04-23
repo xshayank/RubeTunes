@@ -1565,7 +1565,12 @@ def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list]:
             for item in items:
                 item_data = ((item.get("itemV2") or {}).get("data") or {})
                 track_union = (item_data.get("trackUnion") or {})
-                tid = track_union.get("id") or (track_union.get("uri") or "").split(":")[-1]
+                tid = track_union.get("id")
+                if not tid:
+                    uri = track_union.get("uri") or ""
+                    parts = uri.split(":")
+                    if len(parts) == 3 and parts[0] == "spotify" and parts[1] == "track":
+                        tid = parts[2]
                 if tid:
                     all_track_ids.append(tid)
 
@@ -1663,7 +1668,12 @@ def get_spotify_album_tracks(album_id: str) -> tuple[dict, list]:
 
             for item in items:
                 track = (item.get("track") or {})
-                tid = track.get("id") or (track.get("uri") or "").split(":")[-1]
+                tid = track.get("id")
+                if not tid:
+                    uri = track.get("uri") or ""
+                    parts = uri.split(":")
+                    if len(parts) == 3 and parts[0] == "spotify" and parts[1] == "track":
+                        tid = parts[2]
                 if tid:
                     all_track_ids.append(tid)
 
