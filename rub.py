@@ -43,11 +43,16 @@ ADMIN_GUIDS: set = {g.strip() for g in _raw_admins.split(",") if g.strip()}
 
 YTDLP_BIN = BASE_DIR / "yt-dlp"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
+SPOTDL_BIN = BASE_DIR / "spotdl"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 YOUTUBE_RE = re.compile(
     r'https?://(?:(?:(?:www|m|music)\.)?youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/|v/)|youtu\.be/)[\w\-]+'
+)
+
+SPOTIFY_RE = re.compile(
+    r'https?://open\.spotify\.com/(track|album|playlist)/[\w]+'
 )
 
 PROGRESS_RE = re.compile(
@@ -142,6 +147,10 @@ def make_bar(percent: float, width: int = 10) -> str:
 
 def _ytdlp_bin() -> str:
     return str(YTDLP_BIN) if YTDLP_BIN.exists() else "yt-dlp"
+
+
+def _spotdl_bin() -> str:
+    return str(SPOTDL_BIN) if SPOTDL_BIN.exists() else "spotdl"
 
 
 def _base_cmd() -> list:
@@ -402,14 +411,20 @@ async def _run_download_and_queue(
             except Exception:
                 pass
             await asyncio.sleep(1)
-            asyncio.create_task(
-                _run_download_and_queue(
-                    next_entry["object_guid"],
-                    next_entry["url"],
-                    next_entry["choice"],
-                    next_entry["title"],
+            # Dispatch next entry — may be Spotify or YouTube
+            if next_entry["choice"] is None:
+                asyncio.create_task(
+                    _run_spotify_and_queue(next_entry["object_guid"], next_entry["url"])
                 )
-            )
+            else:
+                asyncio.create_task(
+                    _run_download_and_queue(
+                        next_entry["object_guid"],
+                        next_entry["url"],
+                        next_entry["choice"],
+                        next_entry["title"],
+                    )
+                )
         else:
             is_downloading = False
 
@@ -435,10 +450,12 @@ async def start_handler(update):
         "\U0001f3ac Welcome!\n\n"
         "\U0001f4cc Commands:\n"
         "  !download <url> \u2014 Fetch quality options for a YouTube video\n"
+        "  !spotify <url>  \u2014 Download a Spotify track / album / playlist\n"
         "  !cancel         \u2014 Cancel a pending quality selection\n"
         "  !start          \u2014 Show this message\n\n"
         "After sending !download the bot lists available qualities.\n"
-        "Reply with !1, !2, \u2026 to pick one. Options above 2 GB are hidden."
+        "Reply with !1, !2, \u2026 to pick one. Options above 2 GB are hidden.\n\n"
+        "Spotify links are downloaded as MP3 with full metadata (cover art, artist, album)."
     )
 
 
@@ -926,6 +943,246 @@ async def admin_handler(update):
         object_guid,
         "❌ Unknown admin sub-command: {}".format(sub)
     )
+
+
+# ---------------------------------------------------------------------------
+# Spotify downloading
+# ---------------------------------------------------------------------------
+
+SPOTDL_DONE_RE = re.compile(r'Downloaded\s+"(.+?)"')
+SPOTDL_FAIL_RE = re.compile(r'(Failed to download|Skipping)\s+"(.+?)"')
+SPOTDL_FOUND_RE = re.compile(r'Found\s+(\d+)\s+song')
+
+
+async def _do_spotify_download(object_guid: str, url: str, log) -> None:
+    """Run spotdl for the given Spotify URL and send every downloaded file."""
+    status = await app.send_message(object_guid, "\U0001f50d Looking up Spotify link\u2026")
+    status_id = status.message_id
+
+    # spotdl saves files to cwd by default — point it at DOWNLOAD_DIR
+    cmd = [
+        _spotdl_bin(),
+        url,
+        "--output", str(DOWNLOAD_DIR / "{title} - {artists}.{output-ext}"),
+        "--format", "mp3",
+        "--bitrate", "320k",
+        "--log-level", "INFO",
+    ]
+    log.info("spotdl cmd: %s", " ".join(cmd))
+
+    downloaded_files: list[Path] = []
+    total_tracks = 0
+    done_count = 0
+    fail_count = 0
+    last_update = 0.0
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        log.info("spotdl pid=%s", proc.pid)
+
+        async for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                log.debug("spotdl | %s", line)
+
+            m_found = SPOTDL_FOUND_RE.search(line)
+            if m_found:
+                total_tracks = int(m_found.group(1))
+                try:
+                    await app.edit_message(
+                        object_guid, status_id,
+                        "\U0001f3b5 Found {} track{}. Downloading\u2026".format(
+                            total_tracks, "s" if total_tracks != 1 else ""
+                        )
+                    )
+                except Exception:
+                    pass
+                continue
+
+            m_done = SPOTDL_DONE_RE.search(line)
+            if m_done:
+                done_count += 1
+                track_name = m_done.group(1)
+                now = time.monotonic()
+                if now - last_update >= UPDATE_INTERVAL:
+                    last_update = now
+                    progress_str = (
+                        " ({}/{})".format(done_count, total_tracks)
+                        if total_tracks > 1
+                        else ""
+                    )
+                    try:
+                        await app.edit_message(
+                            object_guid, status_id,
+                            "\U0001f4e5 Downloaded{}: {}".format(progress_str, track_name)
+                        )
+                    except Exception:
+                        pass
+                continue
+
+            m_fail = SPOTDL_FAIL_RE.search(line)
+            if m_fail:
+                fail_count += 1
+                log.warning("spotdl failed track: %s", line)
+
+        await proc.wait()
+        log.info("spotdl returncode=%s", proc.returncode)
+
+        if proc.returncode != 0 and done_count == 0:
+            await app.edit_message(
+                object_guid, status_id,
+                "\u274c spotdl failed. Check the URL and try again."
+            )
+            return
+
+        # Collect all MP3s written during this run (newest files first)
+        candidates = sorted(
+            DOWNLOAD_DIR.glob("*.mp3"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        # We only want files produced in this run — use the count of successfully
+        # downloaded tracks as a cap so we don't re-send old leftover files.
+        expected = max(done_count, 1)
+        downloaded_files = candidates[:expected]
+
+        if not downloaded_files:
+            await app.edit_message(
+                object_guid, status_id,
+                "\u274c Download finished but no files were found."
+            )
+            return
+
+        await app.edit_message(
+            object_guid, status_id,
+            "\u2705 Download complete. Sending {} file{}\u2026".format(
+                len(downloaded_files), "s" if len(downloaded_files) != 1 else ""
+            )
+        )
+
+        for fp in downloaded_files:
+            try:
+                await app.send_document(object_guid, str(fp), caption=fp.stem)
+                log.info("sent: %s", fp)
+            except Exception as exc:
+                log.error("send failed for %s: %s", fp, exc)
+                await app.send_message(
+                    object_guid,
+                    "\u274c Failed to send {}: {}".format(fp.name, exc)
+                )
+            finally:
+                try:
+                    fp.unlink()
+                except Exception:
+                    pass
+
+        summary = "\u2705 Done!"
+        if fail_count:
+            summary += " ({} track{} failed to download)".format(
+                fail_count, "s" if fail_count != 1 else ""
+            )
+        await app.edit_message(object_guid, status_id, summary)
+
+    except Exception as exc:
+        log.exception("error in _do_spotify_download: %s", exc)
+        try:
+            await app.edit_message(object_guid, status_id, "\u274c Error: {}".format(exc))
+        except Exception:
+            pass
+
+
+@app.on_message_updates(filters.commands("spotify", prefixes="!"))
+async def spotify_handler(update):
+    global is_downloading
+    log = logging.getLogger("spotify")
+    object_guid = update.object_guid
+    log.info("!spotify | guid=%s", object_guid)
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    match = SPOTIFY_RE.search(args)
+
+    if not match:
+        await app.send_message(
+            object_guid,
+            "\u274c Please provide a valid Spotify link.\n"
+            "Supported: track, album, or playlist URLs.\n"
+            "Example: !spotify https://open.spotify.com/track/..."
+        )
+        return
+
+    url = match.group(0)
+    link_type = match.group(1)  # "track", "album", or "playlist"
+    _append_log(object_guid, "spotify_{}".format(link_type), url)
+
+    # Re-use the same download queue so Spotify and YouTube downloads don't run concurrently.
+    if not is_downloading:
+        is_downloading = True
+        asyncio.create_task(_run_spotify_and_queue(object_guid, url))
+    else:
+        pos = len(download_queue) + 1
+        people = "person" if pos == 1 else "people"
+        queue_msg = await app.send_message(
+            object_guid,
+            "\u23f3 The bot is busy right now.\n"
+            "There {} {} {} ahead of you.".format(
+                "is" if pos == 1 else "are", pos, people
+            ),
+        )
+        download_queue.append({
+            "object_guid": object_guid,
+            "url": url,
+            "choice": None,           # sentinel: Spotify entry
+            "title": url,
+            "queue_msg_id": queue_msg.message_id,
+        })
+        log.info("spotify queued at position %d | guid=%s", pos, object_guid)
+
+
+async def _run_spotify_and_queue(object_guid: str, url: str) -> None:
+    """Run one Spotify download then hand off to the next queue entry."""
+    global is_downloading
+    log = logging.getLogger("queue")
+    try:
+        await _do_spotify_download(object_guid, url, log)
+    finally:
+        if download_queue:
+            next_entry = download_queue.popleft()
+            await _notify_queue_positions()
+            try:
+                await app.edit_message(
+                    next_entry["object_guid"],
+                    next_entry["queue_msg_id"],
+                    "\U0001f7e2 You are the first person in the queue!\n"
+                    "Starting your download\u2026",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+            # Dispatch the next entry — Spotify or YouTube
+            if next_entry["choice"] is None:
+                asyncio.create_task(
+                    _run_spotify_and_queue(next_entry["object_guid"], next_entry["url"])
+                )
+            else:
+                asyncio.create_task(
+                    _run_download_and_queue(
+                        next_entry["object_guid"],
+                        next_entry["url"],
+                        next_entry["choice"],
+                        next_entry["title"],
+                    )
+                )
+        else:
+            is_downloading = False
 
 
 if __name__ == "__main__":
