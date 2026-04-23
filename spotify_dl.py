@@ -373,9 +373,36 @@ def _totp(secret_b32: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Spotify access token
+# Spotify access token (in-memory + disk cache)
 # ---------------------------------------------------------------------------
 _token_cache: dict = {}
+
+
+def _spotify_token_cache_path() -> Path:
+    cache_dir = Path(tempfile.gettempdir()) / "tele2rub"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "spotify-anon-token.json"
+
+
+def _load_spotify_token() -> dict:
+    """Load cached Spotify token from disk. Returns {} on failure."""
+    try:
+        data = json.loads(_spotify_token_cache_path().read_text())
+        if data.get("token") and data.get("expires_at"):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_spotify_token(token: str, expires_at: float) -> None:
+    """Persist Spotify token to disk cache."""
+    try:
+        _spotify_token_cache_path().write_text(
+            json.dumps({"token": token, "expires_at": expires_at})
+        )
+    except Exception as exc:
+        log.debug("could not save spotify token cache: %s", exc)
 
 _HEADERS_BASE = {
     "User-Agent": (
@@ -391,19 +418,22 @@ _HEADERS_BASE = {
 
 
 def _fetch_anon_token() -> tuple[str, float]:
-    """Get an anonymous Spotify access token from the web-player endpoint."""
-    ts = int(time.time() * 1000)
+    """Get an anonymous Spotify access token (matches SpotiFLAC requestSpotifyAnonymousAccessToken)."""
+    totp_code = _totp(_SPOTIFY_TOTP_SECRET)
     params: dict = {
-        "reason": "transport",
-        "productType": "web_player",
-        "totp": _totp(_SPOTIFY_TOTP_SECRET),
-        "totpVer": str(_SPOTIFY_TOTP_VERSION),
-        "ts": str(ts),
+        "reason":      "init",
+        "productType": "web-player",
+        "totp":        totp_code,
+        "totpVer":     str(_SPOTIFY_TOTP_VERSION),
+        "totpServer":  totp_code,
     }
     resp = requests.get(
-        "https://open.spotify.com/get_access_token",
+        "https://open.spotify.com/api/token",
         params=params,
-        headers={**_HEADERS_BASE, "app-platform": "WebPlayer"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Content-Type": "application/json;charset=UTF-8",
+        },
         timeout=15,
     )
     resp.raise_for_status()
@@ -427,21 +457,32 @@ def _fetch_cc_token() -> tuple[str, float]:
 
 
 def get_token() -> str:
-    """Return a valid Spotify Bearer token (cached, auto-refreshed)."""
+    """Return a valid Spotify Bearer token (in-memory cache → disk cache → network)."""
     now = time.time()
-    if _token_cache.get("expires_at", 0) > now + 60:
+
+    # 1. In-memory cache
+    if _token_cache.get("expires_at", 0) > now + 30:
         return _token_cache["token"]
 
-    # 1. Anonymous web-player token
+    # 2. Disk cache
+    if not _token_cache:
+        disk = _load_spotify_token()
+        if disk.get("expires_at", 0) > now + 30:
+            _token_cache.update(disk)
+            log.debug("spotify token loaded from disk cache")
+            return _token_cache["token"]
+
+    # 3. Anonymous web-player token
     try:
         token, expires = _fetch_anon_token()
         _token_cache.update({"token": token, "expires_at": expires})
+        _save_spotify_token(token, expires)
         log.debug("spotify anon token OK (expires %s)", time.ctime(expires))
         return token
     except Exception as exc:
         log.warning("anon token failed: %s", exc)
 
-    # 2. Client-credentials fallback
+    # 4. Client-credentials fallback
     if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
         try:
             token, expires = _fetch_cc_token()
@@ -1340,21 +1381,90 @@ def filter_playlist(data: dict, separator: str = ", ") -> dict:
     }
 
 
+
+# ---------------------------------------------------------------------------
+# ISRC disk cache (matches SpotiFLAC GetCachedISRC / PutCachedISRC)
+# ---------------------------------------------------------------------------
+
+_ISRC_CACHE_FILE = "spotify-isrc-cache.json"
+_isrc_cache_lock = threading.Lock()
+
+
+def _isrc_cache_path() -> Path:
+    cache_dir = Path(tempfile.gettempdir()) / "tele2rub"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / _ISRC_CACHE_FILE
+
+
+def _get_cached_isrc(track_id: str) -> str | None:
+    """Return cached ISRC for a Spotify track ID, or None."""
+    try:
+        with _isrc_cache_lock:
+            data = json.loads(_isrc_cache_path().read_text())
+        return data.get(track_id) or None
+    except Exception:
+        return None
+
+
+def _put_cached_isrc(track_id: str, isrc: str) -> None:
+    """Persist a track_id → ISRC mapping to the disk cache."""
+    try:
+        with _isrc_cache_lock:
+            path = _isrc_cache_path()
+            try:
+                data = json.loads(path.read_text())
+            except Exception:
+                data = {}
+            data[track_id] = isrc
+            path.write_text(json.dumps(data))
+    except Exception as exc:
+        log.debug("could not save isrc cache: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # (existing code continues below)
 # ---------------------------------------------------------------------------
 
+_ISRC_RE = re.compile(r'[A-Z]{2}[A-Z0-9]{3}[0-9]{7}')
+
+
 def _isrc_soundplate(track_id: str) -> str | None:
-    """Last-resort ISRC lookup via Soundplate."""
+    """Last-resort ISRC lookup via Soundplate (matches SpotiFLAC lookupSpotifyISRCViaSoundplate)."""
     try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://phpstack-822472-6184058.cloudwaysapps.com/?",
+            "Accept-Language": "en-US,en;q=0.9,id;q=0.8",
+            "Sec-CH-UA": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
         resp = requests.get(
             "https://phpstack-822472-6184058.cloudwaysapps.com/api/spotify.php",
             params={"q": f"https://open.spotify.com/track/{track_id}"},
+            headers=headers,
             timeout=15,
         )
         if resp.ok:
-            data = resp.json()
-            return data.get("isrc") or (data.get("data") or {}).get("isrc")
+            body = resp.text
+            # try JSON field first
+            try:
+                data = resp.json()
+                isrc = data.get("isrc") or (data.get("data") or {}).get("isrc") or ""
+                if isrc:
+                    m = _ISRC_RE.search(isrc.upper())
+                    if m:
+                        return m.group(0)
+            except Exception:
+                pass
+            # fallback: regex search over entire body
+            m = _ISRC_RE.search(body.upper())
+            if m:
+                return m.group(0)
     except Exception as exc:
         log.warning("soundplate fallback: %s", exc)
     return None
@@ -1598,6 +1708,89 @@ def _parse_tidal_track(data: dict) -> dict:
     }
 
 
+
+# ---------------------------------------------------------------------------
+# MusicBrainz genre enrichment (matches SpotiFLAC backend/musicbrainz.go)
+# ---------------------------------------------------------------------------
+
+_mb_lock = threading.Lock()
+_mb_last_call = 0.0  # enforce 1.1s minimum interval
+
+
+def _musicbrainz_genre(isrc: str, max_genres: int = 3) -> str:
+    """
+    Look up genre tags from MusicBrainz for the given ISRC.
+    Returns a comma-separated genre string, or "" on failure.
+    Ref: SpotiFLAC backend/musicbrainz.go FetchMusicBrainzMetadata()
+    """
+    global _mb_last_call
+    if not isrc:
+        return ""
+    try:
+        with _mb_lock:
+            # Respect MusicBrainz rate limit (1 req/sec)
+            wait = 1.1 - (time.time() - _mb_last_call)
+            if wait > 0:
+                time.sleep(wait)
+            _mb_last_call = time.time()
+
+        resp = requests.get(
+            "https://musicbrainz.org/ws/2/recording",
+            params={
+                "query": f"isrc:{isrc}",
+                "fmt":   "json",
+                "inc":   "tags",
+                "limit": "1",
+            },
+            headers={"User-Agent": "Tele2Rub/1.0 (https://github.com/xshayank/Tele2Rub)"},
+            timeout=10,
+        )
+        if not resp.ok:
+            return ""
+        recordings = resp.json().get("recordings") or []
+        if not recordings:
+            return ""
+        tags = recordings[0].get("tags") or []
+        if not tags:
+            return ""
+        tags.sort(key=lambda t: t.get("count", 0), reverse=True)
+        genres = [t["name"].title() for t in tags[:max_genres] if t.get("name")]
+        return ", ".join(genres)
+    except Exception as exc:
+        log.debug("musicbrainz genre lookup: %s", exc)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Tidal Alt proxy (no token required — matches SpotiFLAC backend/tidal_alt.go)
+# ---------------------------------------------------------------------------
+
+_TIDAL_ALT_API_BASE = "https://tidal.spotbye.qzz.io/get"
+
+
+def _get_tidal_alt_url(spotify_track_id: str) -> str | None:
+    """
+    Fetch a Tidal download URL via the no-auth SpotiFLAC proxy.
+    Takes a Spotify track ID and returns a direct audio download URL.
+    Ref: SpotiFLAC backend/tidal_alt.go, GetAltDownloadURLFromSpotify()
+    """
+    try:
+        resp = requests.get(
+            f"{_TIDAL_ALT_API_BASE}/{spotify_track_id}",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15,
+        )
+        if resp.ok:
+            data = resp.json()
+            url = (data.get("link") or data.get("url") or "").strip()
+            if url.startswith("http"):
+                log.debug("tidal alt url OK for %s", spotify_track_id)
+                return url
+    except Exception as exc:
+        log.debug("tidal alt proxy: %s", exc)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Public entry point: get_track_info (Spotify → ISRC → multi-platform)
 # ---------------------------------------------------------------------------
@@ -1611,8 +1804,10 @@ def _resolve_all_platforms(info: dict) -> dict:
       1. Deezer public ISRC API (always)
       2. Qobuz ISRC search (auto-scraped credentials, no account needed)
       3. Tidal ISRC API (if TIDAL_TOKEN set)
+      3b. Tidal Alt — no token needed (uses Spotify track ID directly)
       4. Odesli / song.link API (no auth) — fills in any remaining gaps
       5. Songstats scrape (no auth) — last-resort Tidal/Amazon fallback
+      6. MusicBrainz genre (non-blocking, best-effort)
     """
     isrc = info.get("isrc") or ""
 
@@ -1621,6 +1816,7 @@ def _resolve_all_platforms(info: dict) -> dict:
         "qobuz_id": None, "qobuz_url": None,
         "qobuz_bit_depth": None, "qobuz_sample_rate": None,
         "tidal_id": None, "tidal_url": None,
+        "tidal_alt_url": None,
         "amazon_url": None,
     })
 
@@ -1663,6 +1859,13 @@ def _resolve_all_platforms(info: dict) -> dict:
         info["tidal_url"] = f"https://tidal.com/browse/track/{td['id']}"
         log.debug("tidal resolved: id=%s", td["id"])
 
+    # ── 3b. Tidal Alt — no token needed (uses Spotify track ID directly) ──
+    if not info.get("tidal_url") and info.get("track_id"):
+        tidal_alt_url = _get_tidal_alt_url(info["track_id"])
+        if tidal_alt_url:
+            info["tidal_alt_url"] = tidal_alt_url
+            log.debug("tidal alt resolved for track %s", info["track_id"])
+
     # ── 4. Odesli — fills missing platform URLs (no auth) ─────────────────
     # Build an input URL for Odesli: prefer a Deezer URL we already have,
     # otherwise synthesise a Spotify one if we have a track_id.
@@ -1691,6 +1894,12 @@ def _resolve_all_platforms(info: dict) -> dict:
         if sg.get("amazon_url") and not info["amazon_url"]:
             info["amazon_url"] = sg["amazon_url"]
 
+    # ── 6. MusicBrainz genre (non-blocking, best-effort) ──────────────────
+    if isrc and not info.get("genre"):
+        genre = _musicbrainz_genre(isrc)
+        if genre:
+            info["genre"] = genre
+
     return info
 
 
@@ -1703,9 +1912,22 @@ def get_track_info(track_id: str) -> dict:
       track_number, disc_number, isrc,
       deezer_id, deezer_url, deezer_preview_url,
       qobuz_id, qobuz_url,
-      tidal_id, tidal_url
+      tidal_id, tidal_url, tidal_alt_url
     """
     info: dict = {}
+
+    # --- Phase 0: Check ISRC disk cache (skip metadata fetch if ISRC known) ---
+    cached_isrc = _get_cached_isrc(track_id)
+    if cached_isrc:
+        log.debug("isrc cache hit for track %s: %s", track_id, cached_isrc)
+        info = {
+            "title": "", "artists": [], "album": "",
+            "release_date": "", "cover_url": "",
+            "track_number": 1, "disc_number": 1,
+            "isrc": cached_isrc,
+        }
+        info["track_id"] = track_id
+        return _resolve_all_platforms(info)
 
     # --- Phase 1: Spotify metadata via GraphQL (primary) ---
     try:
@@ -1737,6 +1959,10 @@ def get_track_info(track_id: str) -> dict:
     # ISRC via Soundplate if still missing
     if not info.get("isrc"):
         info["isrc"] = _isrc_soundplate(track_id)
+
+    # Persist ISRC to disk cache for future lookups
+    if info.get("isrc"):
+        _put_cached_isrc(track_id, info["isrc"])
 
     # --- Phase 2: multi-platform resolution ---
     return _resolve_all_platforms(info)
@@ -1843,7 +2069,7 @@ def embed_metadata(filepath: Path, info: dict) -> None:
     try:
         from mutagen.id3 import (
             ID3, ID3NoHeaderError,
-            TIT2, TPE1, TALB, TDRC, TRCK, TPOS, APIC, TSRC,
+            TIT2, TPE1, TPE2, TALB, TDRC, TRCK, TPOS, APIC, TSRC, TCON, COMM,
         )
         from mutagen.flac import FLAC, Picture
     except ImportError:
@@ -1876,6 +2102,12 @@ def embed_metadata(filepath: Path, info: dict) -> None:
         tags.add(TPOS(encoding=3, text=str(info.get("disc_number", 1))))
         if info.get("isrc"):
             tags.add(TSRC(encoding=3, text=info["isrc"]))
+        if info.get("albumartist") or info.get("album_artist"):
+            tags.add(TPE2(encoding=3, text=info.get("albumartist") or info.get("album_artist") or ""))
+        if info.get("genre"):
+            tags.add(TCON(encoding=3, text=info["genre"]))
+        if info.get("isrc"):
+            tags.add(COMM(encoding=3, lang="eng", desc="", text=info.get("isrc", "")))
         if cover_data:
             tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_data))
         tags.save(str(filepath))
@@ -1891,6 +2123,12 @@ def embed_metadata(filepath: Path, info: dict) -> None:
         audio["discnumber"]  = str(info.get("disc_number", 1))
         if info.get("isrc"):
             audio["isrc"] = info["isrc"]
+        if info.get("albumartist") or info.get("album_artist"):
+            audio["albumartist"] = info.get("albumartist") or info.get("album_artist") or ""
+        if info.get("genre"):
+            audio["genre"] = info["genre"]
+        if info.get("comment"):
+            audio["comment"] = info["comment"]
         if cover_data:
             pic = Picture()
             pic.type = 3  # cover front
@@ -2067,6 +2305,76 @@ async def _download_qobuz(
 
 
 # ---------------------------------------------------------------------------
+# Amazon Music download via proxy (matches SpotiFLAC backend/amazon.go)
+# ---------------------------------------------------------------------------
+
+_AMAZON_PROXY_APIS = [
+    "https://afkar.xyz/api/track/{asin}",
+    "https://amazon.spotbye.qzz.io/api/track/{asin}",
+]
+
+
+def _get_amazon_stream_url(asin: str) -> tuple[str, str]:
+    """
+    Returns (stream_url, decryption_key) from the Amazon proxy API.
+    decryption_key is "" if no decryption is needed.
+    """
+    for template in _AMAZON_PROXY_APIS:
+        url = template.format(asin=asin)
+        try:
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if resp.ok:
+                data = resp.json()
+                stream_url = data.get("streamUrl") or data.get("url") or data.get("link") or ""
+                decryption_key = data.get("decryptionKey") or data.get("key") or ""
+                if stream_url.startswith("http"):
+                    return stream_url, decryption_key
+        except Exception as exc:
+            log.debug("amazon proxy %s: %s", url, exc)
+    return "", ""
+
+
+def _extract_amazon_asin(amazon_url: str) -> str | None:
+    """Extract B0XXXXXXXXX ASIN from an Amazon Music URL."""
+    m = re.search(r'(B[0-9A-Z]{9})', amazon_url)
+    return m.group(1) if m else None
+
+
+def _download_raw_stream(url: str, dest: Path) -> None:
+    """Download a file from a direct URL to dest (blocking)."""
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=120)
+    resp.raise_for_status()
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(65536):
+            if chunk:
+                f.write(chunk)
+
+
+async def _convert_or_rename_amazon(raw_path: Path, download_dir: Path, stem: str) -> Path:
+    """
+    Try to convert the raw Amazon file to FLAC with ffmpeg.
+    If ffmpeg is not available, keep the file as-is with the correct extension.
+    """
+    import shutil
+    ffmpeg = shutil.which("ffmpeg")
+    out_flac = download_dir / f"{stem}.flac"
+    if ffmpeg:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg, "-y", "-i", str(raw_path), "-vn", "-c:a", "flac", str(out_flac),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if out_flac.exists() and out_flac.stat().st_size > 0:
+            raw_path.unlink(missing_ok=True)
+            return out_flac
+    # ffmpeg unavailable or failed — keep with m4a extension
+    out_m4a = raw_path.with_suffix(".m4a")
+    raw_path.rename(out_m4a)
+    return out_m4a
+
+
+# ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
 
@@ -2077,6 +2385,7 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
 
     Priority:
       1. Qobuz FLAC  — via proxy stream APIs (no credentials required), if qobuz_id available
+      1b. Tidal Alt  — no credentials; uses Spotify track ID directly
       2. Deezer FLAC — if DEEZER_ARL set and deezer_url available
       3. YouTube Music MP3 320 k — always available as fallback
     """
@@ -2095,7 +2404,26 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
                 log.warning("metadata embed failed for %s: %s", fp.name, exc)
             return fp
         except Exception as exc:
-            log.warning("qobuz proxy download failed, trying Deezer/YTMusic: %s", exc)
+            log.warning("qobuz proxy download failed, trying Tidal Alt/Deezer/YTMusic: %s", exc)
+
+    # ── 1b. Tidal Alt (no credentials) ────────────────────────────────────
+    spotify_id = info.get("track_id")
+    if not qobuz_id and spotify_id:
+        try:
+            direct_url = info.get("tidal_alt_url") or _get_tidal_alt_url(spotify_id)
+            if direct_url:
+                from urllib.parse import urlparse as _urlparse
+                ext = Path(_urlparse(direct_url).path).suffix.lower() or ".flac"
+                fp = download_dir / f"{safe}{ext}"
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, _download_raw_stream, direct_url, fp)
+                try:
+                    embed_metadata(fp, info)
+                except Exception as exc:
+                    log.warning("metadata embed failed: %s", exc)
+                return fp
+        except Exception as exc:
+            log.warning("tidal alt download failed, trying Deezer/YTMusic: %s", exc)
 
     output_tmpl = str(download_dir / f"{safe}.%(ext)s")
 
@@ -2161,9 +2489,11 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
 def best_source_label(info: dict) -> str:
     """Return a human-readable label for the download source that will be used."""
     if info.get("qobuz_id"):
-        return "\U0001f1f6\U0001f1ff Qobuz FLAC"
+        return "🇶🇿 Qobuz FLAC"
+    if info.get("tidal_alt_url") or info.get("track_id"):
+        return "🇳🇴 Tidal FLAC (keyless)"
     if DEEZER_ARL and info.get("deezer_url"):
-        return "\U0001f1eb\U0001f1f7 Deezer FLAC"
+        return "🇫🇷 Deezer FLAC"
     return "MP3 320k"
 
 
@@ -2460,6 +2790,32 @@ def build_platform_choices(info: dict, quality: str) -> list:
             "url":        info["deezer_url"],
         })
 
+    # ── Tidal Alt — no credentials; uses Spotify track ID directly ─────────
+    if want_flac and info.get("track_id") and not info.get("qobuz_id"):
+        choices.append({
+            "label":      "\U0001f1f3\U0001f1f4 Tidal FLAC (keyless proxy)",
+            "source":     "tidal_alt",
+            "quality":    QUALITY_FLAC_CD,
+            "audio_only": True,
+            "out_ext":    "flac",
+            "url":        info.get("tidal_alt_url"),
+            "spotify_id": info["track_id"],
+        })
+
+    # ── Amazon Music — no credentials required (proxy API) ─────────────────
+    if info.get("amazon_url") and want_flac:
+        asin = _extract_amazon_asin(info["amazon_url"])
+        if asin:
+            choices.append({
+                "label":      "\U0001f1fa\U0001f1f8 Amazon Music FLAC",
+                "source":     "amazon",
+                "quality":    QUALITY_FLAC_CD,
+                "audio_only": True,
+                "out_ext":    "flac",
+                "url":        info["amazon_url"],
+                "asin":       asin,
+            })
+
     # ── YouTube Music MP3 — always available ───────────────────────────────
     title       = info.get("title", "")
     artists_str = ", ".join(info.get("artists") or [])
@@ -2512,6 +2868,50 @@ async def download_track_from_choice(
 
         quality_tier = choice.get("quality", QUALITY_FLAC_CD)
         fp = await _download_qobuz(qobuz_id, quality_tier, download_dir, safe)
+        try:
+            embed_metadata(fp, info)
+        except Exception as exc:
+            log.warning("metadata embed failed for %s: %s", fp.name, exc)
+        return fp
+
+    # ── Tidal Alt — no credentials; uses Spotify track ID ─────────────────
+    if source == "tidal_alt":
+        spotify_id = choice.get("spotify_id") or info.get("track_id")
+        if not spotify_id:
+            raise RuntimeError("Spotify track ID not available for Tidal Alt download")
+
+        direct_url = choice.get("url") or info.get("tidal_alt_url")
+        if not direct_url:
+            loop = asyncio.get_event_loop()
+            direct_url = await loop.run_in_executor(None, _get_tidal_alt_url, spotify_id)
+        if not direct_url:
+            raise RuntimeError(f"Tidal Alt proxy returned no URL for Spotify track {spotify_id}")
+
+        from urllib.parse import urlparse as _urlparse
+        ext = Path(_urlparse(direct_url).path).suffix.lower() or ".flac"
+        dest_path = download_dir / f"{safe}{ext}"
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _download_raw_stream, direct_url, dest_path)
+        try:
+            embed_metadata(dest_path, info)
+        except Exception as exc:
+            log.warning("metadata embed for tidal alt %s: %s", dest_path.name, exc)
+        return dest_path
+
+    # ── Amazon Music — proxy API (no credentials) ──────────────────────────
+    if source == "amazon":
+        asin = choice.get("asin") or _extract_amazon_asin(choice.get("url", ""))
+        if not asin:
+            raise RuntimeError("Amazon ASIN not available")
+        stream_url, _decryption_key = _get_amazon_stream_url(asin)
+        if not stream_url:
+            raise RuntimeError(f"Amazon proxy returned no stream URL for ASIN {asin}")
+
+        loop = asyncio.get_event_loop()
+        raw_path = download_dir / f"{safe}.m4a.tmp"
+        await loop.run_in_executor(None, _download_raw_stream, stream_url, raw_path)
+
+        fp = await _convert_or_rename_amazon(raw_path, download_dir, safe)
         try:
             embed_metadata(fp, info)
         except Exception as exc:
