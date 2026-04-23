@@ -34,6 +34,12 @@ PHONE_NUMBER = os.getenv("RUBIKA_PHONE", "").strip() or None
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
+STATE_FILE = BASE_DIR / "state.json"
+
+# Admin GUIDs loaded from env (comma-separated Rubika object GUIDs or phone numbers
+# that identify the admin accounts in private chats).
+_raw_admins = os.getenv("ADMIN_GUIDS", "").strip()
+ADMIN_GUIDS: set = {g.strip() for g in _raw_admins.split(",") if g.strip()}
 
 YTDLP_BIN = BASE_DIR / "yt-dlp"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
@@ -50,7 +56,8 @@ PROGRESS_RE = re.compile(
 
 UPDATE_INTERVAL = 3.0
 SELECTION_TIMEOUT = 300.0          # seconds before a pending quality menu expires
-SIZE_LIMIT_BYTES = 2 * 1024 ** 3   # 2 GB hard limit \u2014 options above this are hidden
+SIZE_LIMIT_BYTES = 2 * 1024 ** 3   # 2 GB hard limit — options above this are hidden
+MAX_LOG_ENTRIES = 500               # keep the most recent N log lines
 
 # Per-chat pending quality-selection state.
 # Key: object_guid  Value: {url, choices, title, timeout_task}
@@ -60,6 +67,72 @@ pending_selections: dict = {}
 # Each entry: {object_guid, url, choice, title, queue_msg_id}
 download_queue: collections.deque = collections.deque()
 is_downloading: bool = False
+
+# ---------------------------------------------------------------------------
+# Persistent state: whitelist / ban / usage logs
+# ---------------------------------------------------------------------------
+# Structure stored in state.json:
+#   whitelist_enabled : bool
+#   whitelist         : list[str]   – allowed object_guids (when enabled)
+#   banned            : list[str]   – permanently blocked object_guids
+#   logs              : list[dict]  – usage log entries
+
+_state_lock = asyncio.Lock()
+
+def _load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            with STATE_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Normalise
+                data.setdefault("whitelist_enabled", False)
+                data.setdefault("whitelist", [])
+                data.setdefault("banned", [])
+                data.setdefault("logs", [])
+                return data
+        except Exception:
+            pass
+    return {"whitelist_enabled": False, "whitelist": [], "banned": [], "logs": []}
+
+
+def _save_state(state: dict) -> None:
+    tmp = STATE_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    tmp.replace(STATE_FILE)
+
+
+# Load into memory at import time; all mutations go through async helpers.
+_state: dict = _load_state()
+
+
+def _is_admin(object_guid: str) -> bool:
+    return object_guid in ADMIN_GUIDS
+
+
+def _check_access(object_guid: str) -> tuple[bool, str]:
+    """Return (allowed, reason).  Admins always pass."""
+    if _is_admin(object_guid):
+        return True, ""
+    if object_guid in _state["banned"]:
+        return False, "🚫 You have been banned from using this bot."
+    if _state["whitelist_enabled"] and object_guid not in _state["whitelist"]:
+        return False, "🔒 This bot is currently restricted. Contact the admin."
+    return True, ""
+
+
+def _append_log(object_guid: str, action: str, detail: str = "") -> None:
+    entry = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+        "guid": object_guid,
+        "action": action,
+        "detail": detail,
+    }
+    _state["logs"].append(entry)
+    # Keep only the most recent MAX_LOG_ENTRIES
+    if len(_state["logs"]) > MAX_LOG_ENTRIES:
+        _state["logs"] = _state["logs"][-MAX_LOG_ENTRIES:]
+    _save_state(_state)
 
 
 def make_bar(percent: float, width: int = 10) -> str:
@@ -374,9 +447,15 @@ async def download_handler(update):
     log = logging.getLogger("download")
     log.info("!download | text=%r | guid=%s", update.text, update.object_guid)
 
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
     args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
     match = YOUTUBE_RE.search(args)
-    object_guid = update.object_guid
 
     if not match:
         await app.send_message(
@@ -387,6 +466,7 @@ async def download_handler(update):
         return
 
     url = match.group(0)
+    _append_log(object_guid, "download_requested", url)
 
     # Cancel any existing pending selection for this chat
     old = pending_selections.pop(object_guid, None)
@@ -455,6 +535,11 @@ async def selection_handler(update):
     cmd_name = update.command[0] if update.command else ""
     log.info("!%s | guid=%s", cmd_name, object_guid)
 
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
     if cmd_name == "cancel":
         entry = pending_selections.pop(object_guid, None)
         if entry and entry.get("timeout_task"):
@@ -509,6 +594,7 @@ async def selection_handler(update):
     choice = choices[idx]
     url = entry["url"]
     title = entry.get("title", "")
+    _append_log(object_guid, "download_started", "{} | {}".format(choice["label"], url))
 
     # -- Queue logic ----------------------------------------------------------
     # Check and set is_downloading atomically (no await in between -- safe in asyncio).
@@ -634,6 +720,212 @@ async def _do_download(object_guid: str, url: str, choice: dict, title: str, log
             await app.edit_message(object_guid, status_id, "\u274c Error: {}".format(exc))
         except Exception:
             pass
+
+
+
+@app.on_message_updates(filters.commands("admin", prefixes="!"))
+async def admin_handler(update):
+    """
+    Admin command handler.  Only accounts listed in ADMIN_GUIDS may use this.
+
+    Sub-commands
+    ------------
+    !admin whitelist add <guid>    – add a user to the whitelist
+    !admin whitelist remove <guid> – remove a user from the whitelist
+    !admin whitelist on            – enable whitelist mode (only listed users can use bot)
+    !admin whitelist off           – disable whitelist mode (open to everyone)
+    !admin ban <guid>              – ban a user
+    !admin unban <guid>            – unban a user
+    !admin logs [N]                – show last N (default 20) usage log entries
+    !admin status                  – show current settings summary
+    """
+    object_guid = update.object_guid
+    log = logging.getLogger("admin")
+
+    if not _is_admin(object_guid):
+        await app.send_message(object_guid, "🚫 You do not have admin privileges.")
+        return
+
+    parts = update.command  # ['admin', 'sub', ...]
+    if len(parts) < 2:
+        await app.send_message(
+            object_guid,
+            "⚙️ Admin commands:\n"
+            "  !admin whitelist add <guid>\n"
+            "  !admin whitelist remove <guid>\n"
+            "  !admin whitelist on\n"
+            "  !admin whitelist off\n"
+            "  !admin ban <guid>\n"
+            "  !admin unban <guid>\n"
+            "  !admin logs [N]\n"
+            "  !admin status"
+        )
+        return
+
+    sub = parts[1].lower()
+
+    # ------------------------------------------------------------------
+    # whitelist sub-commands
+    # ------------------------------------------------------------------
+    if sub == "whitelist":
+        if len(parts) < 3:
+            await app.send_message(
+                object_guid,
+                "Usage: !admin whitelist add|remove|on|off [<guid>]"
+            )
+            return
+        action = parts[2].lower()
+
+        if action in ("on", "off"):
+            _state["whitelist_enabled"] = (action == "on")
+            _save_state(_state)
+            status_word = "enabled" if _state["whitelist_enabled"] else "disabled"
+            log.info("whitelist %s by %s", status_word, object_guid)
+            await app.send_message(
+                object_guid,
+                "✅ Whitelist mode {}.".format(status_word)
+            )
+            return
+
+        if action in ("add", "remove"):
+            if len(parts) < 4:
+                await app.send_message(
+                    object_guid,
+                    "Usage: !admin whitelist {} <guid>".format(action)
+                )
+                return
+            target = parts[3].strip()
+            wl = _state["whitelist"]
+            if action == "add":
+                if target not in wl:
+                    wl.append(target)
+                    _save_state(_state)
+                    log.info("whitelist add %s by %s", target, object_guid)
+                await app.send_message(
+                    object_guid,
+                    "✅ {} added to whitelist.".format(target)
+                )
+            else:  # remove
+                if target in wl:
+                    wl.remove(target)
+                    _save_state(_state)
+                    log.info("whitelist remove %s by %s", target, object_guid)
+                    await app.send_message(
+                        object_guid,
+                        "✅ {} removed from whitelist.".format(target)
+                    )
+                else:
+                    await app.send_message(
+                        object_guid,
+                        "ℹ️ {} was not in the whitelist.".format(target)
+                    )
+            return
+
+        await app.send_message(
+            object_guid,
+            "❌ Unknown whitelist action. Use add / remove / on / off."
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # ban / unban
+    # ------------------------------------------------------------------
+    if sub in ("ban", "unban"):
+        if len(parts) < 3:
+            await app.send_message(
+                object_guid,
+                "Usage: !admin {} <guid>".format(sub)
+            )
+            return
+        target = parts[2].strip()
+        banned = _state["banned"]
+        if sub == "ban":
+            if target not in banned:
+                banned.append(target)
+                _save_state(_state)
+                log.info("banned %s by %s", target, object_guid)
+            await app.send_message(
+                object_guid,
+                "🚫 {} has been banned.".format(target)
+            )
+        else:  # unban
+            if target in banned:
+                banned.remove(target)
+                _save_state(_state)
+                log.info("unbanned %s by %s", target, object_guid)
+                await app.send_message(
+                    object_guid,
+                    "✅ {} has been unbanned.".format(target)
+                )
+            else:
+                await app.send_message(
+                    object_guid,
+                    "ℹ️ {} was not banned.".format(target)
+                )
+        return
+
+    # ------------------------------------------------------------------
+    # logs
+    # ------------------------------------------------------------------
+    if sub == "logs":
+        try:
+            n = int(parts[2]) if len(parts) >= 3 else 20
+        except ValueError:
+            n = 20
+        n = max(1, min(n, 100))
+        entries = _state["logs"][-n:]
+        if not entries:
+            await app.send_message(object_guid, "ℹ️ No usage logs yet.")
+            return
+        lines = ["📋 Last {} usage log entries:".format(len(entries))]
+        for e in reversed(entries):
+            lines.append(
+                "[{}] {} | {} | {}".format(
+                    e.get("time", "?"),
+                    e.get("guid", "?"),
+                    e.get("action", "?"),
+                    e.get("detail", ""),
+                )
+            )
+        # Split into chunks of ≤4000 chars to avoid message size limits
+        chunk, chunks = [], []
+        for line in lines:
+            if sum(len(l) + 1 for l in chunk) + len(line) > 3800:
+                chunks.append("\n".join(chunk))
+                chunk = []
+            chunk.append(line)
+        if chunk:
+            chunks.append("\n".join(chunk))
+        for c in chunks:
+            await app.send_message(object_guid, c)
+        return
+
+    # ------------------------------------------------------------------
+    # status
+    # ------------------------------------------------------------------
+    if sub == "status":
+        wl_mode = "ON" if _state["whitelist_enabled"] else "OFF"
+        wl_count = len(_state["whitelist"])
+        ban_count = len(_state["banned"])
+        log_count = len(_state["logs"])
+        admin_count = len(ADMIN_GUIDS)
+        await app.send_message(
+            object_guid,
+            "⚙️ Bot status:\n"
+            "  Admins configured : {}\n"
+            "  Whitelist mode    : {}\n"
+            "  Whitelisted users : {}\n"
+            "  Banned users      : {}\n"
+            "  Log entries       : {}".format(
+                admin_count, wl_mode, wl_count, ban_count, log_count
+            )
+        )
+        return
+
+    await app.send_message(
+        object_guid,
+        "❌ Unknown admin sub-command: {}".format(sub)
+    )
 
 
 if __name__ == "__main__":
