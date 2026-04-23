@@ -118,6 +118,22 @@ def _fmt_size(size_bytes: int) -> str:
     return f"~{mb:.0f} MB"
 
 
+def _estimate_size(fmt: dict, duration: float) -> int:
+    """Return best-effort file size in bytes for a format dict.
+
+    Prefers the exact ``filesize`` field, then ``filesize_approx``, and
+    finally falls back to ``tbr`` (total bitrate in kbps) × duration.
+    Returns 0 when no estimate is possible.
+    """
+    size = fmt.get("filesize") or fmt.get("filesize_approx")
+    if size:
+        return int(size)
+    tbr = fmt.get("tbr")  # kilobits per second
+    if tbr and duration:
+        return int(tbr * 1000 / 8 * duration)
+    return 0
+
+
 def build_quality_menu(info: dict) -> list:
     """
     Build a numbered list of download choices from yt-dlp video JSON.
@@ -129,6 +145,7 @@ def build_quality_menu(info: dict) -> list:
     - Any option whose estimated combined size exceeds SIZE_LIMIT_BYTES is skipped.
     """
     formats = info.get("formats", [])
+    duration = float(info.get("duration") or 0)
 
     video_fmts = [
         f for f in formats
@@ -144,7 +161,7 @@ def build_quality_menu(info: dict) -> list:
         if audio_fmts else None
     )
     audio_size = (
-        (best_audio.get("filesize") or best_audio.get("filesize_approx") or 0)
+        _estimate_size(best_audio, duration)
         if best_audio else 0
     )
 
@@ -170,7 +187,7 @@ def build_quality_menu(info: dict) -> list:
         seen_heights.add(actual_h)
 
         best_vid = max(at_height, key=lambda f: f.get("tbr") or f.get("vbr") or 0)
-        vid_size = best_vid.get("filesize") or best_vid.get("filesize_approx") or 0
+        vid_size = _estimate_size(best_vid, duration)
         total_size = vid_size + audio_size
 
         # Skip options that would exceed the 2 GB send limit
@@ -185,7 +202,7 @@ def build_quality_menu(info: dict) -> list:
         choices.append({
             "label": label,
             "format": (
-                "bestvideo[height<={}][ext=mp4]+bestaudio[ext=m4a]"
+                "bestvideo[height<={}]+bestaudio[ext=m4a]"
                 "/bestvideo[height<={}]+bestaudio"
                 "/best[height<={}]"
             ).format(actual_h, actual_h, actual_h),
