@@ -209,6 +209,7 @@ def build_quality_menu(info: dict) -> list:
             "audio_only": False,
             "subtitle_only": False,
             "out_ext": "mp4",
+            "target_height": actual_h,
         })
 
     # Audio-only MP3
@@ -534,24 +535,31 @@ async def selection_handler(update):
         log.info("queued at position %d | guid=%s", pos, object_guid)
 
 
-async def _compress_video(src: Path, log) -> Path:
+async def _transcode_video(src: Path, target_height, log) -> Path:
     """
-    Re-encode *src* with ffmpeg CRF-23 H.264 (-preset fast) into a temporary
-    file.  Only replaces the original when the compressed file is actually
-    smaller.  Returns the final path to send (may be unchanged *src*).
+    Transcode *src* to exactly *target_height* lines using ffmpeg.
+
+    The video is scaled with ``scale=-2:{target_height}`` (maintains aspect
+    ratio, keeps width divisible by 2) and re-encoded as H.264 CRF-23 fast.
+    Audio is re-encoded to AAC 128 kbps for maximum compatibility.
+
+    If *target_height* is None or ffmpeg fails the original file is returned
+    unchanged.
     """
+    if not target_height:
+        return src
     tmp = src.with_suffix(".tmp.mp4")
     cmd = [
         "ffmpeg", "-y",
         "-i", str(src),
+        "-vf", "scale=-2:{}".format(target_height),
         "-c:v", "libx264", "-crf", "23", "-preset", "fast",
-        "-c:a", "copy",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         str(tmp),
     ]
-    before_bytes = src.stat().st_size
-    before_mb = before_bytes / (1024 * 1024)
-    log.info("compressing: %s (%.2f MB)", src.name, before_mb)
+    before_mb = src.stat().st_size / (1024 * 1024)
+    log.info("transcoding to %dp: %s (%.2f MB)", target_height, src.name, before_mb)
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -561,7 +569,7 @@ async def _compress_video(src: Path, log) -> Path:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=3600.0)
         if proc.returncode != 0:
             log.warning(
-                "ffmpeg compression failed (code %s): %s",
+                "ffmpeg transcode failed (code %s): %s",
                 proc.returncode,
                 out.decode("utf-8", errors="replace")[-500:],
             )
@@ -569,33 +577,21 @@ async def _compress_video(src: Path, log) -> Path:
                 tmp.unlink()
             return src
 
-        after_bytes = tmp.stat().st_size
-        after_mb = after_bytes / (1024 * 1024)
-
-        if after_bytes >= before_bytes:
-            # Compressed file is not smaller — discard and send original
-            log.info(
-                "compression skipped: %.2f MB -> %.2f MB (would be larger -- sending original)",
-                before_mb, after_mb,
-            )
-            tmp.unlink()
-            return src
-
-        ratio = (1.0 - after_bytes / before_bytes) * 100.0
+        after_mb = tmp.stat().st_size / (1024 * 1024)
         log.info(
-            "compression result: %.2f MB -> %.2f MB  (%.1f%% smaller)",
-            before_mb, after_mb, ratio,
+            "transcode result: %.2f MB -> %.2f MB  (%dp)",
+            before_mb, after_mb, target_height,
         )
         tmp.replace(src)
         return src
 
     except asyncio.TimeoutError:
-        log.warning("ffmpeg compression timed out -- sending original")
+        log.warning("ffmpeg transcode timed out -- sending original")
         if tmp.exists():
             tmp.unlink()
         return src
     except Exception as exc:
-        log.warning("ffmpeg compression error: %s -- sending original", exc)
+        log.warning("ffmpeg transcode error: %s -- sending original", exc)
         if tmp.exists():
             tmp.unlink()
         return src
@@ -680,16 +676,20 @@ async def _do_download(object_guid: str, url: str, choice: dict, title: str, log
         size_mb = file_path.stat().st_size / (1024 * 1024)
         log.info("sending: %s (%.2f MB)", downloaded_file, size_mb)
 
-        # Compress video files (not audio-only, not subtitles)
+        # Transcode video files to the exact requested resolution via ffmpeg
+        # (not audio-only, not subtitles)
         if not choice.get("audio_only") and not choice.get("subtitle_only"):
+            target_h = choice.get("target_height")
             await app.edit_message(
                 object_guid, status_id,
-                "\u2699\ufe0f Compressing video\u2026"
+                "\u2699\ufe0f Processing video{}\u2026".format(
+                    " to {}p".format(target_h) if target_h else ""
+                )
             )
-            file_path = await _compress_video(file_path, log)
+            file_path = await _transcode_video(file_path, target_h, log)
             downloaded_file = str(file_path)
             size_mb = file_path.stat().st_size / (1024 * 1024)
-            log.info("post-compression size: %.2f MB", size_mb)
+            log.info("post-transcode size: %.2f MB", size_mb)
 
         await app.edit_message(object_guid, status_id, "\u2705 Download complete. Sending\u2026")
         caption = "{}\n{}".format(title, url) if title else url
