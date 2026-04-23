@@ -11,6 +11,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from rubpy import Client as RubikaClient, filters
 
+import spotify_dl as _spodl
+
 
 load_dotenv()
 
@@ -43,7 +45,6 @@ ADMIN_GUIDS: set = {g.strip() for g in _raw_admins.split(",") if g.strip()}
 
 YTDLP_BIN = BASE_DIR / "yt-dlp"
 COOKIES_FILE = BASE_DIR / "cookies.txt"
-SPOTDL_BIN = BASE_DIR / "spotdl"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -52,7 +53,9 @@ YOUTUBE_RE = re.compile(
 )
 
 SPOTIFY_RE = re.compile(
-    r'https?://open\.spotify\.com/(track|album|playlist)/[\w]+'
+    r'https?://open\.spotify\.com/track/([A-Za-z0-9]{22})'
+    r'|spotify:track:([A-Za-z0-9]{22})'
+    r'|(?<![A-Za-z0-9])([A-Za-z0-9]{22})(?![A-Za-z0-9])'
 )
 
 PROGRESS_RE = re.compile(
@@ -147,10 +150,6 @@ def make_bar(percent: float, width: int = 10) -> str:
 
 def _ytdlp_bin() -> str:
     return str(YTDLP_BIN) if YTDLP_BIN.exists() else "yt-dlp"
-
-
-def _spotdl_bin() -> str:
-    return str(SPOTDL_BIN) if SPOTDL_BIN.exists() else "spotdl"
 
 
 def _base_cmd() -> list:
@@ -455,7 +454,9 @@ async def start_handler(update):
         "  !start          \u2014 Show this message\n\n"
         "After sending !download the bot lists available qualities.\n"
         "Reply with !1, !2, \u2026 to pick one. Options above 2 GB are hidden.\n\n"
-        "Spotify links are downloaded as MP3 with full metadata (cover art, artist, album)."
+        "Spotify: send a track URL, URI, or bare ID.\n"
+        "Downloads as FLAC (if DEEZER_ARL is configured) or MP3 320 k.\n"
+        "Full metadata is embedded automatically."
     )
 
 
@@ -946,153 +947,77 @@ async def admin_handler(update):
 
 
 # ---------------------------------------------------------------------------
-# Spotify downloading
+# Spotify downloading  (SpotiFLAC approach via spotify_dl.py)
 # ---------------------------------------------------------------------------
-
-SPOTDL_DONE_RE = re.compile(r'Downloaded\s+"(.+?)"')
-SPOTDL_FAIL_RE = re.compile(r'(Failed to download|Skipping)\s+"(.+?)"')
-SPOTDL_FOUND_RE = re.compile(r'Found\s+(\d+)\s+song')
 
 
 async def _do_spotify_download(object_guid: str, url: str, log) -> None:
-    """Run spotdl for the given Spotify URL and send every downloaded file."""
-    status = await app.send_message(object_guid, "\U0001f50d Looking up Spotify link\u2026")
+    """Download a single Spotify track using the SpotiFLAC approach and send it."""
+    status = await app.send_message(object_guid, "\U0001f50d Looking up Spotify track\u2026")
     status_id = status.message_id
 
-    # spotdl saves files to cwd by default — point it at DOWNLOAD_DIR
-    cmd = [
-        _spotdl_bin(),
-        url,
-        "--output", str(DOWNLOAD_DIR / "{title} - {artists}.{output-ext}"),
-        "--format", "mp3",
-        "--bitrate", "320k",
-        "--log-level", "INFO",
-    ]
-    log.info("spotdl cmd: %s", " ".join(cmd))
-
-    downloaded_files: list[Path] = []
-    total_tracks = 0
-    done_count = 0
-    fail_count = 0
-    last_update = 0.0
-
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        log.info("spotdl pid=%s", proc.pid)
-
-        async for raw in proc.stdout:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if line:
-                log.debug("spotdl | %s", line)
-
-            m_found = SPOTDL_FOUND_RE.search(line)
-            if m_found:
-                total_tracks = int(m_found.group(1))
-                try:
-                    await app.edit_message(
-                        object_guid, status_id,
-                        "\U0001f3b5 Found {} track{}. Downloading\u2026".format(
-                            total_tracks, "s" if total_tracks != 1 else ""
-                        )
-                    )
-                except Exception:
-                    pass
-                continue
-
-            m_done = SPOTDL_DONE_RE.search(line)
-            if m_done:
-                done_count += 1
-                track_name = m_done.group(1)
-                now = time.monotonic()
-                if now - last_update >= UPDATE_INTERVAL:
-                    last_update = now
-                    progress_str = (
-                        " ({}/{})".format(done_count, total_tracks)
-                        if total_tracks > 1
-                        else ""
-                    )
-                    try:
-                        await app.edit_message(
-                            object_guid, status_id,
-                            "\U0001f4e5 Downloaded{}: {}".format(progress_str, track_name)
-                        )
-                    except Exception:
-                        pass
-                continue
-
-            m_fail = SPOTDL_FAIL_RE.search(line)
-            if m_fail:
-                fail_count += 1
-                log.warning("spotdl failed track: %s", line)
-
-        await proc.wait()
-        log.info("spotdl returncode=%s", proc.returncode)
-
-        if proc.returncode != 0 and done_count == 0:
+        # --- Phase 1+2: resolve metadata & Deezer URL ---
+        track_id = _spodl.parse_spotify_track_id(url)
+        if not track_id:
             await app.edit_message(
                 object_guid, status_id,
-                "\u274c spotdl failed. Check the URL and try again."
+                "\u274c Could not parse a Spotify track ID from: {}".format(url),
             )
             return
 
-        # Collect all MP3s written during this run (newest files first)
-        candidates = sorted(
-            DOWNLOAD_DIR.glob("*.mp3"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        # We only want files produced in this run — use the count of successfully
-        # downloaded tracks as a cap so we don't re-send old leftover files.
-        expected = max(done_count, 1)
-        downloaded_files = candidates[:expected]
+        try:
+            await app.edit_message(object_guid, status_id, "\U0001f4e1 Fetching Spotify metadata\u2026")
+        except Exception:
+            pass
 
-        if not downloaded_files:
+        loop = asyncio.get_event_loop()
+        info = await loop.run_in_executor(None, _spodl.get_track_info, track_id)
+
+        title       = info.get("title", "Unknown")
+        artists_str = ", ".join(info.get("artists", []))
+        source_tag  = " [\U0001f1eb\U0001f1f1 FLAC]" if (_spodl.DEEZER_ARL and info.get("deezer_url")) else " [MP3 320k]"
+
+        try:
             await app.edit_message(
                 object_guid, status_id,
-                "\u274c Download finished but no files were found."
+                "\U0001f4e5 Downloading{}: {} — {}".format(source_tag, title, artists_str),
             )
-            return
+        except Exception:
+            pass
 
-        await app.edit_message(
-            object_guid, status_id,
-            "\u2705 Download complete. Sending {} file{}\u2026".format(
-                len(downloaded_files), "s" if len(downloaded_files) != 1 else ""
+        # --- Phase 3: download + tag ---
+        fp = await _spodl.download_track(info, DOWNLOAD_DIR, _ytdlp_bin())
+
+        try:
+            await app.edit_message(
+                object_guid, status_id,
+                "\U0001f4e4 Sending {} ({})…".format(fp.name, fp.suffix.lstrip(".").upper()),
             )
-        )
+        except Exception:
+            pass
 
-        for fp in downloaded_files:
+        try:
+            await app.send_document(object_guid, str(fp), caption="{} — {}".format(title, artists_str))
+            log.info("sent: %s", fp)
+        except Exception as exc:
+            log.error("send failed: %s", exc)
+            await app.send_message(object_guid, "\u274c Failed to send file: {}".format(exc))
+        finally:
             try:
-                await app.send_document(object_guid, str(fp), caption=fp.stem)
-                log.info("sent: %s", fp)
-            except Exception as exc:
-                log.error("send failed for %s: %s", fp, exc)
-                await app.send_message(
-                    object_guid,
-                    "\u274c Failed to send {}: {}".format(fp.name, exc)
-                )
-            finally:
-                try:
-                    fp.unlink()
-                except Exception:
-                    pass
+                fp.unlink()
+            except Exception:
+                pass
 
-        summary = "\u2705 Done!"
-        if fail_count:
-            summary += " ({} track{} failed to download)".format(
-                fail_count, "s" if fail_count != 1 else ""
-            )
-        await app.edit_message(object_guid, status_id, summary)
+        await app.edit_message(object_guid, status_id, "\u2705 Done!")
 
     except Exception as exc:
-        log.exception("error in _do_spotify_download: %s", exc)
+        log.exception("_do_spotify_download error: %s", exc)
         try:
             await app.edit_message(object_guid, status_id, "\u274c Error: {}".format(exc))
         except Exception:
             pass
+
 
 
 @app.on_message_updates(filters.commands("spotify", prefixes="!"))
@@ -1108,22 +1033,23 @@ async def spotify_handler(update):
         return
 
     args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
-    match = SPOTIFY_RE.search(args)
+    track_id = _spodl.parse_spotify_track_id(args)
 
-    if not match:
+    if not track_id:
         await app.send_message(
             object_guid,
-            "\u274c Please provide a valid Spotify link.\n"
-            "Supported: track, album, or playlist URLs.\n"
-            "Example: !spotify https://open.spotify.com/track/..."
+            "\u274c Please provide a valid Spotify track link.\n"
+            "Accepted formats:\n"
+            "  https://open.spotify.com/track/<id>\n"
+            "  spotify:track:<id>\n"
+            "  (bare 22-character track ID)"
         )
         return
 
-    url = match.group(0)
-    link_type = match.group(1)  # "track", "album", or "playlist"
-    _append_log(object_guid, "spotify_{}".format(link_type), url)
+    url = args.strip()
+    _append_log(object_guid, "spotify_track", url)
 
-    # Re-use the same download queue so Spotify and YouTube downloads don't run concurrently.
+    # Re-use the shared download queue
     if not is_downloading:
         is_downloading = True
         asyncio.create_task(_run_spotify_and_queue(object_guid, url))
