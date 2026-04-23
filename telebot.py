@@ -1,13 +1,15 @@
 import os
 import re
 import json
-import asyncio
-import time
 from pathlib import Path
-
+from typing import Optional
+import random
 from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+import yt_dlp
 
 
 load_dotenv()
@@ -20,12 +22,14 @@ BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 QUEUE_DIR = BASE_DIR / "queue"
 QUEUE_FILE = QUEUE_DIR / "tasks.jsonl"
-
-YTDLP_BIN = BASE_DIR / "yt-dlp"
-COOKIES_FILE = BASE_DIR / "cookies.txt"
+#cache for saving url to download
+CHACHE = QUEUE_DIR / "cache.json"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+
+with open(CHACHE, "w") as f:
+    f.write("{}")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Please set API_ID, API_HASH and BOT_TOKEN in .env")
@@ -37,131 +41,249 @@ app = Client(
     bot_token=BOT_TOKEN,
 )
 
-YOUTUBE_RE = re.compile(
-    r'https?://(?:www\.)?(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/)|youtu\.be/)[\w\-]+'
-)
 
-PROGRESS_RE = re.compile(
-    r'\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\S+/s)'
-)
-
-UPDATE_INTERVAL = 3.0
+def safe_filename(name: Optional[str]) -> str:
+    name = (name or "file.bin").strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", name)
+    name = name.rstrip(". ")
+    return name[:200] or "file.bin"
 
 
-def make_bar(percent: float, width: int = 10) -> str:
-    filled = round(width * percent / 100)
-    return '█' * filled + '░' * (width - filled)
+def split_name(filename: str) -> tuple[str, str]:
+    path = Path(filename)
+    return path.stem, path.suffix
+
+
+def get_media(message: Message):
+    media_types = [
+        ("document", message.document),
+        ("video", message.video),
+        ("audio", message.audio),
+        ("voice", message.voice),
+        ("photo", message.photo),
+        ("animation", message.animation),
+        ("video_note", message.video_note),
+        ("sticker", message.sticker),
+    ]
+
+    for media_type, media in media_types:
+        if media:
+            return media_type, media
+
+    return None, None
+
+
+def build_download_filename(message: Message, media_type: str, media) -> str:
+    original_name = getattr(media, "file_name", None)
+
+    if not original_name:
+        file_unique_id = getattr(media, "file_unique_id", None) or "file"
+
+        default_extensions = {
+            "document": ".bin",
+            "video": ".mp4",
+            "audio": ".mp3",
+            "voice": ".ogg",
+            "photo": ".jpg",
+            "animation": ".mp4",
+            "video_note": ".mp4",
+            "sticker": ".webp",
+        }
+
+        original_name = f"{file_unique_id}{default_extensions.get(media_type, '.bin')}"
+
+    original_name = safe_filename(original_name)
+    stem, suffix = split_name(original_name)
+
+    unique_name = f"{stem}_{message.id}{suffix or '.bin'}"
+    return safe_filename(unique_name)
 
 
 def append_task(task: dict) -> None:
-    with open(QUEUE_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(task, ensure_ascii=False) + "\n")
+    with open(QUEUE_FILE, "a", encoding="utf-8") as file:
+        file.write(json.dumps(task, ensure_ascii=False) + "\n")
 
 
-def build_ytdlp_cmd(url: str) -> list[str]:
-    ytdlp = str(YTDLP_BIN) if YTDLP_BIN.exists() else "yt-dlp"
-    cmd = [
-        ytdlp,
-        "--user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "--referer", "https://www.youtube.com/",
-        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]",
-        "--merge-output-format", "mp4",
-        "-o", str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-        "--print", "after_move:filepath",
-        "--newline",
-    ]
-    if COOKIES_FILE.exists():
-        cmd += ["--cookies", str(COOKIES_FILE)]
-    cmd.append(url)
-    return cmd
+#progress message in downloading
+async def prog(c,total,t,client,user_id):                                   
+    #this function show the progress of downlaoing
+    #to prevent error of fast editing i made random system to update the progres                                                                            
+    try:                                                                    
+        alf = random.randint(1,100)                                         
+        # print(alf)                                                      
+        if alf==50:                                                         
+                                                                            
+            await client.edit_message_text(                                 
+            chat_id=t.chat.id,                                                          
+            message_id=t.id,
+            text=f"در حال دانلود {(c*100)/total:.1f}%"
+        )
+    except Exception as e:
+        print(e)
+        pass
+    
 
 
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client: Client, message: Message):
-    await message.reply_text(
-        "🎬 لینک یوتیوب رو بفرست تا دانلود و ارسال به روبیکا بشه."
+
+    start_message = """فایل رو بفرست
+    برای دانلود از لینک از دستور /link <url> استفاده کن."""
+    await message.reply_text(start_message)
+
+
+@app.on_message(
+    filters.private
+    & (
+        filters.document
+        | filters.video
+        | filters.audio
+        | filters.voice
+        | filters.photo
+        | filters.animation
+        | filters.video_note
+        | filters.sticker
     )
-
-
-@app.on_message(filters.private & filters.text & ~filters.command("start"))
-async def url_handler(client: Client, message: Message):
-    text = message.text.strip()
-    match = YOUTUBE_RE.search(text)
-
-    if not match:
-        await message.reply_text("❌ لطفاً یک لینک یوتیوب معتبر بفرست.")
+)
+async def media_handler(client: Client, message: Message):
+    media_type, media = get_media(message)
+    if not media:
+        await message.reply_text("فایل قابل پردازش نیست.")
         return
 
-    url = match.group(0)
-    status = await message.reply_text("⏳ شروع دانلود...")
+    download_name = build_download_filename(message, media_type, media)
+    download_path = DOWNLOAD_DIR / download_name
 
+    status = await message.reply_text("فایل رفت توی صف پردازش.")
+    
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *build_ytdlp_cmd(url),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        downloaded = await client.download_media(
+            message,
+            file_name=str(download_path),
+            progress=prog,progress_args= (status,client,message.from_user.id)
         )
 
-        downloaded_file = None
-        last_update = 0.0
+        if not downloaded:
+            raise RuntimeError("Download failed.")
 
-        async for raw in proc.stdout:
-            line = raw.decode("utf-8", errors="replace").strip()
-
-            # yt-dlp prints the final file path via --print after_move:filepath
-            if line and not line.startswith("[") and line.endswith(".mp4"):
-                downloaded_file = line
-                continue
-
-            m = PROGRESS_RE.search(line)
-            if not m:
-                continue
-
-            percent = float(m.group(1))
-            speed = m.group(2)
-            now = time.monotonic()
-
-            if now - last_update >= UPDATE_INTERVAL:
-                last_update = now
-                bar = make_bar(percent)
-                try:
-                    await status.edit_text(
-                        f"📥 در حال دانلود...\n"
-                        f"[{bar}] {percent:.1f}%\n"
-                        f"⚡ سرعت: {speed}"
-                    )
-                except Exception:
-                    pass
-
-        await proc.wait()
-
-        if proc.returncode != 0:
-            await status.edit_text("❌ دانلود با خطا مواجه شد. لطفاً دوباره امتحان کن.")
-            return
-
-        if not downloaded_file:
-            mp4s = list(DOWNLOAD_DIR.glob("*.mp4"))
-            if mp4s:
-                downloaded_file = str(max(mp4s, key=lambda p: p.stat().st_mtime))
-
-        if not downloaded_file or not Path(downloaded_file).exists():
-            await status.edit_text("❌ فایل دانلود شده پیدا نشد.")
-            return
-
-        await status.edit_text("✅ دانلود کامل شد. در صف ارسال به روبیکا قرار گرفت.")
+        await status.edit_text("فایل از تلگرام با موفقیت دانلود شد.")
+        downloaded_path = Path(downloaded)
+        if not downloaded_path.exists():
+            raise RuntimeError("Downloaded file not found.")
 
         task = {
             "type": "local_file",
-            "path": downloaded_file,
-            "caption": url,
+            "path": str(downloaded_path),
+            "caption": message.caption or "",
             "chat_id": message.chat.id,
             "status_message_id": status.id,
         }
+
         append_task(task)
 
     except Exception as e:
-        await status.edit_text(f"❌ خطا: {str(e)}")
+        await status.edit_text(f"خطا: {str(e)}")
+
+
+
+#########################################################################
+#download link section  
+def add_cache(id,url):
+
+    with open(CHACHE,"r",encoding="UTF-8") as f:
+        data = json.load(f)
+    
+    data[id] = url
+    with open(CHACHE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return data
+
+def read_cache():
+
+    with open(CHACHE,"r",encoding="UTF-8") as f:
+        data = json.load(f)
+
+    return data
+
+
+def get_formats(url):
+    ydl_opts = {"quiet": True, "skip_download": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    formats = []
+    for f in info["formats"]:
+        if f.get("ext") and f.get("format_id"):
+            formats.append({
+                "id": f["format_id"],
+                "ext": f["ext"],
+                "res": f.get("format_note") or f.get("height") or f.get("format") or f.get("resolution"),
+                "url":f.get("url")
+            })
+    return formats
+
+
+@app.on_message(filters.command("link"))
+async def link_handler(client, message):
+    url = message.command[1].strip()
+
+    try:
+        formats = get_formats(url)
+    except:
+        await message.reply("Failed to read video.")
+        return
+    
+    add_cache(message.id,url)
+
+    buttons = []
+    urls = "لینک‌ها به‌ترتیب همراه با دکمه‌ها قرار داده شده‌اند:\n"
+    for f in formats:
+        urls += f["url"]+"\n"
+        label = f'{f["res"]}--{f["ext"]}'
+        data = f"{message.id}|{f['id']}|{f['ext']}"
+        buttons.append([InlineKeyboardButton(label, callback_data=data)])
+
+    await message.reply(urls)
+    await message.reply(
+        "Select format:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+@app.on_callback_query()
+async def callback_handler(client, callback_query):
+    msg_id, format_id,ext = callback_query.data.split("|")
+    url_cache = read_cache()
+
+    url = url_cache.get(msg_id)
+
+    if not url:
+        await callback_query.answer("Expired.")
+        return
+
+
+    filename = f"download_{msg_id}_{format_id}.{ext}"
+    ydl_opts = {
+        "format": format_id,
+        "outtmpl": filename
+    }
+    await callback_query.message.edit_text("در حال دانلود...")
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        file_path = ydl.prepare_filename(info)
+
+    await callback_query.message.edit_text("درحال ارسال...")
+    
+    await client.send_document(
+        chat_id=callback_query.message.chat.id,
+        document=file_path,
+        caption=filename,
+        reply_to_message_id=callback_query.message.id
+    )
+    
+
+    os.remove(filename)
 
 
 if __name__ == "__main__":
