@@ -25,6 +25,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -1214,8 +1215,6 @@ def filter_playlist(data: dict, separator: str = ", ") -> dict:
     Returns a dict with keys: id, name, description, owner, cover, followers,
     count, tracks (list).
     """
-    import html as _html
-
     playlist_data = _sp_map(_sp_map(data, "data"), "playlistV2")
     if not playlist_data:
         return {}
@@ -1332,7 +1331,7 @@ def filter_playlist(data: dict, separator: str = ", ") -> dict:
     return {
         "id":          playlist_id,
         "name":        _sp_str(playlist_data, "name"),
-        "description": _html.unescape(_sp_str(playlist_data, "description")),
+        "description": html.unescape(_sp_str(playlist_data, "description")),
         "owner":       owner_info,
         "cover":       cover,
         "followers":   followers,
