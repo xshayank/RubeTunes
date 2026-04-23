@@ -5,22 +5,18 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
-telegram_file = BASE_DIR / "telebot.py"
 rubika_file = BASE_DIR / "rub.py"
 
-telegram_proc = None
 rubika_proc = None
 
 try:
     rubika_proc = subprocess.Popen([sys.executable, str(rubika_file)])
-    telegram_proc = subprocess.Popen([sys.executable, str(telegram_file)])
-
     rubika_proc.wait()
-    telegram_proc.wait()
+    if rubika_proc.returncode != 0:
+        print(f"[main] rub.py exited with code {rubika_proc.returncode}")
 
 except KeyboardInterrupt:
     pass
 finally:
-    for proc in [telegram_proc, rubika_proc]:
-        if proc and proc.poll() is None:
-            proc.terminate()
+    if rubika_proc and rubika_proc.poll() is None:
+        rubika_proc.terminate()
