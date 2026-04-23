@@ -5,19 +5,22 @@ SpotiFLAC-style multi-platform music downloader.
 Supported input sources: Spotify, Tidal, Qobuz, Amazon Music.
 
 Resolution chain (ISRC-based):
-  Qobuz FLAC (QOBUZ_EMAIL + QOBUZ_PASSWORD + QOBUZ_APP_ID)
-  → Deezer FLAC (DEEZER_ARL)
-  → YouTube Music MP3 320 k (always available)
+  1. Resolve ISRC via Spotify / Tidal / Qobuz / Amazon metadata APIs
+  2. Fan-out across Deezer public ISRC API, Odesli (song.link), Songstats
+  3. Download via:
+       – Qobuz FLAC  (proxy stream APIs, no credentials required)
+       – Deezer FLAC (DEEZER_ARL cookie — if set)
+       – YouTube Music MP3 320 k (always available as fallback)
 
 Environment variables (all optional):
   SPOTIFY_TOTP_SECRET     Base-32 TOTP secret for anonymous Spotify token.
   SPOTIFY_CLIENT_ID       } Spotify app credentials; fallback if anon token fails.
   SPOTIFY_CLIENT_SECRET   }
   DEEZER_ARL              Deezer account ARL cookie — enables lossless FLAC.
-  QOBUZ_APP_ID            Qobuz application ID (required for Qobuz API).
-  QOBUZ_EMAIL             Qobuz account e-mail (required for Qobuz download).
-  QOBUZ_PASSWORD          Qobuz account password (required for Qobuz download).
+  QOBUZ_APP_ID            Qobuz application ID for metadata API (optional lookup).
   TIDAL_TOKEN             Tidal client/OAuth token for metadata lookup.
+
+  Note: Qobuz FLAC downloads use public proxy APIs and require NO credentials.
 """
 import asyncio
 import base64
@@ -45,6 +48,7 @@ SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID",     "").strip()
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 DEEZER_ARL            = os.getenv("DEEZER_ARL",            "").strip()
 QOBUZ_APP_ID          = os.getenv("QOBUZ_APP_ID",          "").strip()
+# QOBUZ_EMAIL / QOBUZ_PASSWORD are no longer needed — proxy APIs used instead.
 QOBUZ_EMAIL           = os.getenv("QOBUZ_EMAIL",           "").strip()
 QOBUZ_PASSWORD        = os.getenv("QOBUZ_PASSWORD",        "").strip()
 TIDAL_TOKEN           = os.getenv("TIDAL_TOKEN",           "").strip()
@@ -479,11 +483,16 @@ def _resolve_via_songstats(isrc: str) -> dict:
                 if isinstance(same_as, str):
                     same_as = [same_as]
                 for u in same_as:
-                    if "tidal.com" in u and "tidal_url" not in result:
+                    try:
+                        from urllib.parse import urlparse as _urlparse
+                        host = _urlparse(u).netloc.lower()
+                    except Exception:
+                        continue
+                    if (host == "tidal.com" or host.endswith(".tidal.com")) and "tidal_url" not in result:
                         result["tidal_url"] = u
-                    elif "deezer.com" in u and "deezer_url" not in result:
+                    elif (host == "deezer.com" or host.endswith(".deezer.com")) and "deezer_url" not in result:
                         result["deezer_url"] = u
-                    elif "music.amazon.com" in u and "amazon_url" not in result:
+                    elif (host == "music.amazon.com" or host.endswith(".music.amazon.com")) and "amazon_url" not in result:
                         result["amazon_url"] = u
             except Exception:
                 pass
@@ -876,6 +885,170 @@ def embed_metadata(filepath: Path, info: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Quality / platform menu builder
+# ---------------------------------------------------------------------------
+
+# Quality tier constants
+QUALITY_MP3      = "mp3"
+QUALITY_FLAC_CD  = "flac_cd"
+QUALITY_FLAC_HI  = "flac_hi"
+
+_QUALITY_LABELS = {
+    QUALITY_MP3:     "MP3 320k",
+    QUALITY_FLAC_CD: "FLAC CD (16-bit / 44.1 kHz)",
+    QUALITY_FLAC_HI: "FLAC Hi-Res (24-bit)",
+}
+
+QUALITY_MENU = [
+    {"label": "\U0001f3b5 MP3 320k",                    "quality": QUALITY_MP3},
+    {"label": "\U0001f4bf FLAC CD (16-bit / 44.1 kHz)", "quality": QUALITY_FLAC_CD},
+    {"label": "\u2b50 FLAC Hi-Res (24-bit)",            "quality": QUALITY_FLAC_HI},
+]
+
+
+# ---------------------------------------------------------------------------
+# Qobuz no-auth stream download (proxy APIs)
+# ---------------------------------------------------------------------------
+
+# Proxy endpoints that return a signed Qobuz stream URL.
+# Each endpoint accepts trackId (Qobuz numeric ID) and quality level.
+_QOBUZ_STREAM_PROXIES = [
+    "https://dab.yeet.su/api/stream?trackId={id}&quality={q}",
+    "https://dabmusic.xyz/api/stream?trackId={id}&quality={q}",
+    "https://qobuz.spotbye.qzz.io/api/track/{id}?quality={q}",
+]
+
+# Quality level fallback chains
+# 27 = Hi-Res Max (24-bit up to 192 kHz)  /  7 = 24-bit Standard  /  6 = 16-bit Lossless CD
+_QOBUZ_QUALITY_CHAIN = {
+    QUALITY_FLAC_HI: [27,  # Hi-Res Max
+                      7,   # 24-bit Standard
+                      6],  # 16-bit Lossless CD
+    QUALITY_FLAC_CD: [6,   # 16-bit Lossless CD
+                      7],  # 24-bit Standard (fallback)
+    QUALITY_MP3:     [],   # Qobuz not used for MP3
+}
+
+
+def _get_qobuz_stream_url(track_id: str, quality_num: int) -> str | None:
+    """
+    Try each proxy API in order and return the first signed stream URL found.
+    Returns *None* if all proxies fail for this (track_id, quality_num) pair.
+    """
+    for template in _QOBUZ_STREAM_PROXIES:
+        url = template.format(id=track_id, q=quality_num)
+        try:
+            resp = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15,
+                allow_redirects=True,
+            )
+            if not resp.ok:
+                log.debug("qobuz proxy %s → HTTP %d", url, resp.status_code)
+                continue
+
+            ct = resp.headers.get("content-type", "")
+            # JSON response — look for a URL field
+            if "json" in ct:
+                try:
+                    data = resp.json()
+                    stream_url = (
+                        data.get("url")
+                        or data.get("stream_url")
+                        or data.get("download_url")
+                        or data.get("link")
+                    )
+                    if stream_url and str(stream_url).startswith("http"):
+                        log.debug("qobuz stream via %s (json)", url)
+                        return str(stream_url)
+                except Exception:
+                    pass
+
+            # Plain-text URL
+            text = resp.text.strip()
+            if text.startswith("http"):
+                log.debug("qobuz stream via %s (plain)", url)
+                return text
+
+            # The proxy might have redirected to the actual CDN URL
+            if resp.url != url:
+                try:
+                    from urllib.parse import urlparse as _urlparse
+                    redir_host = _urlparse(resp.url).netloc.lower()
+                except Exception:
+                    redir_host = ""
+                if (
+                    redir_host == "storage.googleapis.com"
+                    or redir_host.endswith(".storage.googleapis.com")
+                    or "qobuz" in redir_host
+                    or resp.url.endswith(".flac")
+                ):
+                    log.debug("qobuz stream via %s (redirect)", url)
+                    return resp.url
+
+        except Exception as exc:
+            log.debug("qobuz proxy %s error: %s", url, exc)
+
+    return None
+
+
+def _download_qobuz_stream_sync(stream_url: str, dest_path: Path) -> None:
+    """Download a FLAC file from a direct stream URL (blocking, call in executor)."""
+    resp = requests.get(
+        stream_url,
+        headers={"User-Agent": "Mozilla/5.0"},
+        stream=True,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    with open(dest_path, "wb") as fout:
+        for chunk in resp.iter_content(chunk_size=65536):
+            if chunk:
+                fout.write(chunk)
+    log.info("qobuz download complete: %s (%.1f MB)",
+             dest_path.name, dest_path.stat().st_size / (1024 * 1024))
+
+
+async def _download_qobuz(
+    track_id: str, quality_tier: str,
+    download_dir: Path, filename_stem: str
+) -> Path:
+    """
+    Obtain a signed Qobuz stream URL via proxy APIs and download the FLAC.
+    Tries quality levels from *_QOBUZ_QUALITY_CHAIN[quality_tier]* in order.
+    Raises RuntimeError if no stream URL can be obtained.
+    """
+    loop = asyncio.get_event_loop()
+    quality_nums = _QOBUZ_QUALITY_CHAIN.get(quality_tier, [6])
+
+    stream_url: str | None = None
+    used_quality: int | None = None
+    for qnum in quality_nums:
+        stream_url = await loop.run_in_executor(
+            None, _get_qobuz_stream_url, str(track_id), qnum
+        )
+        if stream_url:
+            used_quality = qnum
+            break
+
+    if not stream_url:
+        raise RuntimeError(
+            f"Could not obtain a Qobuz stream URL for track {track_id!r} "
+            f"(tried quality chain {quality_nums})"
+        )
+
+    dest_path = download_dir / f"{filename_stem}.flac"
+    # Remove any leftover file from a previous partial attempt
+    if dest_path.exists():
+        dest_path.unlink()
+
+    log.info("downloading qobuz track %s quality=%s → %s", track_id, used_quality, dest_path.name)
+    await loop.run_in_executor(None, _download_qobuz_stream_sync, stream_url, dest_path)
+    return dest_path
+
+
+# ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
 
@@ -885,30 +1058,31 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
     Returns the Path of the downloaded file.
 
     Priority:
-      1. Qobuz FLAC  — if QOBUZ_EMAIL + QOBUZ_PASSWORD set and qobuz_url available
+      1. Qobuz FLAC  — via proxy stream APIs (no credentials required), if qobuz_id available
       2. Deezer FLAC — if DEEZER_ARL set and deezer_url available
       3. YouTube Music MP3 320 k — always available as fallback
     """
     title       = info.get("title", "Unknown")
     artists_str = ", ".join(info.get("artists", ["Unknown"]))
     safe        = _safe_filename(f"{title} - {artists_str}")
+
+    # ── 1. Qobuz via proxy stream API (no credentials needed) ─────────────
+    qobuz_id = info.get("qobuz_id")
+    if qobuz_id:
+        try:
+            fp = await _download_qobuz(qobuz_id, QUALITY_FLAC_HI, download_dir, safe)
+            try:
+                embed_metadata(fp, info)
+            except Exception as exc:
+                log.warning("metadata embed failed for %s: %s", fp.name, exc)
+            return fp
+        except Exception as exc:
+            log.warning("qobuz proxy download failed, trying Deezer/YTMusic: %s", exc)
+
     output_tmpl = str(download_dir / f"{safe}.%(ext)s")
 
-    if QOBUZ_EMAIL and QOBUZ_PASSWORD and info.get("qobuz_url"):
-        cmd = [
-            ytdlp_bin,
-            info["qobuz_url"],
-            "--extract-audio",
-            "--audio-format", "flac",
-            "--username", QOBUZ_EMAIL,
-            "--password", QOBUZ_PASSWORD,
-            "-o", output_tmpl,
-            "--no-playlist",
-            "--quiet", "--no-warnings",
-        ]
-        source = "Qobuz"
-
-    elif DEEZER_ARL and info.get("deezer_url"):
+    # ── 2. Deezer FLAC ─────────────────────────────────────────────────────
+    if DEEZER_ARL and info.get("deezer_url"):
         cmd = [
             ytdlp_bin,
             info["deezer_url"],
@@ -921,6 +1095,7 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
         ]
         source = "Deezer"
 
+    # ── 3. YouTube Music MP3 ───────────────────────────────────────────────
     else:
         search = f"{title} {artists_str}"
         cmd = [
@@ -947,7 +1122,6 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
         err = stdout.decode(errors="replace")
         raise RuntimeError(f"yt-dlp ({source}) exit {proc.returncode}: {err[:400]}")
 
-    # Find the downloaded file
     exts = {".mp3", ".flac", ".m4a", ".opus", ".ogg", ".wav"}
     candidates = sorted(
         (p for p in download_dir.iterdir() if p.is_file() and p.suffix.lower() in exts),
@@ -958,7 +1132,6 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
         raise RuntimeError("yt-dlp reported success but no audio file found")
 
     fp = candidates[0]
-
     try:
         embed_metadata(fp, info)
     except Exception as exc:
@@ -969,10 +1142,10 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
 
 def best_source_label(info: dict) -> str:
     """Return a human-readable label for the download source that will be used."""
-    if QOBUZ_EMAIL and QOBUZ_PASSWORD and info.get("qobuz_url"):
-        return "\U0001f1f6\U0001f1ff FLAC"       # 🇶🇿
+    if info.get("qobuz_id"):
+        return "\U0001f1f6\U0001f1ff Qobuz FLAC"
     if DEEZER_ARL and info.get("deezer_url"):
-        return "\U0001f1eb\U0001f1f1 FLAC"       # 🇫🇱 (Deezer)
+        return "\U0001f1eb\U0001f1f7 Deezer FLAC"
     return "MP3 320k"
 
 
@@ -1091,35 +1264,17 @@ def get_spotify_album_tracks(album_id: str) -> tuple[dict, list]:
     return album_info, track_ids
 
 
-# ---------------------------------------------------------------------------
-# Quality / platform menu builder
-# ---------------------------------------------------------------------------
-
-# Quality tier constants
-QUALITY_MP3      = "mp3"
-QUALITY_FLAC_CD  = "flac_cd"
-QUALITY_FLAC_HI  = "flac_hi"
-
-_QUALITY_LABELS = {
-    QUALITY_MP3:     "MP3 320k",
-    QUALITY_FLAC_CD: "FLAC CD (16-bit / 44.1 kHz)",
-    QUALITY_FLAC_HI: "FLAC Hi-Res (24-bit)",
-}
-
-QUALITY_MENU = [
-    {"label": "\U0001f3b5 MP3 320k",                  "quality": QUALITY_MP3},
-    {"label": "\U0001f4bf FLAC CD (16-bit / 44.1 kHz)",  "quality": QUALITY_FLAC_CD},
-    {"label": "\u2b50 FLAC Hi-Res (24-bit)",           "quality": QUALITY_FLAC_HI},
-]
-
 
 def build_platform_choices(info: dict, quality: str) -> list:
     """
     Build a list of download-source choices for a resolved track given the
     user's requested quality tier.
 
+    Qobuz is available whenever the track has a qobuz_id (no credentials required
+    — downloads use the public proxy stream APIs).
+
     Each choice dict mirrors the structure used by the YouTube quality menu:
-      label      – display string
+      label      – display string shown to the user
       source     – "qobuz" | "deezer" | "ytmusic"
       quality    – one of the QUALITY_* constants (actual quality of this source)
       audio_only – True
@@ -1130,37 +1285,38 @@ def build_platform_choices(info: dict, quality: str) -> list:
     want_flac  = quality in (QUALITY_FLAC_CD, QUALITY_FLAC_HI)
     want_hires = quality == QUALITY_FLAC_HI
 
-    # ── Qobuz ──────────────────────────────────────────────────────────────
-    if QOBUZ_EMAIL and QOBUZ_PASSWORD and info.get("qobuz_url"):
+    # ── Qobuz — no credentials required; uses proxy stream APIs ───────────
+    qobuz_id = info.get("qobuz_id")
+    if qobuz_id and want_flac:
         bd = info.get("qobuz_bit_depth") or 16
         sr = info.get("qobuz_sample_rate") or 44100
         sr_khz = sr / 1000
 
         if want_hires and bd and int(bd) > 16:
-            # Hi-Res is genuinely available for this track on Qobuz
             choices.append({
                 "label":      f"\U0001f1f6\U0001f1ff Qobuz FLAC Hi-Res \u2014 {bd}-bit / {sr_khz:.0f} kHz",
                 "source":     "qobuz",
                 "quality":    QUALITY_FLAC_HI,
                 "audio_only": True,
                 "out_ext":    "flac",
-                "url":        info["qobuz_url"],
+                "url":        info.get("qobuz_url"),
+                "qobuz_id":   qobuz_id,
             })
-        elif want_flac:
-            # CD quality FLAC on Qobuz (or hi-res requested but not available)
-            note = ""
-            if want_hires:
-                note = " \u26a0\ufe0f (Hi-Res not available for this track)"
-            choices.append({
-                "label":      f"\U0001f1f6\U0001f1ff Qobuz FLAC CD \u2014 16-bit / 44.1 kHz{note}",
-                "source":     "qobuz",
-                "quality":    QUALITY_FLAC_CD,
-                "audio_only": True,
-                "out_ext":    "flac",
-                "url":        info["qobuz_url"],
-            })
+        # Always add CD quality (either as main option or fallback note)
+        note = ""
+        if want_hires and not (bd and int(bd) > 16):
+            note = " \u26a0\ufe0f Hi-Res not available for this track"
+        choices.append({
+            "label":      f"\U0001f1f6\U0001f1ff Qobuz FLAC CD \u2014 16-bit / 44.1 kHz{note}",
+            "source":     "qobuz",
+            "quality":    QUALITY_FLAC_CD,
+            "audio_only": True,
+            "out_ext":    "flac",
+            "url":        info.get("qobuz_url"),
+            "qobuz_id":   qobuz_id,
+        })
 
-    # ── Deezer ─────────────────────────────────────────────────────────────
+    # ── Deezer — requires DEEZER_ARL ───────────────────────────────────────
     if DEEZER_ARL and info.get("deezer_url") and want_flac:
         choices.append({
             "label":      "\U0001f1eb\U0001f1f7 Deezer FLAC CD \u2014 16-bit / 44.1 kHz",
@@ -1197,38 +1353,56 @@ async def download_track_from_choice(
     """
     Download a track using a pre-selected platform+quality *choice* dict
     (as produced by build_platform_choices).  Embeds metadata afterwards.
+
+    Qobuz:    uses the no-auth proxy stream APIs (_download_qobuz).
+    Deezer:   uses yt-dlp with DEEZER_ARL cookie.
+    ytmusic:  uses yt-dlp ytmsearch.
     """
     title       = info.get("title", "Unknown")
     artists_str = ", ".join(info.get("artists", ["Unknown"]))
-    safe        = _safe_filename(f"{title} - {artists_str}")
-    output_tmpl = str(download_dir / f"{safe}.%(ext)s")
+    safe        = _safe_filename("{} - {}".format(title, artists_str))
 
     source = choice.get("source", "ytmusic")
+    log.info("download_track_from_choice source=%s title=%r", source, title)
 
-    if source == "qobuz" and QOBUZ_EMAIL and QOBUZ_PASSWORD:
+    # ── Qobuz — proxy stream APIs (no credentials) ─────────────────────────
+    if source == "qobuz":
+        qobuz_id = choice.get("qobuz_id") or info.get("qobuz_id")
+        if not qobuz_id:
+            # Try to extract ID from URL
+            url_str = choice.get("url") or info.get("qobuz_url") or ""
+            m = re.search(r"qobuz\.com/track/(\d+)", url_str)
+            if m:
+                qobuz_id = m.group(1)
+        if not qobuz_id:
+            raise RuntimeError("Qobuz track ID not available in choice or info dict")
+
+        quality_tier = choice.get("quality", QUALITY_FLAC_CD)
+        fp = await _download_qobuz(qobuz_id, quality_tier, download_dir, safe)
+        try:
+            embed_metadata(fp, info)
+        except Exception as exc:
+            log.warning("metadata embed failed for %s: %s", fp.name, exc)
+        return fp
+
+    output_tmpl = str(download_dir / "{}.%(ext)s".format(safe))
+
+    # ── Deezer — yt-dlp + ARL cookie ──────────────────────────────────────
+    if source == "deezer" and DEEZER_ARL:
         cmd = [
             ytdlp_bin,
             choice["url"],
             "--extract-audio", "--audio-format", "flac",
-            "--username", QOBUZ_EMAIL, "--password", QOBUZ_PASSWORD,
+            "--add-header", "Cookie: arl={}".format(DEEZER_ARL),
             "-o", output_tmpl,
             "--no-playlist", "--quiet", "--no-warnings",
         ]
-    elif source == "deezer" and DEEZER_ARL:
-        cmd = [
-            ytdlp_bin,
-            choice["url"],
-            "--extract-audio", "--audio-format", "flac",
-            "--add-header", f"Cookie: arl={DEEZER_ARL}",
-            "-o", output_tmpl,
-            "--no-playlist", "--quiet", "--no-warnings",
-        ]
+    # ── YouTube Music MP3 fallback ─────────────────────────────────────────
     else:
-        # YouTube Music MP3 fallback
-        search = choice.get("search") or f"{title} {artists_str}"
+        search = choice.get("search") or "{} {}".format(title, artists_str)
         cmd = [
             ytdlp_bin,
-            f"ytmsearch1:{search}",
+            "ytmsearch1:{}".format(search),
             "--extract-audio", "--audio-format", "mp3",
             "--audio-quality", "0",
             "-o", output_tmpl,
@@ -1236,7 +1410,6 @@ async def download_track_from_choice(
         ]
         source = "YouTube Music"
 
-    log.info("download_track_from_choice source=%s title=%r", source, title)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -1246,7 +1419,7 @@ async def download_track_from_choice(
 
     if proc.returncode != 0:
         err = stdout.decode(errors="replace")
-        raise RuntimeError(f"yt-dlp ({source}) exit {proc.returncode}: {err[:400]}")
+        raise RuntimeError("yt-dlp ({}) exit {}: {}".format(source, proc.returncode, err[:400]))
 
     exts = {".mp3", ".flac", ".m4a", ".opus", ".ogg", ".wav"}
     candidates = sorted(
