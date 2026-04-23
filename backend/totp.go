@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+// spotifyTOTPSecret is the reverse-engineered Spotify web-player TOTP secret.
+// It is intentionally hardcoded here (matching the Python implementation) because
+// it is not a user credential — it is a static value embedded in the Spotify
+// web player that enables anonymous token acquisition without a user account.
 const (
 	spotifyTOTPSecret  = "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4DQOJUGQYTAMRRGA2TCMJSHE3TCMBY"
 	spotifyTOTPVersion = 61

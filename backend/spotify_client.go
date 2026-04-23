@@ -744,10 +744,7 @@ func FilterTrack(data map[string]interface{}, separator string, albumFetchData .
 							}
 						}
 
-						trackNum := int(getFloat64(trackData, "trackNumber"))
-						itemTrackNum := idx + 1
-						if trackNum == itemTrackNum && dNum > 0 {
-						}
+						_ = idx // position available for future disc-by-track-number matching
 					}
 				}
 			}
