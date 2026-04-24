@@ -58,6 +58,11 @@ TIDAL_TOKEN           = os.getenv("TIDAL_TOKEN",           "").strip()
 # Optional authenticated Qobuz fallback (Gap 8 — port of SpotiFLAC backend/qobuz_api.go:userLogin)
 QOBUZ_EMAIL           = os.getenv("QOBUZ_EMAIL",           "").strip()
 QOBUZ_PASSWORD        = os.getenv("QOBUZ_PASSWORD",        "").strip()
+
+# Circuit-breaker configuration (all overridable via env vars)
+CIRCUIT_FAIL_THRESHOLD  = max(1, int(os.getenv("CIRCUIT_FAIL_THRESHOLD",  "3")))
+CIRCUIT_FAIL_WINDOW_SEC = max(1, int(os.getenv("CIRCUIT_FAIL_WINDOW_SEC", "300")))  # 5 min
+CIRCUIT_OPEN_DURATION_SEC = max(1, int(os.getenv("CIRCUIT_OPEN_DURATION_SEC", "600")))  # 10 min
 # Tidal Alt endpoint rotation (Gap 5 — port of SpotiFLAC backend/tidal_api_list.go)
 # Override at runtime via TIDAL_ALT_BASES env var (comma-separated list of base URLs).
 _TIDAL_ALT_BASES_ENV = os.getenv("TIDAL_ALT_BASES", "").strip()
@@ -113,6 +118,15 @@ def _cache_set_track_info(track_id: str, info: dict) -> None:
             _track_info_cache.popitem(last=False)
 
 
+def clear_track_info_cache() -> int:
+    """Clear the in-process track-info LRU cache. Returns the number of entries cleared."""
+    with _track_info_cache_lock:
+        n = len(_track_info_cache)
+        _track_info_cache.clear()
+    log.info("track-info LRU cache cleared (%d entries)", n)
+    return n
+
+
 # ---------------------------------------------------------------------------
 # Download history (Gap 7 — port of SpotiFLAC backend/history.go)
 # ---------------------------------------------------------------------------
@@ -147,7 +161,8 @@ def _check_download_history(track_id: str, source: str, quality: str) -> Path | 
         key = _history_key(track_id, source, quality)
         entry = history.get(key)
         if entry:
-            fp = Path(entry)
+            # Entry may be a plain path string (old format) or a dict (new format)
+            fp = Path(entry["file"] if isinstance(entry, dict) else entry)
             if fp.exists() and fp.stat().st_size > 0:
                 return fp
     except Exception as exc:
@@ -155,15 +170,63 @@ def _check_download_history(track_id: str, source: str, quality: str) -> Path | 
     return None
 
 
-def _record_download_history(track_id: str, source: str, quality: str, file_path: Path) -> None:
+def _record_download_history(
+    track_id: str,
+    source: str,
+    quality: str,
+    file_path: Path,
+    *,
+    user_guid: str = "",
+    title: str = "",
+    artists: str = "",
+) -> None:
     """Persist a successful download to history (best-effort, never fatal)."""
     try:
         with _download_history_lock:
             history = _load_download_history()
-            history[_history_key(track_id, source, quality)] = str(file_path)
+            history[_history_key(track_id, source, quality)] = {
+                "file":      str(file_path),
+                "user_guid": user_guid,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "title":     title,
+                "artists":   artists,
+                "source":    source,
+                "quality":   quality,
+            }
             _save_download_history(history)
     except Exception as exc:
         log.debug("download history record failed: %s", exc)
+
+
+def get_download_history() -> list:
+    """Return all history entries as a list of dicts, newest first."""
+    try:
+        with _download_history_lock:
+            history = _load_download_history()
+        entries = []
+        for key, val in history.items():
+            if isinstance(val, dict):
+                entry = dict(val)
+            else:
+                # Migrate legacy plain-path entry
+                parts = key.split("|", 2)
+                entry = {
+                    "file":      str(val),
+                    "user_guid": "",
+                    "timestamp": "",
+                    "title":     "",
+                    "artists":   "",
+                    "source":    parts[1] if len(parts) > 1 else "",
+                    "quality":   parts[2] if len(parts) > 2 else "",
+                }
+            entry["_key"] = key
+            entries.append(entry)
+        # Newest first (sort by timestamp, empty timestamps go last)
+        entries.sort(key=lambda e: e.get("timestamp") or "", reverse=True)
+        return entries
+    except Exception as exc:
+        log.debug("get_download_history failed: %s", exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -3013,32 +3076,158 @@ def _save_provider_stats(stats: dict) -> None:
         pass
 
 
-def _record_provider_outcome(service: str, provider: str, success: bool) -> None:
+# ---------------------------------------------------------------------------
+# Circuit breaker (in-memory only; resets to closed on restart)
+# State machine per (service, provider): closed → open → half_open → closed
+# ---------------------------------------------------------------------------
+_CB_STATE_CLOSED    = "closed"
+_CB_STATE_OPEN      = "open"
+_CB_STATE_HALF_OPEN = "half_open"
+
+# _circuit_breakers[key] = {
+#   "state": str, "consecutive_failures": int,
+#   "last_failure_ts": float, "opened_at": float, "last_reason": str
+# }
+_circuit_breakers: dict = {}
+_circuit_lock = threading.Lock()
+
+
+def _cb_key(service: str, provider: str) -> str:
+    return f"{service}|{provider}"
+
+
+def _is_circuit_open(service: str, provider: str) -> bool:
+    """Return True when the circuit is open (provider should be skipped)."""
+    now = time.time()
+    with _circuit_lock:
+        key = _cb_key(service, provider)
+        cb = _circuit_breakers.get(key)
+        if cb is None:
+            return False
+        state = cb["state"]
+        if state == _CB_STATE_CLOSED:
+            return False
+        if state == _CB_STATE_OPEN:
+            # Check whether it's time to move to half-open
+            if now - cb.get("opened_at", 0) >= CIRCUIT_OPEN_DURATION_SEC:
+                cb["state"] = _CB_STATE_HALF_OPEN
+                log.info("circuit breaker [%s] → half_open (after %ds open)", key, CIRCUIT_OPEN_DURATION_SEC)
+                return False   # allow the next request through
+            return True        # still open — skip
+        # half_open: let exactly one request through (caller must record outcome)
+        return False
+
+
+def _record_provider_outcome(service: str, provider: str, success: bool, reason: str = "") -> None:
+    """Record a provider outcome and manage circuit-breaker state transitions."""
+    now = time.time()
+    key = _cb_key(service, provider)
+
+    # Update disk-based priority stats (unchanged behaviour)
     with _provider_stats_lock:
         stats = _load_provider_stats()
-        key = f"{service}|{provider}"
         entry = stats.get(key, {"success": 0, "failure": 0, "last_success": 0})
         if success:
             entry["success"] = entry.get("success", 0) + 1
-            entry["last_success"] = time.time()
+            entry["last_success"] = now
         else:
             entry["failure"] = entry.get("failure", 0) + 1
         stats[key] = entry
         _save_provider_stats(stats)
 
+    # Update in-memory circuit-breaker state
+    with _circuit_lock:
+        cb = _circuit_breakers.setdefault(key, {
+            "state":                _CB_STATE_CLOSED,
+            "consecutive_failures": 0,
+            "last_failure_ts":      0.0,
+            "opened_at":            0.0,
+            "last_reason":          "",
+        })
+        state = cb["state"]
+
+        if success:
+            if state in (_CB_STATE_HALF_OPEN, _CB_STATE_OPEN):
+                log.info("circuit breaker [%s] → closed (success in %s)", key, state)
+            cb["state"] = _CB_STATE_CLOSED
+            cb["consecutive_failures"] = 0
+        else:
+            # Count failures only within the failure window
+            in_window = (now - cb.get("last_failure_ts", 0)) < CIRCUIT_FAIL_WINDOW_SEC
+            cb["consecutive_failures"] = (cb.get("consecutive_failures", 0) + 1) if in_window else 1
+            cb["last_failure_ts"] = now
+            cb["last_reason"]     = reason or "unknown"
+
+            if state == _CB_STATE_HALF_OPEN:
+                # Failed the probe → re-open
+                cb["state"]      = _CB_STATE_OPEN
+                cb["opened_at"]  = now
+                log.warning("circuit breaker [%s] → open (failed in half_open: %s)", key, cb["last_reason"])
+            elif (
+                state == _CB_STATE_CLOSED
+                and cb["consecutive_failures"] >= CIRCUIT_FAIL_THRESHOLD
+            ):
+                cb["state"]     = _CB_STATE_OPEN
+                cb["opened_at"] = now
+                log.warning(
+                    "circuit breaker [%s] → open (%d consecutive failures within %ds, last: %s)",
+                    key, cb["consecutive_failures"], CIRCUIT_FAIL_WINDOW_SEC, cb["last_reason"],
+                )
+
 
 def _prioritize_providers(service: str, providers: list) -> list:
-    """Sort providers by most recent success. Ref: SpotiFLAC backend/provider_priority.go"""
+    """
+    Sort providers by most recent success, skipping any with an open circuit.
+    Ref: SpotiFLAC backend/provider_priority.go
+    """
     try:
         stats = _load_provider_stats()
+        # Filter out providers whose circuit is open
+        available = [p for p in providers if not _is_circuit_open(service, p)]
+        if not available:
+            # All circuits open — allow everything so the batch degrades gracefully
+            log.debug("all circuits open for service=%s; ignoring breakers", service)
+            available = list(providers)
 
         def score(p: str) -> float:
             entry = stats.get(f"{service}|{p}", {})
             return entry.get("last_success", 0.0)
 
-        return sorted(providers, key=score, reverse=True)
+        return sorted(available, key=score, reverse=True)
     except Exception:
         return providers
+
+
+def get_breaker_states() -> list:
+    """
+    Return the current circuit-breaker state for every tracked provider.
+    Each entry is a dict: {key, service, provider, state, consecutive_failures,
+                           last_failure_ts, opened_at, seconds_until_close, last_reason}
+    """
+    now = time.time()
+    with _circuit_lock:
+        snap = dict(_circuit_breakers)
+
+    result = []
+    for key, cb in snap.items():
+        service, _, provider = key.partition("|")
+        secs_until_close = 0
+        if cb["state"] == _CB_STATE_OPEN:
+            elapsed = now - cb.get("opened_at", now)
+            secs_until_close = max(0, CIRCUIT_OPEN_DURATION_SEC - elapsed)
+        result.append({
+            "key":                   key,
+            "service":               service,
+            "provider":              provider,
+            "state":                 cb["state"],
+            "consecutive_failures":  cb.get("consecutive_failures", 0),
+            "last_failure_ts":       cb.get("last_failure_ts", 0.0),
+            "opened_at":             cb.get("opened_at", 0.0),
+            "seconds_until_close":   secs_until_close,
+            "last_reason":           cb.get("last_reason", ""),
+        })
+    result.sort(key=lambda r: r["key"])
+    return result
 
 
 def _get_qobuz_stream_url(track_id: str, quality_num: int) -> str | None:
@@ -3069,8 +3258,13 @@ def _get_qobuz_stream_url(track_id: str, quality_num: int) -> str | None:
                     return location
 
             if not resp.ok:
+                reason = "HTTP {}".format(resp.status_code)
                 log.debug("qobuz proxy %s → HTTP %d", url, resp.status_code)
-                _record_provider_outcome("qobuz", template, False)
+                # 429 = rate-limited; open circuit immediately by counting as a full threshold
+                if resp.status_code == 429:
+                    reason = "HTTP 429 rate-limit"
+                    log.warning("qobuz proxy %s → 429 rate-limit; tripping circuit breaker", url)
+                _record_provider_outcome("qobuz", template, False, reason=reason)
                 continue
 
             ct = resp.headers.get("content-type", "")
@@ -3127,7 +3321,7 @@ def _get_qobuz_stream_url(track_id: str, quality_num: int) -> str | None:
 
         except Exception as exc:
             log.debug("qobuz proxy %s error: %s", url, exc)
-            _record_provider_outcome("qobuz", template, False)
+            _record_provider_outcome("qobuz", template, False, reason=str(exc)[:80])
 
     return None
 

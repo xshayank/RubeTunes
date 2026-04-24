@@ -4,8 +4,10 @@ import re
 import json
 import asyncio
 import collections
+import concurrent.futures
 import logging
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -112,6 +114,10 @@ elif _env_zip_mb:
     MAX_ZIP_PART_SIZE_BYTES = int(float(_env_zip_mb) * 1024 * 1024)
 else:
     MAX_ZIP_PART_SIZE_BYTES = int(1.95 * 1024 ** 3)  # 1.95 GiB
+
+# Concurrent track downloads within a batch (playlist / album).
+# Override via BATCH_CONCURRENCY env var (default 3, clamped 1–6).
+BATCH_CONCURRENCY = max(1, min(6, int(os.getenv("BATCH_CONCURRENCY", "3"))))
 
 # Number of albums/singles shown per page in the artist album browser
 ARTIST_ALBUMS_PAGE_SIZE = 10
@@ -489,6 +495,7 @@ async def start_handler(update):
         "  !qobuz <url>     \u2014 Download a Qobuz track\n"
         "  !amazon <url>    \u2014 Download an Amazon Music track\n"
         "  !cancel          \u2014 Cancel any pending selection\n"
+        "  !history [N]     \u2014 Show your last N downloads (default 10)\n"
         "  !start           \u2014 Show this message\n\n"
         "\U0001f3b5 Music download flow:\n"
         "  1\ufe0f\u20e3 Send a music command with a URL\n"
@@ -510,6 +517,118 @@ async def start_handler(update):
             MAX_ZIP_PART_SIZE_BYTES / (1024 ** 3)
         )
     )
+
+
+def _relative_time(iso_ts: str) -> str:
+    """Return a human-readable relative time string for an ISO-8601 UTC timestamp."""
+    if not iso_ts:
+        return "unknown time"
+    try:
+        # Parse ISO 8601 (e.g. "2026-04-24T10:30:00Z")
+        ts_str = iso_ts.rstrip("Z")
+        fmt = "%Y-%m-%dT%H:%M:%S"
+        then = time.mktime(time.strptime(ts_str, fmt))
+        # Compensate: strptime gives local time; we stored UTC
+        then_utc = then - (time.mktime(time.gmtime()) - time.mktime(time.localtime()))
+        diff = time.time() - then_utc
+        if diff < 60:
+            return "just now"
+        if diff < 3600:
+            return "{} minute{} ago".format(int(diff // 60), "s" if diff >= 120 else "")
+        if diff < 86400:
+            return "{} hour{} ago".format(int(diff // 3600), "s" if diff >= 7200 else "")
+        days = int(diff // 86400)
+        return "{} day{} ago".format(days, "s" if days > 1 else "")
+    except Exception:
+        return iso_ts  # fall back to raw timestamp
+
+
+@app.on_message_updates(filters.commands("history", prefixes="!"))
+async def history_handler(update):
+    """
+    Show the user's recent downloads.
+    Usage: !history [N|all]
+      N    – show N most recent (default 10, max 25)
+      all  – admin-only; show global recent downloads
+    """
+    object_guid = update.object_guid
+    log = logging.getLogger("history")
+    log.info("!history | guid=%s", object_guid)
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    parts = update.command  # ['history'] or ['history', arg]
+    arg   = parts[1].strip().lower() if len(parts) >= 2 else ""
+
+    show_all = False
+    limit    = 10
+
+    if arg == "all":
+        if not _is_admin(object_guid):
+            await app.send_message(
+                object_guid,
+                "🚫 Only admins can view global history. Use !history [N] to see your own."
+            )
+            return
+        show_all = True
+        limit    = 25
+    elif arg:
+        try:
+            limit = max(1, min(25, int(arg)))
+        except ValueError:
+            await app.send_message(object_guid, "Usage: !history [N] (number 1–25) or !history all (admin only)")
+            return
+
+    try:
+        all_entries = _spodl.get_download_history()
+    except Exception as exc:
+        log.error("get_download_history failed: %s", exc)
+        await app.send_message(object_guid, "❌ Could not read download history.")
+        return
+
+    if show_all:
+        entries = all_entries[:limit]
+    else:
+        # Filter to this user only
+        entries = [e for e in all_entries if e.get("user_guid") == object_guid][:limit]
+
+    if not entries:
+        await app.send_message(object_guid, "📭 No downloads yet.")
+        return
+
+    source_labels = {
+        "qobuz":   "Qobuz",
+        "deezer":  "Deezer",
+        "tidal":   "Tidal",
+        "amazon":  "Amazon Music",
+        "spotify": "Spotify",
+        "youtube": "YouTube Music",
+    }
+    quality_labels = {
+        _spodl.QUALITY_MP3:     "MP3 320k",
+        _spodl.QUALITY_FLAC_CD: "FLAC CD",
+        _spodl.QUALITY_FLAC_HI: "FLAC Hi-Res",
+    }
+
+    header = "🕘 Global recent downloads:" if show_all else "🕘 Your recent downloads:"
+    lines  = [header]
+    for i, e in enumerate(entries, 1):
+        title   = e.get("title")   or "Unknown title"
+        artists = e.get("artists") or "Unknown artist"
+        source  = source_labels.get((e.get("source") or "").lower(), e.get("source") or "?")
+        quality = quality_labels.get(e.get("quality") or "", e.get("quality") or "?")
+        rel     = _relative_time(e.get("timestamp") or "")
+        user_part = " | user: {}".format(e["user_guid"][:8]) if show_all and e.get("user_guid") else ""
+        lines.append(
+            "{}. {} — {}\n   {} | {} | {}{}".format(
+                i, title, artists, source, quality, rel, user_part
+            )
+        )
+
+    await app.send_message(object_guid, "\n".join(lines))
 
 
 @app.on_message_updates(filters.commands("download", prefixes="!"))
@@ -1008,6 +1127,12 @@ async def _do_batch_download(
     """
     Download all tracks in a playlist or album, zip them (splitting if needed),
     and send the zip parts.
+
+    Up to BATCH_CONCURRENCY (default 3) tracks are fetched in parallel using a
+    ThreadPoolExecutor.  Final ZIP ordering matches the original track order.
+    Per-track errors are collected and reported in the summary; they never abort
+    the entire batch.
+
     *url_type* is "playlist" or "album".
     *extra* carries pre-fetched info like collection_name and track_ids.
     """
@@ -1040,30 +1165,83 @@ async def _do_batch_download(
         batch_dir = DOWNLOAD_DIR / _spodl._safe_filename(collection_name)
         batch_dir.mkdir(parents=True, exist_ok=True)
 
-        downloaded: list = []
-        failed: list = []
         ytbin = _ytdlp_bin()
 
-        for i, track_id in enumerate(track_ids, 1):
+        # Shared progress state, protected by a lock for thread safety
+        _progress_lock = threading.Lock()
+        _done_count    = [0]   # mutable container so worker lambdas can update it
+        _fail_count    = [0]
+
+        def _download_one(track_id: str) -> "Path | None":
+            """Download a single track; return the file path or None on failure."""
             try:
-                await app.edit_message(
-                    object_guid, status_id,
-                    "\U0001f4e5 [{}/{}] Downloading\u2026".format(i, total)
-                )
-                # Fetch track info
-                info = await loop.run_in_executor(None, _spodl.get_track_info, track_id)
-                # Pick best source for requested quality (first matching choice)
+                info    = _spodl.get_track_info(track_id)
                 choices = _spodl.build_platform_choices(info, quality)
                 choice  = choices[0] if choices else None
                 if not choice:
-                    failed.append(track_id)
-                    continue
-                fp = await _spodl.download_track_from_choice(info, choice, batch_dir, ytbin)
-                downloaded.append(fp)
+                    with _progress_lock:
+                        _fail_count[0] += 1
+                    return None
+
+                # download_track_from_choice is async; run it synchronously in the thread
+                import asyncio as _asyncio
+                new_loop = _asyncio.new_event_loop()
+                try:
+                    fp = new_loop.run_until_complete(
+                        _spodl.download_track_from_choice(info, choice, batch_dir, ytbin)
+                    )
+                finally:
+                    new_loop.close()
+
+                with _progress_lock:
+                    _done_count[0] += 1
+                return fp
             except Exception as exc:
                 log.warning("batch track %s failed: %s", track_id, exc)
-                failed.append(track_id)
-                continue
+                with _progress_lock:
+                    _fail_count[0] += 1
+                return None
+
+        # Submit all tracks to the thread pool; preserve original order via index
+        results: list = [None] * total   # slot per track, in original order
+        failed_ids: list = []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=BATCH_CONCURRENCY, thread_name_prefix="batch"
+        ) as pool:
+            future_to_idx = {
+                pool.submit(_download_one, tid): i
+                for i, tid in enumerate(track_ids)
+            }
+
+            last_ui_update = time.monotonic()
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                fp = future.result()  # never raises — _download_one catches everything
+                if fp is not None:
+                    results[idx] = fp
+                else:
+                    failed_ids.append(track_ids[idx])
+
+                # Throttle progress edits to avoid flood-control
+                now = time.monotonic()
+                if now - last_ui_update >= 3.0:
+                    last_ui_update = now
+                    with _progress_lock:
+                        done  = _done_count[0]
+                        fails = _fail_count[0]
+                    try:
+                        await app.edit_message(
+                            object_guid, status_id,
+                            "\U0001f4e5 Downloading [{}/{}] ({} failed so far)\u2026".format(
+                                done + fails, total, fails
+                            )
+                        )
+                    except Exception:
+                        pass
+
+        # Collect only successful downloads in original track order
+        downloaded = [r for r in results if r is not None]
 
         if not downloaded:
             await app.edit_message(object_guid, status_id,
@@ -1097,8 +1275,8 @@ async def _do_batch_download(
             collection_name, len(downloaded),
             _spodl._QUALITY_LABELS.get(quality, quality)
         )
-        if failed:
-            caption_base += "\n\u26a0\ufe0f {} track(s) failed".format(len(failed))
+        if failed_ids:
+            caption_base += "\n\u26a0\ufe0f {} track(s) failed".format(len(failed_ids))
 
         if n_parts > 1:
             await app.edit_message(
@@ -1113,8 +1291,8 @@ async def _do_batch_download(
                     collection_name, i, n_parts, len(downloaded),
                     _spodl._QUALITY_LABELS.get(quality, quality)
                 )
-                if failed:
-                    caption += "\n\u26a0\ufe0f {} track(s) failed".format(len(failed))
+                if failed_ids:
+                    caption += "\n\u26a0\ufe0f {} track(s) failed".format(len(failed_ids))
                 await app.edit_message(
                     object_guid, status_id,
                     "\U0001f4e4 Sending part {}/{}: {} ({:.1f} MB)\u2026".format(
@@ -1142,13 +1320,19 @@ async def _do_batch_download(
                 except Exception:
                     pass
 
-        await app.edit_message(
-            object_guid, status_id,
-            "\u2705 Done! {} tracks sent{}.".format(
-                len(downloaded),
-                " ({} parts)".format(n_parts) if n_parts > 1 else ""
-            )
+        summary = "\u2705 Done! {} tracks sent{}.".format(
+            len(downloaded),
+            " ({} parts)".format(n_parts) if n_parts > 1 else ""
         )
+        if failed_ids:
+            # Show up to 5 failed track IDs in the summary
+            shown = failed_ids[:5]
+            summary += "\n\u26a0\ufe0f {} of {} failed: {}{}".format(
+                len(failed_ids), total,
+                ", ".join(shown),
+                " …" if len(failed_ids) > 5 else "",
+            )
+        await app.edit_message(object_guid, status_id, summary)
 
     except Exception as exc:
         log.exception("_do_batch_download error: %s", exc)
@@ -1540,6 +1724,8 @@ async def admin_handler(update):
     !admin unban <guid>            – unban a user
     !admin logs [N]                – show last N (default 20) usage log entries
     !admin status                  – show current settings summary
+    !admin clearcache [lru|isrc|all] – flush in-memory and/or disk caches
+    !admin breakers                – show provider circuit-breaker states
     """
     object_guid = update.object_guid
     log = logging.getLogger("admin")
@@ -1560,7 +1746,9 @@ async def admin_handler(update):
             "  !admin ban <guid>\n"
             "  !admin unban <guid>\n"
             "  !admin logs [N]\n"
-            "  !admin status"
+            "  !admin status\n"
+            "  !admin clearcache [lru|isrc|all]\n"
+            "  !admin breakers"
         )
         return
 
@@ -1722,6 +1910,68 @@ async def admin_handler(update):
                 admin_count, wl_mode, wl_count, ban_count, log_count
             )
         )
+        return
+
+    # ------------------------------------------------------------------
+    # clearcache
+    # ------------------------------------------------------------------
+    if sub == "clearcache":
+        target = (parts[2].lower() if len(parts) >= 3 else "all")
+        cleared = []
+
+        if target in ("lru", "all"):
+            n_lru = _spodl.clear_track_info_cache()
+            cleared.append("track-info LRU ({} entries)".format(n_lru))
+
+        if target in ("isrc", "all"):
+            try:
+                isrc_path = _spodl._isrc_cache_path()
+                n_isrc = 0
+                if isrc_path.exists():
+                    try:
+                        n_isrc = len(json.loads(isrc_path.read_text()))
+                    except Exception:
+                        pass
+                    isrc_path.write_text("{}")
+                    log.info("ISRC disk cache truncated (%d entries) by %s", n_isrc, object_guid)
+                cleared.append("ISRC disk cache ({} entries)".format(n_isrc))
+            except Exception as exc:
+                cleared.append("ISRC disk cache (error: {})".format(exc))
+
+        if not cleared:
+            await app.send_message(
+                object_guid,
+                "❌ Unknown target. Use: !admin clearcache [lru|isrc|all]"
+            )
+            return
+
+        await app.send_message(
+            object_guid,
+            "🗑️ Cleared: {}".format(", ".join(cleared))
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # breakers
+    # ------------------------------------------------------------------
+    if sub == "breakers":
+        states = _spodl.get_breaker_states()
+        if not states:
+            await app.send_message(object_guid, "ℹ️ No circuit-breaker data yet.")
+            return
+        lines = ["⚡ Circuit-breaker states:"]
+        for cb in states:
+            state = cb["state"]
+            icon = {"closed": "🟢", "open": "🔴", "half_open": "🟡"}.get(state, "⚪")
+            line = "{} {} — {}".format(icon, cb["key"], state)
+            if state == "open":
+                line += " (closes in {:.0f}s)".format(cb["seconds_until_close"])
+            if cb["consecutive_failures"]:
+                line += " | {} consecutive failures".format(cb["consecutive_failures"])
+            if cb["last_reason"]:
+                line += " | last: {}".format(cb["last_reason"])
+            lines.append(line)
+        await app.send_message(object_guid, "\n".join(lines))
         return
 
     await app.send_message(
