@@ -69,6 +69,23 @@ For music links the bot tries sources in this order until one succeeds:
 
 ---
 
+## 🚀 Recent improvements
+
+The following features were ported from the [SpotiFLAC](https://github.com/spotbye/SpotiFLAC) Go backend:
+
+| # | Feature | SpotiFLAC reference |
+|---|---|---|
+| 1 | **Amazon Music decryption** — `ffmpeg -decryption_key` applied before FLAC conversion when the proxy returns a key | `backend/amazon.go` |
+| 2 | **Tidal V2 manifest downloads** — base64-decoded multi-segment manifest responses are fetched and concatenated | `backend/tidal.go` `DownloadFromManifest` |
+| 3 | **Parallel platform resolution** — Deezer, Qobuz, Tidal, Tidal Alt, and Odesli lookups now run concurrently (saves 5–10 s per track) | `backend/analysis.go` `CheckTrackAvailability` |
+| 4 | **M4A metadata tagging** — `.m4a` files are now tagged via `mutagen.mp4` (ISRC, cover art, lyrics) with an ffmpeg remux fallback | `backend/metadata.go` `EmbedMetadata` |
+| 5 | **Tidal endpoint rotation** — multiple proxy base URLs are tried in order; configurable via `TIDAL_ALT_BASES` env var | `backend/tidal_api_list.go` |
+| 6 | **In-process metadata cache** — track info is cached for 10 min (LRU, 256 entries) to avoid redundant API calls | `backend/recent_fetches.go` |
+| 7 | **Download history** — successful downloads are recorded in `downloads_history.json`; repeat requests reuse the existing file | `backend/history.go` |
+| 8 | **Authenticated Qobuz fallback** — optional `QOBUZ_EMAIL` / `QOBUZ_PASSWORD` env vars enable a signed `track/getFileUrl` call when all proxy APIs fail | `backend/qobuz_api.go` `userLogin` |
+
+---
+
 ## 🚀 Quick Start
 
 ```bash
@@ -122,9 +139,19 @@ DEEZER_ARL=
 
 # ── Qobuz ────────────────────────────────────────────────────────────────────
 # Credentials are auto-scraped — no account, email, or API key needed.
+# Optional: set both of the following for an authenticated fallback when all
+# proxy APIs fail (port of SpotiFLAC backend/qobuz_api.go userLogin).
+QOBUZ_EMAIL=
+QOBUZ_PASSWORD=
 
 # ── Tidal (metadata only) ────────────────────────────────────────────────────
 TIDAL_TOKEN=
+
+# ── Tidal Alt proxy base URLs (optional) ─────────────────────────────────────
+# Comma-separated list of base URLs for the Tidal Alt proxy.
+# Defaults to the built-in list if not set.
+# (port of SpotiFLAC backend/tidal_api_list.go)
+TIDAL_ALT_BASES=
 ```
 
 ---
