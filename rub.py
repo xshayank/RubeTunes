@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from rubpy import Client as RubikaClient, filters
 
 import spotify_dl as _spodl
+import zip_split as _zip_split
 
 
 load_dotenv()
@@ -68,6 +69,11 @@ SPOTIFY_ALBUM_RE = re.compile(
     r'|spotify:album:([A-Za-z0-9]{22})'
 )
 
+SPOTIFY_ARTIST_RE = re.compile(
+    r'https?://open\.spotify\.com/artist/([A-Za-z0-9]{22})'
+    r'|spotify:artist:([A-Za-z0-9]{22})'
+)
+
 TIDAL_RE = re.compile(
     r'https?://(?:www\.|listen\.)?tidal\.com/(?:browse/)?(?:track|album/[^/\s]+/track)/(\d+)'
     r'|https?://listen\.tidal\.com/album/[^/\s]+/track/(\d+)'
@@ -92,6 +98,21 @@ SELECTION_TIMEOUT = 300.0          # seconds before a pending quality menu expir
 MUSIC_SELECTION_TIMEOUT = 300.0    # same for music quality/platform menus
 SIZE_LIMIT_BYTES = 2 * 1024 ** 3   # 2 GB hard limit — options above this are hidden
 MAX_LOG_ENTRIES = 500               # keep the most recent N log lines
+
+# Maximum size for each ZIP part produced by split_zip_from_files.
+# Default: 1.95 GiB ≈ 2 094 006 272 bytes (safe margin below the 2 GB upload limit).
+# Override via env var ZIP_PART_SIZE_BYTES (bytes) or ZIP_PART_SIZE_MB (megabytes).
+_env_zip_bytes = os.getenv("ZIP_PART_SIZE_BYTES", "")
+_env_zip_mb    = os.getenv("ZIP_PART_SIZE_MB", "")
+if _env_zip_bytes:
+    MAX_ZIP_PART_SIZE_BYTES = int(_env_zip_bytes)
+elif _env_zip_mb:
+    MAX_ZIP_PART_SIZE_BYTES = int(float(_env_zip_mb) * 1024 * 1024)
+else:
+    MAX_ZIP_PART_SIZE_BYTES = int(1.95 * 1024 ** 3)  # 1.95 GiB
+
+# Number of albums/singles shown per page in the artist album browser
+ARTIST_ALBUMS_PAGE_SIZE = 10
 
 # Per-chat pending quality-selection state.
 # Key: object_guid  Value: {url, choices, title, timeout_task}
@@ -461,6 +482,7 @@ async def start_handler(update):
         "\U0001f4cc Commands:\n"
         "  !download <url>  \u2014 Download a YouTube video (choose quality)\n"
         "  !spotify <url>   \u2014 Download a Spotify track / album / playlist\n"
+        "                       or browse a Spotify artist page\n"
         "  !tidal <url>     \u2014 Download a Tidal track\n"
         "  !qobuz <url>     \u2014 Download a Qobuz track\n"
         "  !amazon <url>    \u2014 Download an Amazon Music track\n"
@@ -471,11 +493,20 @@ async def start_handler(update):
         "  2\ufe0f\u20e3 Choose audio quality (MP3 / FLAC CD / FLAC Hi-Res)\n"
         "  3\ufe0f\u20e3 Choose from the platforms that have the track\n"
         "  \U0001f4c2 For playlists/albums: quality is asked once, then all tracks\n"
-        "     are downloaded and zipped automatically.\n\n"
+        "     are downloaded and zipped automatically.\n"
+        "  \U0001f4e6 Large zips are automatically split into multiple parts\n"
+        "     (each \u2264 {:.1f} GiB) for upload.\n\n"
+        "\U0001f3a4 Spotify artist pages:\n"
+        "  Send !spotify https://open.spotify.com/artist/<id>\n"
+        "  \u2022 See the artist\u2019s top 5 tracks\n"
+        "  \u2022 Browse Albums and Singles\n"
+        "  \u2022 Pick any item to download\n\n"
         "Supported lossless sources (when credentials are set):\n"
         "  \u2022 Qobuz FLAC Hi-Res / CD  (QOBUZ_EMAIL + QOBUZ_PASSWORD)\n"
         "  \u2022 Deezer FLAC CD          (DEEZER_ARL)\n"
-        "  \u2022 YouTube Music MP3       (always available as fallback)"
+        "  \u2022 YouTube Music MP3       (always available as fallback)".format(
+            MAX_ZIP_PART_SIZE_BYTES / (1024 ** 3)
+        )
     )
 
 
@@ -563,7 +594,8 @@ async def download_handler(update):
 
 
 @app.on_message_updates(
-    filters.commands(["1", "2", "3", "4", "5", "6", "7", "8", "9", "cancel"], prefixes="!")
+    filters.commands(["1", "2", "3", "4", "5", "6", "7", "8", "9",
+                      "10", "11", "cancel"], prefixes="!")
 )
 async def selection_handler(update):
     global is_downloading
@@ -702,6 +734,120 @@ async def selection_handler(update):
                 "queue_msg_id": queue_msg.message_id,
             })
             log.info("music_choice queued at position %d | guid=%s", pos, object_guid)
+        return
+
+    # ------------------------------------------------------------------
+    # Artist top-track / albums / singles selection
+    # ------------------------------------------------------------------
+    if entry_type == "artist_menu":
+        # Indices 0-4: top tracks; index 5: Albums; index 6: Singles
+        artist_id   = entry["artist_id"]
+        artist_name = entry["artist_name"]
+        top_tracks  = entry["top_tracks"]
+
+        # !6 → Albums (0-indexed: 5)
+        if idx == 5:
+            pending_selections.pop(object_guid, None)
+            if entry.get("timeout_task"):
+                entry["timeout_task"].cancel()
+            _append_log(object_guid, "artist_albums", artist_id)
+            asyncio.create_task(
+                _show_artist_album_list(object_guid, artist_id, artist_name, "album", 0, log)
+            )
+            return
+
+        # !7 → Singles (0-indexed: 6)
+        if idx == 6:
+            pending_selections.pop(object_guid, None)
+            if entry.get("timeout_task"):
+                entry["timeout_task"].cancel()
+            _append_log(object_guid, "artist_singles", artist_id)
+            asyncio.create_task(
+                _show_artist_album_list(object_guid, artist_id, artist_name, "single", 0, log)
+            )
+            return
+
+        # Otherwise it should be a top track selection (0-4)
+        if idx < 0 or idx >= len(top_tracks):
+            await app.send_message(
+                object_guid,
+                "\u274c Please choose a number from the menu, or !cancel."
+            )
+            return
+
+        pending_selections.pop(object_guid, None)
+        if entry.get("timeout_task"):
+            entry["timeout_task"].cancel()
+
+        track = top_tracks[idx]
+        track_id = track.get("id")
+        if not track_id:
+            await app.send_message(object_guid, "\u274c Could not get track ID.")
+            return
+
+        _append_log(object_guid, "artist_top_track", track_id)
+        track_url = "https://open.spotify.com/track/{}".format(track_id)
+        await _ask_quality(object_guid, "\U0001f3b5 {}".format(track["title"]),
+                           track_url, "spotify", "track", {})
+        return
+
+    if entry_type == "artist_list":
+        # Items are albums/singles; last item may be "Next page" if has_next
+        items    = entry["items"]
+        has_next = entry.get("has_next", False)
+        total_choices = len(items) + (1 if has_next else 0)
+
+        if idx < 0 or idx >= total_choices:
+            await app.send_message(
+                object_guid,
+                "\u274c Please choose between !1 and !{}, or !cancel.".format(total_choices)
+            )
+            return
+
+        pending_selections.pop(object_guid, None)
+        if entry.get("timeout_task"):
+            entry["timeout_task"].cancel()
+
+        # "Next page" was selected
+        if has_next and idx == len(items):
+            _append_log(object_guid, "artist_list_next", "{} {}".format(entry["group"], entry["artist_id"]))
+            asyncio.create_task(
+                _show_artist_album_list(
+                    object_guid,
+                    entry["artist_id"],
+                    entry["artist_name"],
+                    entry["group"],
+                    entry["next_offset"],
+                    log,
+                )
+            )
+            return
+
+        # Album / single selected — start batch download
+        alb = items[idx]
+        alb_id   = alb["id"]
+        alb_name = alb["name"]
+        _append_log(object_guid, "artist_list_album", alb_id)
+        await app.send_message(object_guid, "\U0001f50d Fetching tracks for {}\u2026".format(alb_name))
+        try:
+            loop = asyncio.get_event_loop()
+            alb_info, track_ids = await loop.run_in_executor(
+                None, _spodl.get_spotify_album_tracks, alb_id
+            )
+            collection_name = "{} \u2014 {}".format(
+                alb_info.get("name", alb_name),
+                ", ".join(alb_info.get("artists") or []),
+            )
+            header = "\U0001f4bf {} ({} tracks)".format(collection_name, len(track_ids))
+            await _ask_quality(object_guid, header,
+                               "https://open.spotify.com/album/{}".format(alb_id),
+                               "spotify", "album", {
+                                   "collection_name": collection_name,
+                                   "track_ids":       track_ids,
+                               })
+        except Exception as exc:
+            log.error("artist album fetch failed: %s", exc)
+            await app.send_message(object_guid, "\u274c Could not fetch album tracks: {}".format(exc))
         return
 
     # ------------------------------------------------------------------
@@ -858,13 +1004,11 @@ async def _do_batch_download(
     url_type: str, extra: dict, log
 ) -> None:
     """
-    Download all tracks in a playlist or album, zip them, and send the zip.
+    Download all tracks in a playlist or album, zip them (splitting if needed),
+    and send the zip parts.
     *url_type* is "playlist" or "album".
     *extra* carries pre-fetched info like collection_name and track_ids.
     """
-    import zipfile
-    import tempfile
-
     status = await app.send_message(
         object_guid, "\U0001f4c2 Starting batch download\u2026"
     )
@@ -924,15 +1068,18 @@ async def _do_batch_download(
                                     "\u274c No tracks could be downloaded.")
             return
 
-        # Zip all downloaded files
-        await app.edit_message(object_guid, status_id, "\U0001f4e6 Zipping {} files\u2026".format(len(downloaded)))
+        # Zip all downloaded files — split into parts if needed
         safe_name  = _spodl._safe_filename(collection_name)
-        zip_path   = DOWNLOAD_DIR / "{}.zip".format(safe_name)
-        with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
-            for fp in downloaded:
-                zf.write(str(fp), fp.name)
+        out_prefix = DOWNLOAD_DIR / safe_name
+        await app.edit_message(
+            object_guid, status_id,
+            "\U0001f4e6 Packaging {} files\u2026".format(len(downloaded))
+        )
+        zip_parts = _zip_split.split_zip_from_files(
+            downloaded, out_prefix, MAX_ZIP_PART_SIZE_BYTES
+        )
 
-        # Clean up individual files
+        # Clean up individual track files
         for fp in downloaded:
             try:
                 fp.unlink()
@@ -943,35 +1090,231 @@ async def _do_batch_download(
         except Exception:
             pass
 
-        size_mb = zip_path.stat().st_size / (1024 * 1024)
-        caption = "{}\n{} tracks | {}".format(
+        n_parts = len(zip_parts)
+        caption_base = "{}\n{} tracks | {}".format(
             collection_name, len(downloaded),
             _spodl._QUALITY_LABELS.get(quality, quality)
         )
         if failed:
-            caption += "\n\u26a0\ufe0f {} track(s) failed".format(len(failed))
+            caption_base += "\n\u26a0\ufe0f {} track(s) failed".format(len(failed))
 
-        await app.edit_message(object_guid, status_id,
-                                "\U0001f4e4 Sending zip ({:.1f} MB)\u2026".format(size_mb))
-        try:
-            await app.send_document(object_guid, str(zip_path), caption=caption)
-            log.info("batch zip sent: %s (%.1f MB)", zip_path.name, size_mb)
-        except Exception as exc:
-            log.error("send zip failed: %s", exc)
-            await app.send_message(object_guid, "\u274c Failed to send zip: {}".format(exc))
-            return
-        finally:
+        if n_parts > 1:
+            await app.edit_message(
+                object_guid, status_id,
+                "\U0001f4e6 Packaging into {} parts\u2026".format(n_parts)
+            )
+
+        for i, zip_path in enumerate(zip_parts, 1):
+            size_mb = zip_path.stat().st_size / (1024 * 1024)
+            if n_parts > 1:
+                caption = "{}\nPart {}/{}\n{} tracks | {}".format(
+                    collection_name, i, n_parts, len(downloaded),
+                    _spodl._QUALITY_LABELS.get(quality, quality)
+                )
+                if failed:
+                    caption += "\n\u26a0\ufe0f {} track(s) failed".format(len(failed))
+                await app.edit_message(
+                    object_guid, status_id,
+                    "\U0001f4e4 Sending part {}/{}: {} ({:.1f} MB)\u2026".format(
+                        i, n_parts, zip_path.name, size_mb
+                    )
+                )
+            else:
+                caption = caption_base
+                await app.edit_message(
+                    object_guid, status_id,
+                    "\U0001f4e4 Sending zip ({:.1f} MB)\u2026".format(size_mb)
+                )
             try:
-                zip_path.unlink()
-            except Exception:
-                pass
+                await app.send_document(object_guid, str(zip_path), caption=caption)
+                log.info("batch zip part sent: %s (%.1f MB)", zip_path.name, size_mb)
+            except Exception as exc:
+                log.error("send zip part failed: %s", exc)
+                await app.send_message(
+                    object_guid,
+                    "\u274c Failed to send zip part {}/{}: {}".format(i, n_parts, exc)
+                )
+            finally:
+                try:
+                    zip_path.unlink()
+                except Exception:
+                    pass
 
-        await app.edit_message(object_guid, status_id, "\u2705 Done! {} tracks sent.".format(len(downloaded)))
+        await app.edit_message(
+            object_guid, status_id,
+            "\u2705 Done! {} tracks sent{}.".format(
+                len(downloaded),
+                " ({} parts)".format(n_parts) if n_parts > 1 else ""
+            )
+        )
 
     except Exception as exc:
         log.exception("_do_batch_download error: %s", exc)
         try:
             await app.edit_message(object_guid, status_id, "\u274c Error: {}".format(exc))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Spotify artist pages
+# ---------------------------------------------------------------------------
+
+async def _show_artist_menu(object_guid: str, artist_id: str, log) -> None:
+    """
+    Fetch Spotify artist info and send an artist overview menu with:
+    - artist name + image caption
+    - top 5 tracks (numbered)
+    - options: Albums / Singles
+    """
+    status = await app.send_message(
+        object_guid, "\U0001f50d Fetching artist info\u2026"
+    )
+    status_id = status.message_id
+
+    try:
+        loop = asyncio.get_event_loop()
+        artist = await loop.run_in_executor(None, _spodl.get_spotify_artist_info, artist_id)
+
+        name       = artist.get("name", "Unknown Artist")
+        image_url  = artist.get("image_url")
+        top_tracks = artist.get("top_tracks", [])
+
+        lines = ["\U0001f3a4 {}".format(name), ""]
+        if top_tracks:
+            lines.append("\U0001f3b5 Top tracks:")
+            for i, t in enumerate(top_tracks, 1):
+                artists_str = ", ".join(t.get("artists") or [])
+                lines.append("  !{} \u2014 {} \u2014 {} [{}]".format(
+                    i, t["title"], artists_str, t.get("duration", "")
+                ))
+        lines += [
+            "",
+            "  !6 \u2014 \U0001f4bf Albums",
+            "  !7 \u2014 \U0001f4c0 Singles",
+            "  !cancel \u2014 Cancel",
+            "",
+            "\u23f0 This menu expires in 5 minutes.",
+        ]
+
+        try:
+            await app.edit_message(object_guid, status_id, "\n".join(lines))
+        except Exception:
+            await app.send_message(object_guid, "\n".join(lines))
+
+        timeout_task = asyncio.create_task(_expire_selection(object_guid))
+        pending_selections[object_guid] = {
+            "type":        "artist_menu",
+            "artist_id":   artist_id,
+            "artist_name": name,
+            "top_tracks":  top_tracks,
+            "choices":     top_tracks,  # indices 0-4 → top tracks
+            "timeout_task": timeout_task,
+        }
+
+        # Send artist cover image if available
+        if image_url:
+            try:
+                import urllib.request as _ureq
+                import tempfile as _tf
+                with _tf.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    tmp_path = tmp.name
+                _ureq.urlretrieve(image_url, tmp_path)
+                await app.send_document(
+                    object_guid, tmp_path,
+                    caption="\U0001f3a4 {}".format(name)
+                )
+                try:
+                    import os as _os
+                    _os.unlink(tmp_path)
+                except Exception:
+                    pass
+            except Exception as exc:
+                log.warning("artist image send failed: %s", exc)
+
+        log.info("artist menu sent for %s (%s) | guid=%s", name, artist_id, object_guid)
+
+    except Exception as exc:
+        log.exception("_show_artist_menu error: %s", exc)
+        try:
+            await app.edit_message(object_guid, status_id, "\u274c Error fetching artist: {}".format(exc))
+        except Exception:
+            pass
+
+
+async def _show_artist_album_list(
+    object_guid: str,
+    artist_id: str,
+    artist_name: str,
+    group: str,
+    offset: int,
+    log,
+) -> None:
+    """
+    Show a paginated list of albums or singles for an artist.
+    *group* is "album" or "single".
+    """
+    status = await app.send_message(
+        object_guid,
+        "\U0001f50d Fetching {} list\u2026".format("albums" if group == "album" else "singles")
+    )
+    status_id = status.message_id
+
+    try:
+        loop = asyncio.get_event_loop()
+        items, total = await loop.run_in_executor(
+            None,
+            lambda: _spodl.get_spotify_artist_albums(artist_id, group, offset, ARTIST_ALBUMS_PAGE_SIZE),
+        )
+
+        label_plural = "albums" if group == "album" else "singles"
+        label_icon   = "\U0001f4bf" if group == "album" else "\U0001f4c0"
+        lines = [
+            "{} {} \u2014 {} ({}/{})".format(
+                label_icon, artist_name, label_plural.capitalize(),
+                min(offset + ARTIST_ALBUMS_PAGE_SIZE, total), total
+            ),
+            "",
+        ]
+        for i, alb in enumerate(items, 1):
+            artists_str = ", ".join(alb.get("artists") or [])
+            year = (alb.get("release_date") or "")[:4]
+            lines.append("  !{} \u2014 {} \u2014 {} ({}) [{} tracks]".format(
+                i, alb["name"], artists_str, year, alb.get("total_tracks", "?")
+            ))
+
+        has_next = (offset + ARTIST_ALBUMS_PAGE_SIZE) < total
+        next_offset = offset + ARTIST_ALBUMS_PAGE_SIZE
+        if has_next:
+            lines.append("  !{} \u2014 \u27a1\ufe0f Next page".format(len(items) + 1))
+        lines += ["  !cancel \u2014 Cancel", "", "\u23f0 This menu expires in 5 minutes."]
+
+        try:
+            await app.edit_message(object_guid, status_id, "\n".join(lines))
+        except Exception:
+            await app.send_message(object_guid, "\n".join(lines))
+
+        timeout_task = asyncio.create_task(_expire_selection(object_guid))
+        pending_selections[object_guid] = {
+            "type":        "artist_list",
+            "artist_id":   artist_id,
+            "artist_name": artist_name,
+            "group":       group,
+            "offset":      offset,
+            "items":       items,
+            "total":       total,
+            "has_next":    has_next,
+            "next_offset": next_offset,
+            "choices":     items,
+            "timeout_task": timeout_task,
+        }
+        log.info("artist list sent (%s, group=%s, offset=%d/%d) | guid=%s",
+                 artist_name, group, offset, total, object_guid)
+
+    except Exception as exc:
+        log.exception("_show_artist_album_list error: %s", exc)
+        try:
+            await app.edit_message(object_guid, status_id, "\u274c Error fetching list: {}".format(exc))
         except Exception:
             pass
 
@@ -1548,10 +1891,20 @@ async def spotify_handler(update):
         )
         return
 
-    # Detect URL type: playlist > album > track
+    # Detect URL type: artist > playlist > album > track
+    artist_id = _spodl.parse_spotify_artist_id(args)
     pl_id  = _spodl.parse_spotify_playlist_id(args)
     alb_id = _spodl.parse_spotify_album_id(args)
     tr_id  = _spodl.parse_spotify_track_id(args)
+
+    if artist_id:
+        _append_log(object_guid, "spotify_artist", args)
+        # Cancel any existing pending selection
+        old = pending_selections.pop(object_guid, None)
+        if old and old.get("timeout_task"):
+            old["timeout_task"].cancel()
+        asyncio.create_task(_show_artist_menu(object_guid, artist_id, log))
+        return
 
     if pl_id:
         _append_log(object_guid, "spotify_playlist", args)
@@ -1603,11 +1956,12 @@ async def spotify_handler(update):
 
     await app.send_message(
         object_guid,
-        "\u274c Please provide a valid Spotify track, album, or playlist link.\n"
+        "\u274c Please provide a valid Spotify track, album, playlist, or artist link.\n"
         "Accepted formats:\n"
         "  https://open.spotify.com/track/<id>\n"
         "  https://open.spotify.com/album/<id>\n"
-        "  https://open.spotify.com/playlist/<id>"
+        "  https://open.spotify.com/playlist/<id>\n"
+        "  https://open.spotify.com/artist/<id>"
     )
 
 
