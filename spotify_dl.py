@@ -3332,6 +3332,159 @@ def _get_spotify_album_tracks_rest(album_id: str) -> tuple[dict, list]:
     return album_info, track_ids
 
 
+# ---------------------------------------------------------------------------
+# Spotify artist support
+# ---------------------------------------------------------------------------
+
+def parse_spotify_artist_id(text: str) -> str | None:
+    """Extract a 22-char Spotify artist ID from a URL, URI, or bare ID."""
+    text = text.strip()
+    for pattern in (
+        r"open\.spotify\.com/artist/([A-Za-z0-9]{22})",
+        r"spotify:artist:([A-Za-z0-9]{22})",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def get_spotify_artist_info(artist_id: str) -> dict:
+    """
+    Fetch artist metadata + top 5 tracks via Spotify's public REST API.
+
+    Returns a dict with:
+      name        – str
+      image_url   – str | None  (largest available image)
+      top_tracks  – list[dict]  (up to 5 entries; each has id, title, artists, duration)
+    """
+    headers = _auth_headers()
+
+    # Artist profile
+    artist_resp = requests.get(
+        f"https://api.spotify.com/v1/artists/{artist_id}",
+        headers=headers,
+        timeout=15,
+    )
+    artist_resp.raise_for_status()
+    artist_data = artist_resp.json()
+
+    name = artist_data.get("name", "Unknown Artist")
+    images = artist_data.get("images") or []
+    image_url: str | None = None
+    if images:
+        # Pick the largest image (images are sorted largest-first by Spotify)
+        image_url = images[0].get("url")
+
+    # Top tracks.
+    # "market=from_token" asks Spotify to use the token's home region, which
+    # avoids having to hard-code a country code.  Anonymous tokens returned by
+    # Spotify's web-player auth flow sometimes lack a region claim, causing a
+    # 400 error.  In that case we fall back to an explicit US market.
+    top_resp = requests.get(
+        f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks",
+        headers=headers,
+        params={"market": "from_token"},
+        timeout=15,
+    )
+    if top_resp.status_code == 400:
+        # Token does not carry a region claim — retry with an explicit market
+        top_resp = requests.get(
+            f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks",
+            headers=headers,
+            params={"market": "US"},
+            timeout=15,
+        )
+    top_resp.raise_for_status()
+    top_data = top_resp.json()
+
+    top_tracks: list[dict] = []
+    for t in (top_data.get("tracks") or [])[:5]:
+        dur_ms = t.get("duration_ms") or 0
+        dur_s = dur_ms // 1000
+        m_val, s_val = divmod(dur_s, 60)
+        top_tracks.append({
+            "id":       t.get("id", ""),
+            "title":    t.get("name", "Unknown"),
+            "artists":  [a["name"] for a in (t.get("artists") or [])],
+            "duration": f"{m_val}:{s_val:02d}",
+        })
+
+    log.info("artist %s: name=%r top_tracks=%d", artist_id, name, len(top_tracks))
+    return {
+        "artist_id":  artist_id,
+        "name":       name,
+        "image_url":  image_url,
+        "top_tracks": top_tracks,
+    }
+
+
+def get_spotify_artist_albums(
+    artist_id: str,
+    group: str = "album",
+    offset: int = 0,
+    limit: int = 10,
+) -> tuple[list[dict], int]:
+    """
+    Fetch a page of artist albums or singles via Spotify's public REST API.
+
+    Parameters
+    ----------
+    artist_id : Spotify artist ID
+    group     : "album" or "single"
+    offset    : pagination offset
+    limit     : page size (max 50)
+
+    Returns
+    -------
+    (items, total) where *items* is a list of dicts with keys:
+      id, name, artists, release_date, total_tracks, image_url
+    and *total* is the total count of matching releases.
+    """
+    headers = _auth_headers()
+    resp = requests.get(
+        f"https://api.spotify.com/v1/artists/{artist_id}/albums",
+        headers=headers,
+        params={
+            "include_groups": group,
+            "limit":          min(limit, 50),
+            "offset":         offset,
+            "market":         "from_token",
+        },
+        timeout=15,
+    )
+    if resp.status_code == 400:
+        resp = requests.get(
+            f"https://api.spotify.com/v1/artists/{artist_id}/albums",
+            headers=headers,
+            params={
+                "include_groups": group,
+                "limit":          min(limit, 50),
+                "offset":         offset,
+                "market":         "US",
+            },
+            timeout=15,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+
+    total = data.get("total", 0)
+    items: list[dict] = []
+    for alb in (data.get("items") or []):
+        images = alb.get("images") or []
+        img_url = images[0].get("url") if images else None
+        items.append({
+            "id":           alb.get("id", ""),
+            "name":         alb.get("name", "Unknown"),
+            "artists":      [a["name"] for a in (alb.get("artists") or [])],
+            "release_date": alb.get("release_date", ""),
+            "total_tracks": alb.get("total_tracks", 0),
+            "image_url":    img_url,
+        })
+
+    log.info("artist %s albums (group=%s offset=%d): %d/%d", artist_id, group, offset, len(items), total)
+    return items, total
+
 
 def build_platform_choices(info: dict, quality: str) -> list:
     """
