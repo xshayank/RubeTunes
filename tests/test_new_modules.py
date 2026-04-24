@@ -86,6 +86,16 @@ class TestRateLimiter:
         finally:
             rl.USER_TRACKS_PER_HOUR = 100
 
+    def test_get_usage_count(self):
+        from rubetunes.rate_limiter import record_usage, get_usage_count
+
+        user = "test_user_count"
+        assert get_usage_count(user) == 0
+        record_usage(user)
+        record_usage(user)
+        record_usage(user)
+        assert get_usage_count(user) == 3
+
 
 # ===========================================================================
 # Disk space guard (D2)
@@ -173,14 +183,14 @@ class TestAppleMusicProvider:
         info = {"title": "Unknown Song", "artists": ["Unknown Artist"]}
         result = enrich_from_apple_music(info)
         # Should not raise; just returns unchanged info
-        assert result is info
+        assert result == info
 
     def test_enrich_missing_title_skipped(self):
         from rubetunes.providers.apple_music import enrich_from_apple_music
 
         info = {"artists": ["Queen"]}  # no title
         result = enrich_from_apple_music(info)
-        assert result is info  # returned unchanged
+        assert result == info  # returned unchanged
 
     @resp_lib.activate
     def test_fetch_apple_cover(self):
