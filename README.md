@@ -10,6 +10,7 @@
 [![Rubika](https://img.shields.io/badge/Platform-Rubika-orange?style=flat-square)](https://rubika.ir)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
 [![Tests](https://github.com/xshayank/RubeTunes/actions/workflows/tests.yml/badge.svg)](https://github.com/xshayank/RubeTunes/actions/workflows/tests.yml)
+[![Version](https://img.shields.io/badge/version-2.0.0-blue?style=flat-square)](CHANGELOG.md)
 
 </div>
 
@@ -17,278 +18,302 @@
 
 ## 🌟 What is RubeTunes?
 
-**RubeTunes** is a self-hosted Rubika bot that lets you send any YouTube, Spotify, Qobuz, Tidal, or Amazon Music link and receive the downloaded file — video or audio — directly in your Rubika chat.
-
-- Send a **YouTube link** → pick your preferred quality → get the file
-- Send a **Spotify / Qobuz / Tidal / Amazon Music link** → get lossless FLAC or MP3 audio
-- Everything runs through a **queue** so concurrent requests never conflict
+**RubeTunes** is a self-hosted Rubika bot that lets you send any YouTube, Spotify, Qobuz, Tidal,
+Amazon Music, SoundCloud, or Bandcamp link and receive the downloaded file — video or audio —
+directly in your Rubika chat.
 
 ---
 
 ## ✨ Features
 
-| Category | Details |
-|---|---|
-| 📺 **YouTube & YouTube Music** | Download videos up to **4K** or audio-only as **MP3** |
-| 🎵 **Spotify** | Single tracks, full playlists & albums |
-| 🎶 **Qobuz** | Hi-Res & lossless **FLAC** (no account needed) |
-| 🌊 **Tidal** | Track metadata + ISRC-based download |
-| 🎙 **Amazon Music** | Track download via ISRC resolution |
-| 📄 **Subtitles** | Auto-detected subtitles in SRT format |
-| ⚡ **Download Queue** | One download at a time — crash-proof & conflict-free |
-| 🔀 **Concurrent Batch** | Albums & playlists download up to 3 tracks in parallel |
-| 🛡️ **Circuit Breaker** | Failing providers are temporarily disabled automatically |
-| 🕘 **Download History** | `!history` shows your recent downloads |
-| 🔒 **Admin Controls** | Whitelist mode, per-user bans, usage logs, cache management |
-| 💾 **2 GB file limit** | Files up to **2 GB** sent natively via Rubika |
+### 🎵 Music Sources
 
----
+| Source | Format | Notes |
+|--------|--------|-------|
+| **Spotify** | MP3 / FLAC | Track, album, playlist, artist browse |
+| **Qobuz** | Hi-Res FLAC / CD FLAC | No account needed |
+| **Tidal** | FLAC | Metadata + ISRC-based download |
+| **Amazon Music** | FLAC / M4A | Via ISRC resolution |
+| **Deezer** | FLAC CD | Requires `DEEZER_ARL` |
+| **SoundCloud** | MP3 | Direct URL download via yt-dlp |
+| **Bandcamp** | FLAC / MP3 | Direct URL download via yt-dlp |
+| **YouTube Music** | MP3 | Always available as fallback |
 
-## ⚙️ How It Works
+### 📺 Video
 
-```
-User sends link in Rubika
-        ↓
-Bot detects link type (YouTube / Spotify / Qobuz / …)
-        ↓
-Bot presents quality / format options (inline keyboard)
-        ↓
-User picks a quality
-        ↓
-Request joins the download queue
-        ↓
-yt-dlp / spotify_dl fetches & processes the file
-        ↓
-File is sent back to the user in Rubika
-```
+| Source | Notes |
+|--------|-------|
+| **YouTube** | Up to 4K; subtitles auto-detected |
 
-### Music quality resolution chain
+### 🔧 Infrastructure
 
-For music links the bot tries sources in this order until one succeeds:
-
-1. **Qobuz FLAC Hi-Res** (27-bit) — *no account required*
-2. **Qobuz FLAC CD** (16-bit)
-3. **Deezer FLAC** — requires `DEEZER_ARL` cookie
-4. **YouTube Music MP3** — always available as a fallback
-
----
-
-## 🚀 Recent improvements
-
-The following features were ported from the [SpotiFLAC](https://github.com/spotbye/SpotiFLAC) Go backend:
-
-| # | Feature | SpotiFLAC reference |
-|---|---|---|
-| 1 | **Amazon Music decryption** — `ffmpeg -decryption_key` applied before FLAC conversion when the proxy returns a key | `backend/amazon.go` |
-| 2 | **Tidal V2 manifest downloads** — base64-decoded multi-segment manifest responses are fetched and concatenated | `backend/tidal.go` `DownloadFromManifest` |
-| 3 | **Parallel platform resolution** — Deezer, Qobuz, Tidal, Tidal Alt, and Odesli lookups now run concurrently (saves 5–10 s per track) | `backend/analysis.go` `CheckTrackAvailability` |
-| 4 | **M4A metadata tagging** — `.m4a` files are now tagged via `mutagen.mp4` (ISRC, cover art, lyrics) with an ffmpeg remux fallback | `backend/metadata.go` `EmbedMetadata` |
-| 5 | **Tidal endpoint rotation** — multiple proxy base URLs are tried in order; configurable via `TIDAL_ALT_BASES` env var | `backend/tidal_api_list.go` |
-| 6 | **In-process metadata cache** — track info is cached for 10 min (LRU, 256 entries) to avoid redundant API calls | `backend/recent_fetches.go` |
-| 7 | **Download history** — successful downloads are recorded in `downloads_history.json`; repeat requests reuse the existing file | `backend/history.go` |
-| 8 | **Authenticated Qobuz fallback** — optional `QOBUZ_EMAIL` / `QOBUZ_PASSWORD` env vars enable a signed `track/getFileUrl` call when all proxy APIs fail | `backend/qobuz_api.go` `userLogin` |
-
-And the following UX & resilience improvements:
-
-| # | Feature |
-|---|---|
-| 9 | **`!history` command** — users see their own recent downloads; admins can view global history |
-| 10 | **`!admin clearcache`** — flush the in-memory LRU and/or ISRC disk cache on demand |
-| 11 | **`!admin breakers`** — inspect provider circuit-breaker states in real time |
-| 12 | **Concurrent batch downloads** — albums/playlists download up to 3 tracks in parallel (configurable) |
-| 13 | **Provider circuit breaker** — providers that fail repeatedly are automatically skipped until they recover |
-| 14 | **Resolver unit tests** — `pytest`-based test suite covering parsers, resolvers, circuit breaker, and LRU cache |
+| Feature | Description |
+|---------|-------------|
+| 🔍 **`!search`** | Spotify search — top 10 results as numbered menu |
+| 📋 **`!queue`** | Show your position in the download queue |
+| 🕘 **`!history`** | Your recent downloads |
+| ⚡ **Circuit Breaker** | Failing providers skipped automatically |
+| 🔀 **Concurrent Batch** | Albums/playlists download up to 3 tracks in parallel |
+| 💾 **Download History** | Repeat requests reuse cached files |
+| 📊 **Prometheus Metrics** | `/metrics` endpoint on port 9090 |
+| 🔒 **Admin Controls** | Whitelist, ban, logs, health check, cache management |
+| �� **Structured Logging** | JSON logs via `LOG_FORMAT=json` |
+| 🛡️ **Rate Limiting** | Per-user rolling-hour track limit |
+| 💾 **Disk Guard** | Rejects batches if insufficient disk space |
 
 ---
 
 ## 🚀 Quick Start
 
-```bash
-# 1. Clone the repository
-git clone https://github.com/xshayank/RubeTunes.git
-cd RubeTunes
-
-# 2. Create & activate a virtual environment (recommended)
-python3 -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-
-# 3. Install dependencies
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# 4. Configure your environment
-cp .env.example .env
-nano .env   # fill in your credentials (see below)
-
-# 5. Run the bot
-python3 main.py
-```
-
-> **First run only:** the bot will prompt you to enter your Rubika phone number and the verification code. The session is then saved locally — you won't be asked again.
-
----
-
-## 🔧 Configuration
-
-All settings live in a `.env` file in the project root.
-
-```env
-# ── Rubika ──────────────────────────────────────────────────────────────────
-RUBIKA_SESSION=rubika_session        # local session file name (no extension)
-RUBIKA_PHONE=09xxxxxxxxx             # your Rubika phone number
-
-# ── Admin ───────────────────────────────────────────────────────────────────
-# Comma-separated Rubika object GUIDs that have admin privileges
-ADMIN_GUIDS=
-
-# ── Spotify (optional) ───────────────────────────────────────────────────────
-# Anonymous Spotify token is obtained automatically — no account needed.
-# Only required if the anonymous token ever fails.
-SPOTIFY_CLIENT_ID=
-SPOTIFY_CLIENT_SECRET=
-
-# ── Deezer (lossless FLAC) ───────────────────────────────────────────────────
-# Obtain your ARL from browser cookies after logging in to deezer.com.
-# Leave blank to skip Deezer and use Qobuz or YouTube Music instead.
-DEEZER_ARL=
-
-# ── Qobuz ────────────────────────────────────────────────────────────────────
-# Credentials are auto-scraped — no account, email, or API key needed.
-# Optional: set both of the following for an authenticated fallback when all
-# proxy APIs fail (port of SpotiFLAC backend/qobuz_api.go userLogin).
-QOBUZ_EMAIL=
-QOBUZ_PASSWORD=
-
-# ── Tidal (metadata only) ────────────────────────────────────────────────────
-TIDAL_TOKEN=
-
-# ── Tidal Alt proxy base URLs (optional) ─────────────────────────────────────
-# Comma-separated list of base URLs for the Tidal Alt proxy.
-# Defaults to the built-in list if not set.
-# (port of SpotiFLAC backend/tidal_api_list.go)
-TIDAL_ALT_BASES=
-
-# ── Batch download concurrency ────────────────────────────────────────────────
-# Number of tracks downloaded in parallel for albums/playlists.
-# Default: 3  |  Min: 1  |  Max: 6
-BATCH_CONCURRENCY=3
-
-# ── Provider circuit breaker ──────────────────────────────────────────────────
-# Open the circuit after N consecutive failures within W seconds.
-# Keep it open for T seconds, then allow one probe (half-open state).
-CIRCUIT_FAIL_THRESHOLD=3
-CIRCUIT_FAIL_WINDOW_SEC=300
-CIRCUIT_OPEN_DURATION_SEC=600
-```
-
----
-
-## 🖥️ Server Setup (Production)
+### Docker (recommended)
 
 ```bash
-# Install system dependencies
-sudo apt update
-sudo apt install python3 python3-venv python3-pip git -y
+# 1. Copy the example env file and fill in your credentials
+cp .env.example .env
+# Edit .env with your Rubika session, Spotify credentials, etc.
 
-# Clone and enter the project
+# 2. Start the bot
+docker compose up -d
+
+# 3. View logs
+docker compose logs -f bot
+```
+
+The Prometheus metrics endpoint will be available at `http://localhost:9090/metrics`.
+
+### Manual (Python)
+
+```bash
+# 1. Clone and install
 git clone https://github.com/xshayank/RubeTunes.git
 cd RubeTunes
-
-# Set up virtual environment
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Configure
-cp .env.example .env
-nano .env
+# 2. Download yt-dlp
+curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o yt-dlp
+chmod +x yt-dlp
 
-# Run persistently with screen
-screen -S rubetunes
-source venv/bin/activate
-python3 main.py
-# Detach: Ctrl+A then D
-# Reattach later: screen -r rubetunes
+# 3. Configure
+cp .env.example .env
+# Edit .env
+
+# 4. Run
+python main.py
 ```
 
 ---
 
-## 📋 User Commands
+## 📋 Commands Reference
 
 | Command | Description |
-|---|---|
-| `!start` | Show the welcome / help message |
-| `!download <url>` | Download a YouTube video (choose quality) |
-| `!spotify <url>` | Download a Spotify track / album / playlist, or browse an artist page |
+|---------|-------------|
+| `!start` | Show help and command list |
+| `!download <url>` | Download a YouTube video (quality menu) |
+| `!spotify <url>` | Download Spotify track / album / playlist / artist |
 | `!tidal <url>` | Download a Tidal track |
 | `!qobuz <url>` | Download a Qobuz track |
 | `!amazon <url>` | Download an Amazon Music track |
-| `!cancel` | Cancel a pending quality-selection menu |
-| `!history [N]` | Show your N most recent downloads (default 10, max 25) |
+| `!soundcloud <url>` | Download a SoundCloud track |
+| `!bandcamp <url>` | Download a Bandcamp track or album |
+| `!search <query>` | Search Spotify, get a numbered menu |
+| `!queue` | Show your position in the download queue |
+| `!history [N]` | Show your last N downloads (default 10) |
+| `!cancel` | Cancel any pending quality/platform selection |
 
----
-
-## 👑 Admin Commands
-
-Send these commands in your Rubika chat with the bot (admin only — set via `ADMIN_GUIDS` env var):
-
-| Command | Description |
-|---|---|
-| `!admin whitelist on` | Enable whitelist mode — only approved users can use the bot |
-| `!admin whitelist off` | Disable whitelist mode |
-| `!admin whitelist add <guid>` | Add a user to the whitelist |
-| `!admin whitelist remove <guid>` | Remove a user from the whitelist |
-| `!admin ban <guid>` | Permanently ban a user |
-| `!admin unban <guid>` | Remove a user's ban |
-| `!admin logs [N]` | View last N usage log entries (default 20) |
-| `!admin status` | Show current bot settings summary |
-| `!admin clearcache [lru\|isrc\|all]` | Flush in-memory LRU cache and/or ISRC disk cache |
-| `!admin breakers` | Show current circuit-breaker state for every provider |
-| `!history all` | View global recent download history (admin only) |
-
----
-
-## 🧪 Running Tests
-
-```bash
-# Install dev dependencies (adds pytest + responses)
-pip install -r requirements-dev.txt
-
-# Run the test suite
-pytest -q tests/
+**Format hint:** Append `mp3`, `flac`, or `m4a` to music commands:
+```
+!spotify https://open.spotify.com/track/... flac
 ```
 
-Tests run fully **offline** — all HTTP calls are mocked via the `responses` library.
-CI runs automatically on every push and pull request via GitHub Actions (`.github/workflows/tests.yml`).
+### Admin Commands
+
+| Command | Description |
+|---------|-------------|
+| `!admin whitelist on/off` | Enable/disable whitelist mode |
+| `!admin whitelist add/remove <guid>` | Manage whitelist |
+| `!admin ban/unban <guid>` | Ban/unban a user |
+| `!admin logs [N]` | Show last N usage log entries |
+| `!admin status` | Show bot status summary |
+| `!admin clearcache [lru\|isrc\|all]` | Flush in-memory or disk cache |
+| `!admin breakers` | Inspect provider circuit-breaker states |
+| `!admin health` | Ping all provider endpoints (up/down/slow) |
 
 ---
 
-## 🛠️ Tech Stack
+## ⚙️ Configuration
 
-| Component | Library |
-|---|---|
-| Rubika client | [`rubpy`](https://github.com/shayanheidari01/rubpy) |
-| YouTube / video download | [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) |
-| Audio tagging | [`mutagen`](https://github.com/quodlibet/mutagen) |
-| Spotify metadata | Internal GraphQL persisted-query client |
-| Qobuz metadata | Auto-scraped credentials from `open.qobuz.com` |
-| Environment config | [`python-dotenv`](https://github.com/theskumar/python-dotenv) |
-| Testing | [`pytest`](https://pytest.org) + [`responses`](https://github.com/getsentry/responses) |
+All configuration is via environment variables. Copy `.env.example` to `.env`.
+
+### Core
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RUBIKA_SESSION` | `rubika_session` | Rubika session name |
+| `RUBIKA_PHONE` | — | Phone number for session auth |
+| `ADMIN_GUIDS` | — | Comma-separated admin GUIDs |
+
+### Music Sources
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPOTIFY_CLIENT_ID` | — | Spotify app client ID (optional fallback) |
+| `SPOTIFY_CLIENT_SECRET` | — | Spotify app client secret |
+| `DEEZER_ARL` | — | Deezer account ARL cookie (enables FLAC) |
+| `TIDAL_TOKEN` | — | Tidal OAuth token (metadata only) |
+| `QOBUZ_EMAIL` | — | Qobuz account email (authenticated fallback) |
+| `QOBUZ_PASSWORD` | — | Qobuz account password |
+| `TIDAL_ALT_BASES` | 4 mirrors | Comma-separated Tidal Alt proxy URLs |
+
+### Downloads
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BATCH_CONCURRENCY` | `3` | Parallel tracks in batch (1–6) |
+| `ZIP_PART_SIZE_MB` | `1997` | Max ZIP part size in MB |
+
+### Circuit Breaker
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CIRCUIT_FAIL_THRESHOLD` | `3` | Failures before opening circuit |
+| `CIRCUIT_FAIL_WINDOW_SEC` | `300` | Failure window (seconds) |
+| `CIRCUIT_OPEN_DURATION_SEC` | `600` | Open duration (seconds) |
+
+### Operations (New in v2.0)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_FORMAT` | `text` | `text` or `json` (requires python-json-logger) |
+| `METRICS_PORT` | `9090` | Prometheus port (`0` to disable) |
+| `SENTRY_DSN` | — | Sentry DSN (optional error reporting) |
+| `SHUTDOWN_TIMEOUT_SEC` | `30` | Graceful shutdown timeout seconds |
+| `USER_TRACKS_PER_HOUR` | `100` | Per-user rate limit (non-admins) |
+| `MIN_FREE_SPACE_MB` | `500` | Minimum free disk space for batch reject |
+| `MIN_FREE_SPACE_MULTIPLIER` | `2.0` | Free space must be N× estimated |
+| `HEURISTIC_MB_PER_TRACK` | `30` | Estimated MB per FLAC track |
 
 ---
 
-## 📋 Requirements
+## 🏗️ Architecture
 
-- Python **3.10+**
-- A Rubika account
-- A server or always-on machine to host the bot
-- *(Optional)* Deezer ARL for lossless FLAC downloads
+```
+RubeTunes/
+├── main.py              # Entry point: graceful shutdown, metrics, Sentry init
+├── rub.py               # Bot handlers (Rubika events → download commands)
+├── spotify_dl.py        # Compatibility shim → imports from rubetunes/
+├── rubetunes/
+│   ├── __init__.py      # __version__ = "2.0.0"
+│   ├── cache.py         # LRU track-info cache + ISRC disk cache
+│   ├── circuit_breaker.py  # Provider circuit-breaker state machine
+│   ├── disk_guard.py    # Disk space check before batch download
+│   ├── downloader.py    # Quality constants + download orchestration
+│   ├── history.py       # downloads_history.json helpers
+│   ├── logging_setup.py # setup_logging() (text/JSON toggle)
+│   ├── metrics.py       # Prometheus counters/gauges/histograms
+│   ├── rate_limiter.py  # Per-user rolling-hour rate limit
+│   ├── resolver.py      # _resolve_all_platforms, Odesli, Songstats, MusicBrainz
+│   ├── sentry_setup.py  # Sentry SDK init + capture helpers
+│   ├── spotify_meta.py  # Spotify TOTP, tokens, GraphQL, SpotifyClient, ISRC
+│   ├── tagging.py       # embed_metadata (MP3/FLAC/M4A)
+│   └── providers/
+│       ├── amazon.py    # Amazon Music
+│       ├── apple_music.py  # iTunes Search API (cover art + metadata)
+│       ├── bandcamp.py  # Bandcamp via yt-dlp
+│       ├── deezer.py    # Deezer ISRC resolution
+│       ├── qobuz.py     # Qobuz credential scraping + FLAC download
+│       ├── soundcloud.py  # SoundCloud via yt-dlp
+│       ├── tidal.py     # Tidal API (TIDAL_TOKEN)
+│       └── tidal_alt.py # Tidal Alt proxy (no token)
+└── tests/
+    ├── test_spotify_dl.py   # Core resolver tests (40 tests)
+    └── test_new_modules.py  # New module tests (18 tests)
+```
+
+### Music quality resolution chain
+
+```
+Spotify / Tidal / Qobuz / Amazon / SoundCloud / Bandcamp URL
+        ↓
+  ISRC extraction (Spotify/Tidal/Qobuz/Amazon metadata APIs)
+        ↓
+  Fan-out resolution (Odesli, Songstats, Deezer ISRC API)
+        ↓
+  1. Qobuz FLAC Hi-Res 27-bit  (no account needed)
+  2. Qobuz FLAC CD 16-bit
+  3. Deezer FLAC               (requires DEEZER_ARL)
+  4. YouTube Music MP3 320k    (always available)
+```
 
 ---
 
-<div align="center">
+## 🔧 Development
 
-Made with ❤️ for the Rubika community
+### Running tests
 
-</div>
+```bash
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+### Type checking (mypy)
+
+```bash
+mypy rubetunes/ --ignore-missing-imports
+```
+
+### Linting
+
+```bash
+ruff check .
+black --check .
+```
+
+### Pre-commit hooks
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+---
+
+## 🚀 Recent improvements (v2.0.0)
+
+See [CHANGELOG.md](CHANGELOG.md) for full details.
+
+### SpotiFLAC features ported
+
+| Feature | SpotiFLAC reference |
+|---------|---------------------|
+| Amazon Music decryption | `backend/amazon.go` |
+| Tidal V2 manifest downloads | `backend/tidal.go DownloadFromManifest` |
+| Parallel platform resolution | `backend/analysis.go CheckTrackAvailability` |
+| M4A metadata tagging | `backend/metadata.go EmbedMetadata` |
+| Tidal endpoint rotation | `backend/tidal_api_list.go` |
+| In-process LRU metadata cache | `backend/recent_fetches.go` |
+| Download history | `backend/history.go` |
+| Authenticated Qobuz fallback | `backend/qobuz_api.go userLogin` |
+
+### New in v2.0.0
+
+- **Package refactor**: `spotify_dl.py` split into `rubetunes/` package (8 modules + providers/)
+- **SoundCloud** (`!soundcloud`) and **Bandcamp** (`!bandcamp`) providers
+- **Spotify search** (`!search`) — top 10 results as numbered menu
+- **Queue status** (`!queue`) — position + items ahead
+- **Apple Music metadata** enrichment — 1400×1400 cover art via iTunes API
+- **Prometheus metrics** endpoint (`METRICS_PORT=9090`)
+- **Structured JSON logging** (`LOG_FORMAT=json`)
+- **Sentry integration** (`SENTRY_DSN`)
+- **Graceful shutdown** (SIGTERM/SIGINT with configurable timeout)
+- **Per-user rate limiting** (`USER_TRACKS_PER_HOUR`)
+- **Disk space guard** before batch downloads
+- **`!admin health`** — concurrent endpoint health check
+- **Docker + compose** support
+- **mypy**, **ruff**, **black**, **pre-commit** toolchain
+
+---
+
+## 📄 License
+
+MIT © xshayank

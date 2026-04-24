@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - downloads:/app/downloads
+      - state:/app/state
+    ports:
+      - "9090:9090"
+    environment:
+      - LOG_FORMAT=json
+      - METRICS_PORT=9090
+
+volumes:
+  downloads:
+  state:

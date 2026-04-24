@@ -37,3 +37,7 @@ jobs:
 
       - name: Run tests
         run: pytest -q tests/
+
+      - name: mypy type check (non-blocking)
+        continue-on-error: true
+        run: mypy rubetunes/ --ignore-missing-imports
