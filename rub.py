@@ -5,7 +5,9 @@ import json
 import asyncio
 import collections
 import logging
+import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -1215,18 +1217,15 @@ async def _show_artist_menu(object_guid: str, artist_id: str, log) -> None:
         # Send artist cover image if available
         if image_url:
             try:
-                import urllib.request as _ureq
-                import tempfile as _tf
-                with _tf.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                     tmp_path = tmp.name
-                _ureq.urlretrieve(image_url, tmp_path)
+                urllib.request.urlretrieve(image_url, tmp_path)
                 await app.send_document(
                     object_guid, tmp_path,
                     caption="\U0001f3a4 {}".format(name)
                 )
                 try:
-                    import os as _os
-                    _os.unlink(tmp_path)
+                    os.unlink(tmp_path)
                 except Exception:
                     pass
             except Exception as exc:

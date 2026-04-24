@@ -3376,7 +3376,11 @@ def get_spotify_artist_info(artist_id: str) -> dict:
         # Pick the largest image (images are sorted largest-first by Spotify)
         image_url = images[0].get("url")
 
-    # Top tracks (market=from_token uses the token's region; fallback to US)
+    # Top tracks.
+    # "market=from_token" asks Spotify to use the token's home region, which
+    # avoids having to hard-code a country code.  Anonymous tokens returned by
+    # Spotify's web-player auth flow sometimes lack a region claim, causing a
+    # 400 error.  In that case we fall back to an explicit US market.
     top_resp = requests.get(
         f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks",
         headers=headers,
@@ -3384,7 +3388,7 @@ def get_spotify_artist_info(artist_id: str) -> dict:
         timeout=15,
     )
     if top_resp.status_code == 400:
-        # Some tokens don't support from_token — retry with explicit market
+        # Token does not carry a region claim — retry with an explicit market
         top_resp = requests.get(
             f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks",
             headers=headers,
