@@ -162,7 +162,7 @@ def _download_tidal_manifest(manifest: dict, out_path: "Path") -> None:  # type:
                 if chunk:
                     fout.write(chunk)
 
-    log.debug("tidal manifest: wrote %d segments to %s", len(urls), out_path)
+    log.debug("tidal manifest: wrote %d segments to %s", len(urls), out_path.name)
 
 
 def _ext_from_manifest(manifest: dict) -> str:

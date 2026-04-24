@@ -210,7 +210,8 @@ def _qobuz_signed_params(path: str, params: dict, creds: dict) -> dict:
             payload += k + str(v)
     payload += timestamp + creds["app_secret"]
 
-    sig = hashlib.md5(payload.encode()).hexdigest()
+    # MD5 is mandated by the Qobuz API wire protocol for request signing — not our choice.
+    sig = hashlib.md5(payload.encode()).hexdigest()  # noqa: S324
     out = dict(params)
     out["app_id"]      = creds["app_id"]
     out["request_ts"]  = timestamp
