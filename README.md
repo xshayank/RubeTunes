@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![Rubika](https://img.shields.io/badge/Platform-Rubika-orange?style=flat-square)](https://rubika.ir)
-[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/License-GNUGPLv3-green?style=flat-square)](LICENSE)
 [![Tests](https://github.com/xshayank/RubeTunes/actions/workflows/tests.yml/badge.svg)](https://github.com/xshayank/RubeTunes/actions/workflows/tests.yml)
 [![Version](https://img.shields.io/badge/version-2.0.0-blue?style=flat-square)](CHANGELOG.md)
 
