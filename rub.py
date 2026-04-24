@@ -980,12 +980,15 @@ async def _do_music_from_choice(object_guid: str, info: dict, choice: dict, log)
     """Download a single track using a specific platform choice and send it."""
     title       = info.get("title") or "Unknown"
     artists_str = ", ".join(info.get("artists") or [])
-    status = await app.send_message(
-        object_guid,
-        "\U0001f4e5 Downloading [{}]: {} \u2014 {}".format(
+
+    if choice.get("source") == "auto":
+        status_msg = "\u26a1 Auto-selecting best source for: {} \u2014 {}".format(title, artists_str)
+    else:
+        status_msg = "\U0001f4e5 Downloading [{}]: {} \u2014 {}".format(
             choice["label"], title, artists_str
         )
-    )
+
+    status = await app.send_message(object_guid, status_msg)
     status_id = status.message_id
 
     try:

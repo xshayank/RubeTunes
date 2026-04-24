@@ -3425,6 +3425,39 @@ def build_platform_choices(info: dict, quality: str) -> list:
         "search":     f"{title} {artists_str}".strip(),
     })
 
+    # ── Auto — try all in priority order ───────────────────────────────────
+    # Prepend as the first choice so it gets index 0 / "!1" in the menu.
+    # The actual per-source choices follow and are tried in order.
+    if len(choices) >= 2:
+        auto_label_parts = []
+        for c in choices:
+            src = c.get("source", "")
+            if src == "qobuz":
+                lbl = c.get("label", "")
+                if "Hi-Res" in lbl:
+                    auto_label_parts.append("Qobuz Hi-Res")
+                else:
+                    auto_label_parts.append("Qobuz")
+            elif src == "tidal_alt":
+                auto_label_parts.append("Tidal")
+            elif src == "deezer":
+                auto_label_parts.append("Deezer")
+            elif src == "amazon":
+                auto_label_parts.append("Amazon")
+            elif src == "ytmusic":
+                auto_label_parts.append("YT Music")
+
+        auto_choice = {
+            "label":       "\u26a1 Auto \u2014 try all in order ({})".format(" \u2192 ".join(auto_label_parts)),
+            "source":      "auto",
+            "quality":     quality,
+            "audio_only":  True,
+            "out_ext":     "flac",
+            "url":         None,
+            "_sub_choices": list(choices),
+        }
+        choices.insert(0, auto_choice)
+
     return choices
 
 
@@ -3449,6 +3482,34 @@ async def download_track_from_choice(
 
     source = choice.get("source", "ytmusic")
     log.info("download_track_from_choice source=%s title=%r", source, title)
+
+    # ── Auto mode — try each sub-choice in order, return first that succeeds ──
+    if source == "auto":
+        sub_choices = choice.get("_sub_choices") or []
+        if not sub_choices:
+            raise RuntimeError("Auto mode has no sub-choices to try")
+
+        last_exc: Exception | None = None
+        for sub in sub_choices:
+            sub_src = sub.get("source", "?")
+            try:
+                log.info("auto mode: trying source=%s for %r", sub_src, title)
+                result = await download_track_from_choice(info, sub, download_dir, ytdlp_bin)
+                log.info("auto mode: succeeded with source=%s", sub_src)
+                return result
+            except Exception as exc:
+                log.warning(
+                    "auto mode: source=%s failed (%s), trying next\u2026",
+                    sub_src, exc,
+                )
+                last_exc = exc
+                continue
+
+        raise RuntimeError(
+            "Auto mode exhausted all {} sources. Last error: {}".format(
+                len(sub_choices), last_exc
+            )
+        )
 
     # ── Qobuz — proxy stream APIs (no credentials) ─────────────────────────
     if source == "qobuz":
