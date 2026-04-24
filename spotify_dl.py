@@ -1653,8 +1653,8 @@ def _parse_qobuz_track(data: dict) -> dict:
 def _resolve_via_odesli(track_url: str) -> dict:
     """
     Resolve a track URL to all platform links via the Odesli / song.link API.
-    Returns a dict of {deezer_url, qobuz_url, tidal_url, amazon_url} (keys absent when
-    the platform was not found).  No API key required.
+    Returns a dict of {deezer_url, qobuz_url, tidal_url, amazon_url, spotify_url}
+    (keys absent when the platform was not found).  No API key required.
     """
     try:
         resp = requests.get(
@@ -1672,10 +1672,17 @@ def _resolve_via_odesli(track_url: str) -> dict:
             result["deezer_url"] = links["deezer"]["url"]
         if "tidal" in links:
             result["tidal_url"] = links["tidal"]["url"]
-        if "qobuz" in links:
-            result["qobuz_url"] = links["qobuz"]["url"]
-        if "amazonMusic" in links:
-            result["amazon_url"] = links["amazonMusic"]["url"]
+        # Handle both "qobuz" and "qobuzStore" keys
+        qobuz_link = links.get("qobuz") or links.get("qobuzStore")
+        if qobuz_link:
+            result["qobuz_url"] = qobuz_link.get("url", "")
+        # Handle both "amazonMusic" and "amazon" keys
+        amazon_link = links.get("amazonMusic") or links.get("amazon")
+        if amazon_link:
+            result["amazon_url"] = amazon_link.get("url", "")
+        # Extract Spotify URL — useful when input was Tidal/Qobuz/Amazon
+        if "spotify" in links:
+            result["spotify_url"] = links["spotify"]["url"]
         log.debug("odesli resolved: %s", list(result.keys()))
         return result
     except Exception as exc:
@@ -1690,22 +1697,27 @@ def _resolve_via_odesli(track_url: str) -> dict:
 def _resolve_via_songstats(isrc: str) -> dict:
     """
     Scrape Songstats for a given ISRC and return platform URLs found in the
-    structured-data (application/ld+json sameAs blocks).  No auth required.
-    Returns a dict with any of: deezer_url, tidal_url, amazon_url.
+    structured-data (application/ld+json sameAs blocks) or href attributes.
+    No auth required.  Returns a dict with any of: deezer_url, tidal_url, amazon_url.
     """
     try:
+        url = f"https://songstats.com/track/{isrc.upper()}"
         resp = requests.get(
-            f"https://songstats.com/{isrc}",
+            url,
             params={"ref": "ISRCFinder"},
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                "Accept": "text/html",
+            },
             timeout=15,
         )
         if not resp.ok:
             return {}
-        html = resp.text
+        html_text = resp.text
         result: dict = {}
-        # Extract all JSON-LD blocks
-        for block in re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
+
+        # ── JSON-LD structured data ────────────────────────────────────────
+        for block in re.findall(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html_text, re.S):
             try:
                 obj = json.loads(block)
                 same_as = obj.get("sameAs") or []
@@ -1725,6 +1737,21 @@ def _resolve_via_songstats(isrc: str) -> dict:
                         result["amazon_url"] = u
             except Exception:
                 pass
+
+        # ── Fallback: href regex scan (handles current Songstats HTML) ────
+        if "tidal_url" not in result:
+            m = re.search(r'href="(https://tidal\.com/browse/track/\d+)"', html_text)
+            if m:
+                result["tidal_url"] = m.group(1)
+        if "amazon_url" not in result:
+            m = re.search(r'href="(https://music\.amazon\.com/[^"]+)"', html_text)
+            if m:
+                result["amazon_url"] = m.group(1)
+        if "deezer_url" not in result:
+            m = re.search(r'href="(https://www\.deezer\.com/track/\d+)"', html_text)
+            if m:
+                result["deezer_url"] = m.group(1)
+
         log.debug("songstats resolved: %s", list(result.keys()))
         return result
     except Exception as exc:
@@ -1788,12 +1815,21 @@ def _get_tidal_track(track_id: str) -> dict | None:
     return None
 
 
+def _upgrade_tidal_cover_url(url: str) -> str:
+    """Upgrade a Tidal cover URL to 1280×1280 for best quality."""
+    if not url:
+        return url
+    return re.sub(r'/(\d+)x(\d+)\.jpg$', '/1280x1280.jpg', url)
+
+
 def _parse_tidal_track(data: dict) -> dict:
     """Convert a Tidal track API dict to the standard info dict."""
     album = data.get("album") or {}
     # Cover art: https://resources.tidal.com/images/<uuid-with-dashes>/640x640.jpg
     cover_id = album.get("cover", "").replace("-", "/")
-    cover_url = f"https://resources.tidal.com/images/{cover_id}/640x640.jpg" if cover_id else ""
+    cover_url = _upgrade_tidal_cover_url(
+        f"https://resources.tidal.com/images/{cover_id}/640x640.jpg" if cover_id else ""
+    )
     release_date = album.get("releaseDate") or ""
     artists = [a.get("name", "") for a in (data.get("artists") or [])]
     if not artists and data.get("artist"):
@@ -1874,6 +1910,7 @@ def _get_tidal_alt_url(spotify_track_id: str) -> str | None:
     """
     Fetch a Tidal download URL via the no-auth SpotiFLAC proxy.
     Takes a Spotify track ID and returns a direct audio download URL.
+    Handles JSON, HTTP redirect, and plain-text URL responses.
     Ref: SpotiFLAC backend/tidal_alt.go, GetAltDownloadURLFromSpotify()
     """
     try:
@@ -1881,15 +1918,75 @@ def _get_tidal_alt_url(spotify_track_id: str) -> str | None:
             f"{_TIDAL_ALT_API_BASE}/{spotify_track_id}",
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=15,
+            allow_redirects=False,  # catch redirects manually
         )
-        if resp.ok:
+        # Handle HTTP redirect
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("Location", "")
+            if loc.startswith("http"):
+                log.debug("tidal alt redirect for %s -> %s", spotify_track_id, loc[:60])
+                return loc
+
+        if not resp.ok:
+            return None
+
+        ct = resp.headers.get("content-type", "")
+        # Plain-text URL
+        if "text/plain" in ct:
+            txt = resp.text.strip()
+            if txt.startswith("http"):
+                return txt
+
+        # JSON
+        try:
             data = resp.json()
             url = (data.get("link") or data.get("url") or "").strip()
             if url.startswith("http"):
                 log.debug("tidal alt url OK for %s", spotify_track_id)
                 return url
+        except Exception:
+            # Maybe the body IS a URL
+            txt = resp.text.strip()
+            if txt.startswith("http"):
+                return txt
+
     except Exception as exc:
         log.debug("tidal alt proxy: %s", exc)
+    return None
+
+
+_TIDAL_ALT_TIDAL_BASE = "https://tidal.spotbye.qzz.io/tidal"
+
+
+def _get_tidal_alt_url_by_tidal_id(tidal_track_id: str) -> str | None:
+    """
+    Try to get a download URL from the Tidal Alt proxy using the Tidal track ID.
+    Falls back when no Spotify ID is available (e.g. user provided a Tidal URL).
+    """
+    for base in (_TIDAL_ALT_API_BASE, _TIDAL_ALT_TIDAL_BASE):
+        try:
+            resp = requests.get(
+                f"{base}/{tidal_track_id}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15,
+                allow_redirects=False,
+            )
+            if resp.status_code in (301, 302, 303, 307, 308):
+                loc = resp.headers.get("Location", "")
+                if loc.startswith("http"):
+                    return loc
+            if resp.ok:
+                try:
+                    data = resp.json()
+                    url = (data.get("link") or data.get("url") or "").strip()
+                    if url.startswith("http"):
+                        return url
+                except Exception:
+                    txt = resp.text.strip()
+                    if txt.startswith("http"):
+                        return txt
+        except Exception as exc:
+            log.debug("tidal alt by tidal id (%s): %s", base, exc)
     return None
 
 
@@ -1919,6 +2016,7 @@ def _resolve_all_platforms(info: dict) -> dict:
         "qobuz_bit_depth": None, "qobuz_sample_rate": None,
         "tidal_id": None, "tidal_url": None,
         "tidal_alt_url": None,
+        "tidal_alt_available": False,
         "amazon_url": None,
     })
 
@@ -1961,19 +2059,25 @@ def _resolve_all_platforms(info: dict) -> dict:
         info["tidal_url"] = f"https://tidal.com/browse/track/{td['id']}"
         log.debug("tidal resolved: id=%s", td["id"])
 
-    # ── 3b. Tidal Alt — no token needed (uses Spotify track ID directly) ──
-    if not info.get("tidal_url") and info.get("track_id"):
+    # ── 3b. Tidal Alt — always try when we have a Spotify track ID ────────
+    if info.get("track_id"):
         tidal_alt_url = _get_tidal_alt_url(info["track_id"])
         if tidal_alt_url:
             info["tidal_alt_url"] = tidal_alt_url
             log.debug("tidal alt resolved for track %s", info["track_id"])
+        else:
+            # Mark as potentially available; resolve at download time
+            info["tidal_alt_url"] = None
+            info["tidal_alt_available"] = True
+            log.debug("tidal alt not pre-resolved for %s; will try at download", info["track_id"])
 
     # ── 4. Odesli — fills missing platform URLs (no auth) ─────────────────
-    # Build an input URL for Odesli: prefer a Deezer URL we already have,
-    # otherwise synthesise a Spotify one if we have a track_id.
+    # Prefer Spotify URL for best resolution, then Deezer, then Tidal/Qobuz.
     odesli_input = (
-        info.get("deezer_url") or
         (f"https://open.spotify.com/track/{info['track_id']}" if info.get("track_id") else None)
+        or info.get("deezer_url")
+        or info.get("tidal_url")
+        or info.get("qobuz_url")
     )
     if odesli_input and (not info["tidal_url"] or not info["deezer_url"] or not info["qobuz_url"]):
         od = _resolve_via_odesli(odesli_input)
@@ -1985,6 +2089,19 @@ def _resolve_all_platforms(info: dict) -> dict:
             info["tidal_url"] = od["tidal_url"]
         if od.get("amazon_url") and not info["amazon_url"]:
             info["amazon_url"] = od["amazon_url"]
+        # Recover Spotify track ID from Odesli when input was Tidal/Qobuz/Amazon
+        if od.get("spotify_url") and not info.get("track_id"):
+            sp_id = parse_spotify_track_id(od["spotify_url"])
+            if sp_id:
+                info["track_id"] = sp_id
+                log.debug("spotify track ID recovered from odesli: %s", sp_id)
+                # Now we can also try Tidal Alt with the recovered Spotify ID
+                if not info.get("tidal_alt_url"):
+                    tidal_alt_url = _get_tidal_alt_url(sp_id)
+                    if tidal_alt_url:
+                        info["tidal_alt_url"] = tidal_alt_url
+                    else:
+                        info["tidal_alt_available"] = True
 
     # ── 5. Songstats — last-resort (no auth) ──────────────────────────────
     if isrc and (not info["tidal_url"] or not info["amazon_url"]):
@@ -2146,24 +2263,129 @@ def get_track_info(track_id: str) -> dict:
 
 def get_tidal_track_info(track_id: str) -> dict:
     """
-    Fetch Tidal track metadata and resolve ISRC on Deezer / Qobuz.
-    Raises RuntimeError if TIDAL_TOKEN is not set.
+    Fetch Tidal track metadata. Works with or without TIDAL_TOKEN.
+    If TIDAL_TOKEN is set, uses the Tidal API for full metadata.
+    Otherwise, resolves via Odesli (song.link free API) to get ISRC
+    and all platform URLs, then uses Tidal Alt proxy for download.
     """
-    if not TIDAL_TOKEN:
+    tidal_url = f"https://tidal.com/browse/track/{track_id}"
+
+    # --- Path 1: TIDAL_TOKEN available — use API ---
+    if TIDAL_TOKEN:
+        data = _get_tidal_track(track_id)
+        if data:
+            info = _parse_tidal_track(data)
+            info["track_id"] = None
+            info["tidal_id"] = track_id
+            info["tidal_url"] = tidal_url
+            return _resolve_all_platforms(info)
+
+    # --- Path 2: No token — resolve via Odesli ---
+    log.info("No TIDAL_TOKEN; resolving Tidal track %s via Odesli", track_id)
+    od = _resolve_via_odesli(tidal_url)
+
+    # Try to get ISRC from Deezer (free public API) if we got a Deezer URL
+    isrc = ""
+    if od.get("deezer_url"):
+        isrc = _deezer_isrc_from_url(od["deezer_url"]) or ""
+
+    # Build a minimal info dict from whatever Odesli gave us
+    info: dict = {
+        "title": "",
+        "artists": [],
+        "album": "",
+        "release_date": "",
+        "cover_url": "",
+        "track_number": 1,
+        "disc_number": 1,
+        "isrc": isrc,
+        "track_id": None,            # no Spotify ID known yet
+        "tidal_id": track_id,
+        "tidal_url": tidal_url,
+        "tidal_alt_url": None,
+        "tidal_alt_available": True,  # signal: attempt at download time
+    }
+
+    # Pre-populate platform URLs from Odesli
+    info.update({
+        "deezer_id": None,
+        "deezer_url": od.get("deezer_url"),
+        "deezer_preview_url": None,
+        "qobuz_id": None,
+        "qobuz_url": od.get("qobuz_url"),
+        "qobuz_bit_depth": None,
+        "qobuz_sample_rate": None,
+        "amazon_url": od.get("amazon_url"),
+    })
+
+    # Recover Spotify track ID from Odesli result if available
+    if od.get("spotify_url"):
+        sp_id = parse_spotify_track_id(od["spotify_url"])
+        if sp_id:
+            info["track_id"] = sp_id
+            log.debug("spotify track ID recovered from odesli for tidal track: %s", sp_id)
+            # Pre-resolve Tidal Alt with the Spotify ID
+            tidal_alt = _get_tidal_alt_url(sp_id)
+            if tidal_alt:
+                info["tidal_alt_url"] = tidal_alt
+                info["tidal_alt_available"] = False
+
+    # If we got a Qobuz URL from Odesli, extract the Qobuz track ID and metadata
+    if info.get("qobuz_url"):
+        qobuz_id = parse_qobuz_track_id(info["qobuz_url"])
+        if qobuz_id:
+            info["qobuz_id"] = qobuz_id
+            try:
+                qz_data = _get_qobuz_track(qobuz_id)
+                if qz_data:
+                    parsed = _parse_qobuz_track(qz_data)
+                    for k in ("title", "artists", "album", "release_date", "cover_url",
+                              "track_number", "disc_number", "isrc"):
+                        if parsed.get(k) and not info.get(k):
+                            info[k] = parsed[k]
+                    info["qobuz_bit_depth"]   = qz_data.get("maximum_bit_depth", 16)
+                    info["qobuz_sample_rate"] = qz_data.get("maximum_sampling_rate", 44100)
+            except Exception as exc:
+                log.debug("qobuz metadata for tidal track: %s", exc)
+
+    # If we got a Deezer URL, fetch Deezer metadata for title/artist
+    if info.get("deezer_url") and not info.get("title"):
+        try:
+            dz_track_id = re.search(r'/track/(\d+)', info["deezer_url"])
+            if dz_track_id:
+                resp = requests.get(
+                    f"https://api.deezer.com/track/{dz_track_id.group(1)}",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=10,
+                )
+                if resp.ok:
+                    dz = resp.json()
+                    if not info.get("title"):
+                        info["title"] = dz.get("title", "")
+                    if not info.get("artists"):
+                        info["artists"] = [dz.get("artist", {}).get("name", "")]
+                    if not info.get("album"):
+                        info["album"] = dz.get("album", {}).get("title", "")
+                    if not info.get("cover_url"):
+                        info["cover_url"] = (
+                            dz.get("album", {}).get("cover_xl") or
+                            dz.get("album", {}).get("cover_big") or ""
+                        )
+                    if not info.get("isrc"):
+                        info["isrc"] = dz.get("isrc", "")
+                    if not info.get("deezer_preview_url"):
+                        info["deezer_preview_url"] = dz.get("preview", "")
+        except Exception as exc:
+            log.debug("deezer metadata for tidal track: %s", exc)
+
+    # If we still have no title, the track is unresolvable
+    if not info.get("title") and not info.get("isrc"):
         raise RuntimeError(
-            "TIDAL_TOKEN env var is required to look up Tidal tracks."
+            f"Could not resolve Tidal track {track_id!r}. "
+            "No TIDAL_TOKEN and Odesli/Deezer returned no metadata."
         )
 
-    data = _get_tidal_track(track_id)
-    if not data:
-        raise RuntimeError(f"Tidal API returned no data for track {track_id!r}")
-
-    info = _parse_tidal_track(data)
-    info["track_id"]  = None
-    info["tidal_id"]  = track_id
-    info["tidal_url"] = f"https://tidal.com/browse/track/{track_id}"
-
-    return _resolve_all_platforms(info)
+    return info
 
 
 # ---------------------------------------------------------------------------
@@ -2864,7 +3086,7 @@ def best_source_label(info: dict) -> str:
     """Return a human-readable label for the download source that will be used."""
     if info.get("qobuz_id"):
         return "🇶🇿 Qobuz FLAC"
-    if info.get("tidal_alt_url") or info.get("track_id"):
+    if info.get("tidal_alt_url") or info.get("tidal_alt_available"):
         return "🇳🇴 Tidal FLAC (keyless)"
     if DEEZER_ARL and info.get("deezer_url"):
         return "🇫🇷 Deezer FLAC"
@@ -3164,8 +3386,8 @@ def build_platform_choices(info: dict, quality: str) -> list:
             "url":        info["deezer_url"],
         })
 
-    # ── Tidal Alt — no credentials; uses Spotify track ID directly ─────────
-    if want_flac and info.get("track_id") and not info.get("qobuz_id"):
+    # ── Tidal Alt — no credentials; shows alongside Qobuz as alternate FLAC ──
+    if want_flac and info.get("track_id") and (info.get("tidal_alt_url") or info.get("tidal_alt_available")):
         choices.append({
             "label":      "\U0001f1f3\U0001f1f4 Tidal FLAC (keyless proxy)",
             "source":     "tidal_alt",
@@ -3173,7 +3395,7 @@ def build_platform_choices(info: dict, quality: str) -> list:
             "audio_only": True,
             "out_ext":    "flac",
             "url":        info.get("tidal_alt_url"),
-            "spotify_id": info["track_id"],
+            "spotify_id": info.get("track_id"),
         })
 
     # ── Amazon Music — no credentials required (proxy API) ─────────────────
@@ -3248,18 +3470,27 @@ async def download_track_from_choice(
             log.warning("metadata embed failed for %s: %s", fp.name, exc)
         return fp
 
-    # ── Tidal Alt — no credentials; uses Spotify track ID ─────────────────
+    # ── Tidal Alt — no credentials; uses Spotify track ID (or Tidal ID) ─────
     if source == "tidal_alt":
         spotify_id = choice.get("spotify_id") or info.get("track_id")
-        if not spotify_id:
-            raise RuntimeError("Spotify track ID not available for Tidal Alt download")
+        tidal_id   = info.get("tidal_id")
 
         direct_url = choice.get("url") or info.get("tidal_alt_url")
-        if not direct_url:
+
+        if not direct_url and spotify_id:
             loop = asyncio.get_event_loop()
             direct_url = await loop.run_in_executor(None, _get_tidal_alt_url, spotify_id)
+
+        if not direct_url and tidal_id:
+            # Fallback: try the proxy with the Tidal track ID directly
+            loop = asyncio.get_event_loop()
+            direct_url = await loop.run_in_executor(None, _get_tidal_alt_url_by_tidal_id, str(tidal_id))
+
         if not direct_url:
-            raise RuntimeError(f"Tidal Alt proxy returned no URL for Spotify track {spotify_id}")
+            raise RuntimeError(
+                f"Tidal Alt proxy returned no URL. "
+                f"spotify_id={spotify_id!r} tidal_id={tidal_id!r}"
+            )
 
         from urllib.parse import urlparse as _urlparse
         ext = Path(_urlparse(direct_url).path).suffix.lower() or ".flac"
