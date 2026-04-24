@@ -3160,18 +3160,27 @@ def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list]:
             items = (content.get("items") or [])
 
             for item in items:
+                # item["itemV2"]["data"] is the track object directly —
+                # there is no "trackUnion" wrapper inside playlist items
+                # (that key only appears in standalone getTrack responses).
                 item_data = ((item.get("itemV2") or {}).get("data") or {})
-                track_union = (item_data.get("trackUnion") or {})
-                tid = track_union.get("id")
+                # Skip non-track entries such as podcast episodes
+                typename = item_data.get("__typename", "")
+                if typename and typename != "Track":
+                    continue
+                tid = item_data.get("id") or ""
                 if not tid:
-                    uri = track_union.get("uri") or ""
+                    uri = item_data.get("uri") or ""
                     parts = uri.split(":")
                     if len(parts) == 3 and parts[0] == "spotify" and parts[1] == "track":
                         tid = parts[2]
                 if tid:
                     all_track_ids.append(tid)
 
-            if not items or len(all_track_ids) >= total_count:
+            # Stop when there are no more items, or when we have collected
+            # all tracks according to totalCount (guard against totalCount=0
+            # so that we do not stop after the very first empty page).
+            if not items or (total_count > 0 and len(all_track_ids) >= total_count):
                 break
             offset += limit
 
