@@ -20,9 +20,15 @@ Environment variables (all optional):
   SPOTIFY_CLIENT_SECRET   }
   DEEZER_ARL              Deezer account ARL cookie — enables lossless FLAC.
   TIDAL_TOKEN             Tidal client/OAuth token for metadata lookup.
+  QOBUZ_EMAIL             } Optional Qobuz account for authenticated fallback when
+  QOBUZ_PASSWORD          }   all proxy APIs fail (port of SpotiFLAC qobuz_api.go).
+  TIDAL_ALT_BASES         Comma-separated list of Tidal Alt proxy base URLs to rotate
+                          (port of SpotiFLAC backend/tidal_api_list.go).
 """
 import asyncio
 import base64
+import collections
+import concurrent.futures
 import hashlib
 import hmac
 import html
@@ -49,6 +55,106 @@ SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID",     "").strip()
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 DEEZER_ARL            = os.getenv("DEEZER_ARL",            "").strip()
 TIDAL_TOKEN           = os.getenv("TIDAL_TOKEN",           "").strip()
+# Optional authenticated Qobuz fallback (Gap 8 — port of SpotiFLAC backend/qobuz_api.go:userLogin)
+QOBUZ_EMAIL           = os.getenv("QOBUZ_EMAIL",           "").strip()
+QOBUZ_PASSWORD        = os.getenv("QOBUZ_PASSWORD",        "").strip()
+# Tidal Alt endpoint rotation (Gap 5 — port of SpotiFLAC backend/tidal_api_list.go)
+# Override at runtime via TIDAL_ALT_BASES env var (comma-separated list of base URLs).
+_TIDAL_ALT_BASES_ENV = os.getenv("TIDAL_ALT_BASES", "").strip()
+TIDAL_ALT_BASES: list[str] = (
+    [b.strip() for b in _TIDAL_ALT_BASES_ENV.split(",") if b.strip()]
+    if _TIDAL_ALT_BASES_ENV
+    else [
+        "https://tidal.spotbye.qzz.io/get",
+        "https://tidal.spotbye.qzz.io/tidal",
+        "https://tidal2.spotbye.qzz.io/get",
+        "https://tidal2.spotbye.qzz.io/tidal",
+    ]
+)
+
+# ---------------------------------------------------------------------------
+# Recent-fetch metadata cache (Gap 6 — port of SpotiFLAC backend/recent_fetches.go)
+# ---------------------------------------------------------------------------
+_TRACK_INFO_CACHE_MAX  = 256   # max entries
+_TRACK_INFO_CACHE_TTL  = 600   # seconds (10 min)
+_track_info_cache: "collections.OrderedDict[str, tuple[float, dict]]" = collections.OrderedDict()
+_track_info_cache_lock = threading.Lock()
+
+
+def _cache_get_track_info(track_id: str) -> dict | None:
+    with _track_info_cache_lock:
+        entry = _track_info_cache.get(track_id)
+        if entry is None:
+            return None
+        ts, data = entry
+        if time.time() - ts > _TRACK_INFO_CACHE_TTL:
+            _track_info_cache.pop(track_id, None)
+            return None
+        # LRU: move to end
+        _track_info_cache.move_to_end(track_id)
+        return data
+
+
+def _cache_set_track_info(track_id: str, info: dict) -> None:
+    with _track_info_cache_lock:
+        _track_info_cache[track_id] = (time.time(), info)
+        _track_info_cache.move_to_end(track_id)
+        while len(_track_info_cache) > _TRACK_INFO_CACHE_MAX:
+            _track_info_cache.popitem(last=False)
+
+
+# ---------------------------------------------------------------------------
+# Download history (Gap 7 — port of SpotiFLAC backend/history.go)
+# ---------------------------------------------------------------------------
+_DOWNLOAD_HISTORY_PATH = Path(tempfile.gettempdir()) / "tele2rub" / "downloads_history.json"
+_download_history_lock = threading.Lock()
+
+
+def _load_download_history() -> dict:
+    try:
+        return json.loads(_DOWNLOAD_HISTORY_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _save_download_history(history: dict) -> None:
+    try:
+        _DOWNLOAD_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DOWNLOAD_HISTORY_PATH.write_text(json.dumps(history, indent=2))
+    except Exception as exc:
+        log.debug("download history save failed: %s", exc)
+
+
+def _history_key(track_id: str, source: str, quality: str) -> str:
+    return f"{track_id}|{source}|{quality}"
+
+
+def _check_download_history(track_id: str, source: str, quality: str) -> Path | None:
+    """Return path of previously downloaded file if it still exists, else None."""
+    try:
+        with _download_history_lock:
+            history = _load_download_history()
+        key = _history_key(track_id, source, quality)
+        entry = history.get(key)
+        if entry:
+            fp = Path(entry)
+            if fp.exists() and fp.stat().st_size > 0:
+                return fp
+    except Exception as exc:
+        log.debug("download history check failed: %s", exc)
+    return None
+
+
+def _record_download_history(track_id: str, source: str, quality: str, file_path: Path) -> None:
+    """Persist a successful download to history (best-effort, never fatal)."""
+    try:
+        with _download_history_lock:
+            history = _load_download_history()
+            history[_history_key(track_id, source, quality)] = str(file_path)
+            _save_download_history(history)
+    except Exception as exc:
+        log.debug("download history record failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Spotify TOTP — hardcoded secret and version (no env var needed)
@@ -1901,93 +2007,170 @@ def _musicbrainz_genre(isrc: str, max_genres: int = 3) -> str:
 
 # ---------------------------------------------------------------------------
 # Tidal Alt proxy (no token required — matches SpotiFLAC backend/tidal_alt.go)
+# Gap 5: endpoint rotation via TIDAL_ALT_BASES list (SpotiFLAC backend/tidal_api_list.go)
 # ---------------------------------------------------------------------------
 
-_TIDAL_ALT_API_BASE = "https://tidal.spotbye.qzz.io/get"
+_TIDAL_ALT_API_BASE = TIDAL_ALT_BASES[0]
 
 
-def _get_tidal_alt_url(spotify_track_id: str) -> str | None:
+def _parse_tidal_alt_response(resp: "requests.Response") -> "str | dict | None":
     """
-    Fetch a Tidal download URL via the no-auth SpotiFLAC proxy.
-    Takes a Spotify track ID and returns a direct audio download URL.
-    Handles JSON, HTTP redirect, and plain-text URL responses.
-    Ref: SpotiFLAC backend/tidal_alt.go, GetAltDownloadURLFromSpotify()
+    Parse a Tidal Alt proxy response.
+
+    Returns:
+      - A plain URL string for direct single-file downloads.
+      - A dict with keys {"type": "manifest", "urls": [...], "codecs": "...", "mimeType": "..."}
+        when the proxy returns a V2 BTS manifest (Gap 2 — SpotiFLAC backend/tidal.go
+        DownloadFromManifest / GetDownloadURL).
+      - None if no usable response.
     """
+    # HTTP redirect → direct URL
+    if resp.status_code in (301, 302, 303, 307, 308):
+        loc = resp.headers.get("Location", "")
+        if loc.startswith("http"):
+            return loc
+
+    if not resp.ok:
+        return None
+
+    ct = resp.headers.get("content-type", "")
+
+    # Plain-text URL
+    if "text/plain" in ct:
+        txt = resp.text.strip()
+        if txt.startswith("http"):
+            return txt
+
+    # JSON
     try:
-        resp = requests.get(
-            f"{_TIDAL_ALT_API_BASE}/{spotify_track_id}",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=15,
-            allow_redirects=False,  # catch redirects manually
-        )
-        # Handle HTTP redirect
-        if resp.status_code in (301, 302, 303, 307, 308):
-            loc = resp.headers.get("Location", "")
-            if loc.startswith("http"):
-                log.debug("tidal alt redirect for %s -> %s", spotify_track_id, loc[:60])
-                return loc
+        data = resp.json()
+    except Exception:
+        txt = resp.text.strip()
+        if txt.startswith("http"):
+            return txt
+        return None
 
-        if not resp.ok:
-            return None
-
-        ct = resp.headers.get("content-type", "")
-        # Plain-text URL
-        if "text/plain" in ct:
-            txt = resp.text.strip()
-            if txt.startswith("http"):
-                return txt
-
-        # JSON
+    # V2 manifest response: {"data": {"manifest": "<base64>"}}
+    # Ref: SpotiFLAC backend/tidal.go GetDownloadURL / DownloadFromManifest
+    manifest_b64 = (data.get("data") or {}).get("manifest")
+    if manifest_b64:
         try:
-            data = resp.json()
-            url = (data.get("link") or data.get("url") or "").strip()
-            if url.startswith("http"):
-                log.debug("tidal alt url OK for %s", spotify_track_id)
-                return url
-        except Exception:
-            # Maybe the body IS a URL
-            txt = resp.text.strip()
-            if txt.startswith("http"):
-                return txt
+            manifest_json = json.loads(base64.b64decode(manifest_b64 + "=="))
+            urls = manifest_json.get("urls") or []
+            if urls:
+                return {
+                    "type":     "manifest",
+                    "urls":     urls,
+                    "codecs":   manifest_json.get("codecs", ""),
+                    "mimeType": manifest_json.get("mimeType", ""),
+                }
+        except Exception as exc:
+            log.debug("tidal manifest decode error: %s", exc)
 
-    except Exception as exc:
-        log.debug("tidal alt proxy: %s", exc)
+    # Standard JSON: link / url field
+    url = (data.get("link") or data.get("url") or "").strip()
+    if url.startswith("http"):
+        return url
+
+    # Body might literally be a URL
+    txt = resp.text.strip()
+    if txt.startswith("http"):
+        return txt
+
     return None
 
 
-_TIDAL_ALT_TIDAL_BASE = "https://tidal.spotbye.qzz.io/tidal"
-
-
-def _get_tidal_alt_url_by_tidal_id(tidal_track_id: str) -> str | None:
+def _get_tidal_alt_url(spotify_track_id: str) -> "str | dict | None":
     """
-    Try to get a download URL from the Tidal Alt proxy using the Tidal track ID.
+    Fetch a Tidal download URL/manifest via the no-auth SpotiFLAC proxy.
+    Takes a Spotify track ID.
+
+    Returns:
+      - str: direct audio download URL
+      - dict: manifest dict ({"type":"manifest", "urls":[...], "codecs":"...", ...})
+      - None on failure
+    Ref: SpotiFLAC backend/tidal_alt.go GetAltDownloadURLFromSpotify()
+    """
+    for base in TIDAL_ALT_BASES:
+        try:
+            resp = requests.get(
+                f"{base}/{spotify_track_id}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=8,
+                allow_redirects=False,
+            )
+            result = _parse_tidal_alt_response(resp)
+            if result is not None:
+                log.debug("tidal alt url OK for %s (base=%s)", spotify_track_id, base)
+                return result
+        except Exception as exc:
+            log.debug("tidal alt proxy (%s): %s", base, exc)
+    return None
+
+
+def _get_tidal_alt_url_by_tidal_id(tidal_track_id: str) -> "str | dict | None":
+    """
+    Try to get a download URL/manifest from the Tidal Alt proxy using the Tidal track ID.
     Falls back when no Spotify ID is available (e.g. user provided a Tidal URL).
+    Gap 5: rotates through all entries in TIDAL_ALT_BASES (SpotiFLAC backend/tidal_api_list.go).
     """
-    for base in (_TIDAL_ALT_API_BASE, _TIDAL_ALT_TIDAL_BASE):
+    for base in TIDAL_ALT_BASES:
         try:
             resp = requests.get(
                 f"{base}/{tidal_track_id}",
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=15,
+                timeout=8,
                 allow_redirects=False,
             )
-            if resp.status_code in (301, 302, 303, 307, 308):
-                loc = resp.headers.get("Location", "")
-                if loc.startswith("http"):
-                    return loc
-            if resp.ok:
-                try:
-                    data = resp.json()
-                    url = (data.get("link") or data.get("url") or "").strip()
-                    if url.startswith("http"):
-                        return url
-                except Exception:
-                    txt = resp.text.strip()
-                    if txt.startswith("http"):
-                        return txt
+            result = _parse_tidal_alt_response(resp)
+            if result is not None:
+                log.debug("tidal alt by tidal id OK (base=%s)", base)
+                return result
         except Exception as exc:
             log.debug("tidal alt by tidal id (%s): %s", base, exc)
     return None
+
+
+def _download_tidal_manifest(manifest: dict, out_path: Path) -> None:
+    """
+    Download a Tidal BTS V2 manifest by fetching each URL segment and
+    concatenating bytes to out_path.
+    Ref: SpotiFLAC backend/tidal.go DownloadFromManifest()
+    Gap 2 implementation.
+    """
+    urls = manifest.get("urls") or []
+    if not urls:
+        raise RuntimeError("Tidal manifest has no URLs")
+
+    with open(out_path, "wb") as fout:
+        for seg_url in urls:
+            resp = requests.get(
+                seg_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                stream=True,
+                timeout=120,
+            )
+            resp.raise_for_status()
+            for chunk in resp.iter_content(65536):
+                if chunk:
+                    fout.write(chunk)
+
+    log.debug("tidal manifest: wrote %d segments to %s", len(urls), out_path.name)
+
+
+def _ext_from_manifest(manifest: dict) -> str:
+    """Derive a file extension from a Tidal manifest codecs/mimeType."""
+    codecs = (manifest.get("codecs") or "").lower()
+    mime   = (manifest.get("mimeType") or "").lower()
+    if "flac" in codecs or "flac" in mime:
+        return ".flac"
+    if "aac" in codecs or "mp4" in mime or "m4a" in mime:
+        return ".m4a"
+    if "mp3" in codecs or "mpeg" in mime:
+        return ".mp3"
+    if "opus" in codecs or "ogg" in mime:
+        return ".ogg"
+    return ".flac"  # safe default
 
 
 # ---------------------------------------------------------------------------
@@ -2007,6 +2190,10 @@ def _resolve_all_platforms(info: dict) -> dict:
       4. Odesli / song.link API (no auth) — fills in any remaining gaps
       5. Songstats scrape (no auth) — last-resort Tidal/Amazon fallback
       6. MusicBrainz genre (non-blocking, best-effort)
+
+    Gap 3: primary lookups (Deezer, Qobuz, Tidal, Tidal Alt, Odesli) now run
+    concurrently via ThreadPoolExecutor (port of SpotiFLAC backend/analysis.go
+    CheckTrackAvailability).
     """
     isrc = info.get("isrc") or ""
 
@@ -2023,8 +2210,68 @@ def _resolve_all_platforms(info: dict) -> dict:
     if not isrc:
         return info
 
+    spotify_id = info.get("track_id")
+
+    # ── Primary lookups in parallel (Gap 3) ────────────────────────────────
+    def _fetch_deezer() -> "dict | None":
+        try:
+            return _resolve_deezer(isrc)
+        except Exception as exc:
+            log.debug("parallel deezer: %s", exc)
+            return None
+
+    def _fetch_qobuz() -> "dict | None":
+        try:
+            return _resolve_qobuz_by_isrc(isrc)
+        except Exception as exc:
+            log.debug("parallel qobuz: %s", exc)
+            return None
+
+    def _fetch_tidal() -> "dict | None":
+        try:
+            return _resolve_tidal_by_isrc(isrc)
+        except Exception as exc:
+            log.debug("parallel tidal: %s", exc)
+            return None
+
+    def _fetch_tidal_alt() -> "str | dict | None":
+        if not spotify_id:
+            return None
+        try:
+            return _get_tidal_alt_url(spotify_id)
+        except Exception as exc:
+            log.debug("parallel tidal alt: %s", exc)
+            return None
+
+    odesli_input = (
+        (f"https://open.spotify.com/track/{spotify_id}" if spotify_id else None)
+        or info.get("deezer_url")
+        or info.get("tidal_url")
+        or info.get("qobuz_url")
+    )
+
+    def _fetch_odesli() -> dict:
+        try:
+            if odesli_input:
+                return _resolve_via_odesli(odesli_input)
+        except Exception as exc:
+            log.debug("parallel odesli: %s", exc)
+        return {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        f_dz   = pool.submit(_fetch_deezer)
+        f_qz   = pool.submit(_fetch_qobuz)
+        f_td   = pool.submit(_fetch_tidal)
+        f_talt = pool.submit(_fetch_tidal_alt)
+        f_od   = pool.submit(_fetch_odesli)
+
+        dz   = f_dz.result()
+        qz   = f_qz.result()
+        td   = f_td.result()
+        talt = f_talt.result()
+        od   = f_od.result()
+
     # ── 1. Deezer ──────────────────────────────────────────────────────────
-    dz = _resolve_deezer(isrc)
     if dz:
         info["deezer_id"]          = dz["id"]
         info["deezer_url"]         = dz.get("link", f"https://www.deezer.com/track/{dz['id']}")
@@ -2043,7 +2290,6 @@ def _resolve_all_platforms(info: dict) -> dict:
         log.debug("deezer resolved: id=%s", dz["id"])
 
     # ── 2. Qobuz ───────────────────────────────────────────────────────────
-    qz = _resolve_qobuz_by_isrc(isrc)
     if qz:
         info["qobuz_id"]          = qz["id"]
         info["qobuz_url"]         = f"https://open.qobuz.com/track/{qz['id']}"
@@ -2053,34 +2299,23 @@ def _resolve_all_platforms(info: dict) -> dict:
                   qz["id"], info["qobuz_bit_depth"], info["qobuz_sample_rate"])
 
     # ── 3. Tidal ───────────────────────────────────────────────────────────
-    td = _resolve_tidal_by_isrc(isrc)
     if td:
         info["tidal_id"]  = td["id"]
         info["tidal_url"] = f"https://tidal.com/browse/track/{td['id']}"
         log.debug("tidal resolved: id=%s", td["id"])
 
-    # ── 3b. Tidal Alt — always try when we have a Spotify track ID ────────
-    if info.get("track_id"):
-        tidal_alt_url = _get_tidal_alt_url(info["track_id"])
-        if tidal_alt_url:
-            info["tidal_alt_url"] = tidal_alt_url
-            log.debug("tidal alt resolved for track %s", info["track_id"])
-        else:
-            # Mark as potentially available; resolve at download time
-            info["tidal_alt_url"] = None
-            info["tidal_alt_available"] = True
-            log.debug("tidal alt not pre-resolved for %s; will try at download", info["track_id"])
+    # ── 3b. Tidal Alt ──────────────────────────────────────────────────────
+    if talt:
+        info["tidal_alt_url"] = talt
+        log.debug("tidal alt resolved for track %s", spotify_id)
+    elif spotify_id:
+        # Mark as potentially available; will retry at download time
+        info["tidal_alt_available"] = True
+        log.debug("tidal alt not pre-resolved for %s; will try at download", spotify_id)
 
     # ── 4. Odesli — fills missing platform URLs (no auth) ─────────────────
-    # Prefer Spotify URL for best resolution, then Deezer, then Tidal/Qobuz.
-    odesli_input = (
-        (f"https://open.spotify.com/track/{info['track_id']}" if info.get("track_id") else None)
-        or info.get("deezer_url")
-        or info.get("tidal_url")
-        or info.get("qobuz_url")
-    )
-    if odesli_input and (not info["tidal_url"] or not info["deezer_url"] or not info["qobuz_url"]):
-        od = _resolve_via_odesli(odesli_input)
+    need_odesli = not info["tidal_url"] or not info["deezer_url"] or not info["qobuz_url"]
+    if od and need_odesli:
         if od.get("deezer_url") and not info["deezer_url"]:
             info["deezer_url"] = od["deezer_url"]
         if od.get("qobuz_url") and not info["qobuz_url"]:
@@ -2089,13 +2324,12 @@ def _resolve_all_platforms(info: dict) -> dict:
             info["tidal_url"] = od["tidal_url"]
         if od.get("amazon_url") and not info["amazon_url"]:
             info["amazon_url"] = od["amazon_url"]
-        # Recover Spotify track ID from Odesli when input was Tidal/Qobuz/Amazon
+        # Recover Spotify track ID when input was Tidal/Qobuz/Amazon
         if od.get("spotify_url") and not info.get("track_id"):
             sp_id = parse_spotify_track_id(od["spotify_url"])
             if sp_id:
                 info["track_id"] = sp_id
                 log.debug("spotify track ID recovered from odesli: %s", sp_id)
-                # Now we can also try Tidal Alt with the recovered Spotify ID
                 if not info.get("tidal_alt_url"):
                     tidal_alt_url = _get_tidal_alt_url(sp_id)
                     if tidal_alt_url:
@@ -2140,10 +2374,19 @@ def get_track_info(track_id: str) -> dict:
       deezer_id, deezer_url, deezer_preview_url,
       qobuz_id, qobuz_url,
       tidal_id, tidal_url, tidal_alt_url
+
+    Gap 6: results are cached in-process for up to 10 minutes (LRU, 256 entries)
+    — port of SpotiFLAC backend/recent_fetches.go.
     """
+    # --- Phase 0a: In-process LRU metadata cache (Gap 6) ---
+    cached = _cache_get_track_info(track_id)
+    if cached is not None:
+        log.debug("track info cache hit for %s", track_id)
+        return cached
+
     info: dict = {}
 
-    # --- Phase 0: Check ISRC disk cache (skip metadata fetch if ISRC known) ---
+    # --- Phase 0b: Check ISRC disk cache (skip metadata fetch if ISRC known) ---
     cached_isrc = _get_cached_isrc(track_id)
     if cached_isrc:
         log.debug("isrc cache hit for track %s: %s", track_id, cached_isrc)
@@ -2154,7 +2397,9 @@ def get_track_info(track_id: str) -> dict:
             "isrc": cached_isrc,
         }
         info["track_id"] = track_id
-        return _resolve_all_platforms(info)
+        result = _resolve_all_platforms(info)
+        _cache_set_track_info(track_id, result)
+        return result
 
     # --- Phase 1: Spotify metadata via GraphQL (primary) ---
     _internal_raw: dict | None = None
@@ -2254,6 +2499,8 @@ def get_track_info(track_id: str) -> dict:
         t.start()
         t.join(timeout=15)  # wait up to 15s so lyrics are available before download
 
+    # Cache result for future calls (Gap 6)
+    _cache_set_track_info(track_id, info)
     return info
 
 
@@ -2624,10 +2871,67 @@ def embed_metadata(filepath: Path, info: dict) -> None:
         audio.save()
         log.debug("FLAC tags written to %s", filepath.name)
 
-
-# ---------------------------------------------------------------------------
-# Quality / platform menu builder
-# ---------------------------------------------------------------------------
+    elif ext == ".m4a":
+        # Gap 4: M4A/AAC tagging via mutagen.mp4
+        # Ref: SpotiFLAC backend/metadata.go EmbedMetadata() — uses ffmpeg -metadata for M4A
+        try:
+            from mutagen.mp4 import MP4, MP4Cover
+            audio = MP4(str(filepath))
+            audio["\xa9nam"] = [info.get("title", "")]
+            audio["\xa9ART"] = [", ".join(info.get("artists", []))]
+            audio["\xa9alb"] = [info.get("album", "")]
+            audio["\xa9day"] = [str(info.get("release_date", ""))]
+            trkn = info.get("track_number", 1)
+            trkn_total = info.get("track_total", 0)
+            audio["trkn"] = [(int(trkn), int(trkn_total))]
+            disk = info.get("disc_number", 1)
+            audio["disk"] = [(int(disk), 0)]
+            if info.get("isrc"):
+                # Store ISRC as iTunes freeform tag (standard practice)
+                audio["----:com.apple.iTunes:ISRC"] = [info["isrc"].encode()]
+            if info.get("albumartist") or info.get("album_artist"):
+                audio["aART"] = [info.get("albumartist") or info.get("album_artist") or ""]
+            if info.get("genre"):
+                audio["\xa9gen"] = [info["genre"]]
+            if info.get("lyrics"):
+                audio["\xa9lyr"] = [info["lyrics"]]
+            if cover_data:
+                audio["covr"] = [MP4Cover(cover_data, imageformat=MP4Cover.FORMAT_JPEG)]
+            audio.save()
+            log.debug("MP4 tags written to %s", filepath.name)
+        except Exception as exc:
+            log.warning("mutagen MP4 tagging failed for %s: %s — trying ffmpeg remux", filepath.name, exc)
+            # Fallback: ffmpeg remux with -metadata flags
+            import shutil
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg:
+                meta_args: list[str] = []
+                for k, v in [
+                    ("title",  info.get("title", "")),
+                    ("artist", ", ".join(info.get("artists", []))),
+                    ("album",  info.get("album", "")),
+                    ("date",   str(info.get("release_date", ""))),
+                    ("track",  str(info.get("track_number", 1))),
+                ]:
+                    if v:
+                        meta_args += ["-metadata", f"{k}={v}"]
+                if info.get("isrc"):
+                    meta_args += ["-metadata", f"ISRC={info['isrc']}"]
+                tmp_path = filepath.with_suffix(".tagged.m4a")
+                try:
+                    subprocess.run(
+                        [ffmpeg, "-y", "-i", str(filepath)] + meta_args +
+                        ["-c", "copy", str(tmp_path)],
+                        capture_output=True, timeout=60,
+                    )
+                    if tmp_path.exists() and tmp_path.stat().st_size > 0:
+                        filepath.unlink(missing_ok=True)
+                        tmp_path.rename(filepath)
+                        log.debug("ffmpeg M4A metadata remux OK: %s", filepath.name)
+                    else:
+                        tmp_path.unlink(missing_ok=True)
+                except Exception as exc2:
+                    log.warning("ffmpeg M4A remux also failed: %s", exc2)
 
 # Quality tier constants
 QUALITY_MP3      = "mp3"
@@ -2832,6 +3136,100 @@ def _download_qobuz_stream_sync(stream_url: str, dest_path: Path) -> None:
              dest_path.name, dest_path.stat().st_size / (1024 * 1024))
 
 
+# ---------------------------------------------------------------------------
+# Authenticated Qobuz fallback (Gap 8)
+# Port of SpotiFLAC backend/qobuz_api.go userLogin() + doQobuzSignedRequest()
+# Used only when QOBUZ_EMAIL + QOBUZ_PASSWORD are set and all proxy APIs fail.
+# ---------------------------------------------------------------------------
+
+_qobuz_auth_token: "str | None" = None
+_qobuz_auth_lock  = threading.Lock()
+
+
+def _qobuz_auth_login() -> "str | None":
+    """
+    Attempt an authenticated Qobuz login and return a user auth token.
+    Returns None on failure. Caches the token module-globally.
+    Ref: SpotiFLAC backend/qobuz_api.go userLogin()
+    """
+    global _qobuz_auth_token
+    if not QOBUZ_EMAIL or not QOBUZ_PASSWORD:
+        return None
+    with _qobuz_auth_lock:
+        if _qobuz_auth_token:
+            return _qobuz_auth_token
+        try:
+            creds = _get_qobuz_creds()
+            app_id     = creds["app_id"]
+            app_secret = creds["app_secret"]
+            resp = requests.post(
+                f"{_QOBUZ_API_BASE}/user/login",
+                params={
+                    "username":  QOBUZ_EMAIL,
+                    "password":  hashlib.md5(QOBUZ_PASSWORD.encode()).hexdigest(),
+                    "app_id":    app_id,
+                },
+                headers={"User-Agent": _QOBUZ_UA, "X-App-Id": app_id},
+                timeout=15,
+            )
+            if resp.ok:
+                data = resp.json()
+                token = (data.get("user_auth_token") or
+                         (data.get("user") or {}).get("auth_token") or "")
+                if token:
+                    _qobuz_auth_token = token
+                    log.info("qobuz authenticated login succeeded")
+                    return token
+            log.warning("qobuz auth login failed: HTTP %d", resp.status_code)
+        except Exception as exc:
+            log.warning("qobuz auth login error: %s", exc)
+    return None
+
+
+def _get_qobuz_stream_url_auth(track_id: str, quality_num: int) -> "str | None":
+    """
+    Authenticated Qobuz stream URL via user auth token + signed request.
+    Ref: SpotiFLAC backend/qobuz_api.go doQobuzSignedRequest()
+    Gap 8: called only when both QOBUZ_EMAIL and QOBUZ_PASSWORD are set
+    and all proxy API attempts have failed.
+    """
+    token = _qobuz_auth_login()
+    if not token:
+        return None
+    try:
+        creds = _get_qobuz_creds()
+        app_id     = creds["app_id"]
+        app_secret = creds["app_secret"]
+        ts = str(int(time.time()))
+        # Signing: MD5("/track/getFileUrl" + params_sorted_alphabetically + ts + secret)
+        sig_path = "trackgetFileUrl"
+        sig_params = f"format_id{quality_num}intentstreamtrack_id{track_id}{ts}{app_secret}"
+        sig = hashlib.md5(sig_params.encode()).hexdigest()
+        resp = requests.get(
+            f"{_QOBUZ_API_BASE}/track/getFileUrl",
+            params={
+                "track_id":        track_id,
+                "format_id":       quality_num,
+                "intent":          "stream",
+                "request_ts":      ts,
+                "request_sig":     sig,
+                "app_id":          app_id,
+                "user_auth_token": token,
+            },
+            headers={"User-Agent": _QOBUZ_UA, "X-App-Id": app_id, "X-User-Auth-Token": token},
+            timeout=15,
+        )
+        if resp.ok:
+            data = resp.json()
+            url = data.get("url") or data.get("stream_url") or ""
+            if url.startswith("http"):
+                log.debug("qobuz auth stream url OK for track %s quality %s", track_id, quality_num)
+                return url
+    except Exception as exc:
+        log.warning("qobuz auth stream url error: %s", exc)
+    return None
+
+
 async def _download_qobuz(
     track_id: str, quality_tier: str,
     download_dir: Path, filename_stem: str
@@ -2853,6 +3251,18 @@ async def _download_qobuz(
         if stream_url:
             used_quality = qnum
             break
+
+    # Gap 8: authenticated Qobuz fallback when all proxy APIs failed
+    # Ref: SpotiFLAC backend/qobuz_api.go userLogin() + doQobuzSignedRequest()
+    if not stream_url and QOBUZ_EMAIL and QOBUZ_PASSWORD:
+        log.info("qobuz proxy failed; trying authenticated fallback for track %s", track_id)
+        for qnum in quality_nums:
+            stream_url = await loop.run_in_executor(
+                None, _get_qobuz_stream_url_auth, str(track_id), qnum
+            )
+            if stream_url:
+                used_quality = qnum
+                break
 
     if not stream_url:
         raise RuntimeError(
@@ -2946,27 +3356,91 @@ def _download_raw_stream(url: str, dest: Path) -> None:
                 f.write(chunk)
 
 
-async def _convert_or_rename_amazon(raw_path: Path, download_dir: Path, stem: str) -> Path:
+async def _convert_or_rename_amazon(
+    raw_path: Path, download_dir: Path, stem: str, decryption_key: str = ""
+) -> Path:
     """
-    Try to convert the raw Amazon file to FLAC with ffmpeg.
-    If ffmpeg is not available, keep the file as-is with the correct extension.
+    Optionally decrypt, then convert/rename a raw Amazon download to FLAC.
+
+    Gap 1 — port of SpotiFLAC backend/amazon.go:
+      When decryption_key is non-empty, first runs:
+        ffmpeg -decryption_key {key} -i {raw} -c copy {decrypted}
+      to produce a clear intermediate, then probes and converts to FLAC.
+      When the key is empty, behaves as before.
     """
     import shutil
     ffmpeg = shutil.which("ffmpeg")
-    out_flac = download_dir / f"{stem}.flac"
-    if ffmpeg:
+
+    work_path = raw_path  # the file we'll probe / convert
+
+    # ── Step 1 (Gap 1): decrypt if a key was provided ─────────────────────
+    if decryption_key and ffmpeg:
+        decrypted_path = raw_path.with_suffix(".dec.mp4")
         proc = await asyncio.create_subprocess_exec(
-            ffmpeg, "-y", "-i", str(raw_path), "-vn", "-c:a", "flac", str(out_flac),
+            ffmpeg, "-y",
+            "-decryption_key", decryption_key,
+            "-i", str(raw_path),
+            "-c", "copy",
+            str(decrypted_path),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.wait()
-        if out_flac.exists() and out_flac.stat().st_size > 0:
+        if decrypted_path.exists() and decrypted_path.stat().st_size > 0:
             raw_path.unlink(missing_ok=True)
+            work_path = decrypted_path
+            log.debug("amazon decryption OK: %s", decrypted_path.name)
+        else:
+            log.warning("amazon decryption produced empty file; trying without key")
+            decrypted_path.unlink(missing_ok=True)
+
+    # ── Step 2: probe codec so we can decide copy vs. transcode ───────────
+    codec = ""
+    if ffmpeg:
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe:
+            try:
+                probe = await asyncio.create_subprocess_exec(
+                    ffprobe, "-v", "quiet",
+                    "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_name",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(work_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await probe.communicate()
+                codec = stdout.decode().strip().lower()
+                log.debug("amazon codec probe: %s", codec)
+            except Exception as exc:
+                log.debug("ffprobe failed: %s", exc)
+
+    # ── Step 3: rename to .flac (already FLAC) or convert ─────────────────
+    if ffmpeg:
+        out_flac = download_dir / f"{stem}.flac"
+        if codec == "flac":
+            # Already FLAC — just copy container
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg, "-y", "-i", str(work_path), "-c", "copy", str(out_flac),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        else:
+            # Transcode to FLAC
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg, "-y", "-i", str(work_path), "-vn", "-c:a", "flac", str(out_flac),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        await proc.wait()
+        if out_flac.exists() and out_flac.stat().st_size > 0:
+            work_path.unlink(missing_ok=True)
             return out_flac
-    # ffmpeg unavailable or failed — keep with m4a extension
-    out_m4a = raw_path.with_suffix(".m4a")
-    raw_path.rename(out_m4a)
+
+    # ffmpeg unavailable or conversion failed — keep as .m4a
+    out_m4a = work_path.with_suffix(".m4a")
+    if work_path != out_m4a:
+        work_path.rename(out_m4a)
     return out_m4a
 
 
@@ -3006,13 +3480,20 @@ async def download_track(info: dict, download_dir: Path, ytdlp_bin: str) -> Path
     spotify_id = info.get("track_id")
     if not qobuz_id and spotify_id:
         try:
-            direct_url = info.get("tidal_alt_url") or _get_tidal_alt_url(spotify_id)
-            if direct_url:
-                from urllib.parse import urlparse as _urlparse
-                ext = Path(_urlparse(direct_url).path).suffix.lower() or ".flac"
-                fp = download_dir / f"{safe}{ext}"
+            tidal_result = info.get("tidal_alt_url") or _get_tidal_alt_url(spotify_id)
+            if tidal_result:
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, _download_raw_stream, direct_url, fp)
+                # Gap 2: handle V2 manifest (SpotiFLAC backend/tidal.go DownloadFromManifest)
+                if isinstance(tidal_result, dict) and tidal_result.get("type") == "manifest":
+                    ext = _ext_from_manifest(tidal_result)
+                    fp = download_dir / f"{safe}{ext}"
+                    await loop.run_in_executor(None, _download_tidal_manifest, tidal_result, fp)
+                else:
+                    direct_url = str(tidal_result)
+                    from urllib.parse import urlparse as _urlparse
+                    ext = Path(_urlparse(direct_url).path).suffix.lower() or ".flac"
+                    fp = download_dir / f"{safe}{ext}"
+                    await loop.run_in_executor(None, _download_raw_stream, direct_url, fp)
                 try:
                     embed_metadata(fp, info)
                 except Exception as exc:
@@ -3645,6 +4126,17 @@ async def download_track_from_choice(
     source = choice.get("source", "ytmusic")
     log.info("download_track_from_choice source=%s title=%r", source, title)
 
+    # ── Gap 7: Check download history before downloading ───────────────────
+    # Ref: SpotiFLAC backend/history.go + backend/filemanager.go ResolveOutputPathForDownload
+    if source != "auto":
+        track_id = info.get("track_id") or info.get("amazon_id") or info.get("tidal_id") or ""
+        quality  = choice.get("quality", "")
+        if track_id and quality:
+            cached_fp = _check_download_history(str(track_id), source, quality)
+            if cached_fp:
+                log.info("download history hit: reusing %s", cached_fp)
+                return cached_fp
+
     # ── Auto mode — try each sub-choice in order, return first that succeeds ──
     if source == "auto":
         sub_choices = choice.get("_sub_choices") or []
@@ -3691,6 +4183,8 @@ async def download_track_from_choice(
             embed_metadata(fp, info)
         except Exception as exc:
             log.warning("metadata embed failed for %s: %s", fp.name, exc)
+        # Record to download history (Gap 7)
+        _record_download_history(info.get("track_id") or qobuz_id, "qobuz", quality_tier, fp)
         return fp
 
     # ── Tidal Alt — no credentials; uses Spotify track ID (or Tidal ID) ─────
@@ -3698,32 +4192,46 @@ async def download_track_from_choice(
         spotify_id = choice.get("spotify_id") or info.get("track_id")
         tidal_id   = info.get("tidal_id")
 
-        direct_url = choice.get("url") or info.get("tidal_alt_url")
+        tidal_result = choice.get("url") or info.get("tidal_alt_url")
 
-        if not direct_url and spotify_id:
+        if not tidal_result and spotify_id:
             loop = asyncio.get_event_loop()
-            direct_url = await loop.run_in_executor(None, _get_tidal_alt_url, spotify_id)
+            tidal_result = await loop.run_in_executor(None, _get_tidal_alt_url, spotify_id)
 
-        if not direct_url and tidal_id:
+        if not tidal_result and tidal_id:
             # Fallback: try the proxy with the Tidal track ID directly
             loop = asyncio.get_event_loop()
-            direct_url = await loop.run_in_executor(None, _get_tidal_alt_url_by_tidal_id, str(tidal_id))
+            tidal_result = await loop.run_in_executor(
+                None, _get_tidal_alt_url_by_tidal_id, str(tidal_id)
+            )
 
-        if not direct_url:
+        if not tidal_result:
             raise RuntimeError(
                 f"Tidal Alt proxy returned no URL. "
                 f"spotify_id={spotify_id!r} tidal_id={tidal_id!r}"
             )
 
-        from urllib.parse import urlparse as _urlparse
-        ext = Path(_urlparse(direct_url).path).suffix.lower() or ".flac"
-        dest_path = download_dir / f"{safe}{ext}"
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _download_raw_stream, direct_url, dest_path)
+        # Gap 2: handle V2 manifest response (SpotiFLAC backend/tidal.go DownloadFromManifest)
+        if isinstance(tidal_result, dict) and tidal_result.get("type") == "manifest":
+            ext = _ext_from_manifest(tidal_result)
+            dest_path = download_dir / f"{safe}{ext}"
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _download_tidal_manifest, tidal_result, dest_path)
+        else:
+            # Plain URL download
+            direct_url = str(tidal_result)
+            from urllib.parse import urlparse as _urlparse
+            ext = Path(_urlparse(direct_url).path).suffix.lower() or ".flac"
+            dest_path = download_dir / f"{safe}{ext}"
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _download_raw_stream, direct_url, dest_path)
+
         try:
             embed_metadata(dest_path, info)
         except Exception as exc:
             log.warning("metadata embed for tidal alt %s: %s", dest_path.name, exc)
+        # Record to download history (Gap 7)
+        _record_download_history(info.get("track_id") or str(tidal_id or ""), "tidal_alt", QUALITY_FLAC_CD, dest_path)
         return dest_path
 
     # ── Amazon Music — proxy API (no credentials) ──────────────────────────
@@ -3731,7 +4239,9 @@ async def download_track_from_choice(
         asin = choice.get("asin") or _extract_amazon_asin(choice.get("url", ""))
         if not asin:
             raise RuntimeError("Amazon ASIN not available")
-        stream_url, _decryption_key = _get_amazon_stream_url(asin)
+        # Gap 1: thread decryption key through to _convert_or_rename_amazon
+        # Ref: SpotiFLAC backend/amazon.go — apply -decryption_key before convert
+        stream_url, decryption_key = _get_amazon_stream_url(asin)
         if not stream_url:
             raise RuntimeError(f"Amazon proxy returned no stream URL for ASIN {asin}")
 
@@ -3739,11 +4249,15 @@ async def download_track_from_choice(
         raw_path = download_dir / f"{safe}.m4a.tmp"
         await loop.run_in_executor(None, _download_raw_stream, stream_url, raw_path)
 
-        fp = await _convert_or_rename_amazon(raw_path, download_dir, safe)
+        fp = await _convert_or_rename_amazon(raw_path, download_dir, safe, decryption_key)
         try:
             embed_metadata(fp, info)
         except Exception as exc:
             log.warning("metadata embed failed for %s: %s", fp.name, exc)
+
+        # Record to download history (Gap 7)
+        track_id = info.get("track_id") or asin
+        _record_download_history(track_id, "amazon", "flac", fp)
         return fp
 
     output_tmpl = str(download_dir / "{}.%(ext)s".format(safe))
