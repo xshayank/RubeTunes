@@ -1183,15 +1183,11 @@ async def _do_batch_download(
                         _fail_count[0] += 1
                     return None
 
-                # download_track_from_choice is async; run it synchronously in the thread
-                import asyncio as _asyncio
-                new_loop = _asyncio.new_event_loop()
-                try:
-                    fp = new_loop.run_until_complete(
-                        _spodl.download_track_from_choice(info, choice, batch_dir, ytbin)
-                    )
-                finally:
-                    new_loop.close()
+                # download_track_from_choice is async; run it in a fresh event loop
+                # (asyncio.run creates and closes a new loop — safe from a non-async thread)
+                fp = asyncio.run(
+                    _spodl.download_track_from_choice(info, choice, batch_dir, ytbin)
+                )
 
                 with _progress_lock:
                     _done_count[0] += 1
@@ -1203,7 +1199,7 @@ async def _do_batch_download(
                 return None
 
         # Submit all tracks to the thread pool; preserve original order via index
-        results: list = [None] * total   # slot per track, in original order
+        track_files: list = [None] * total   # slot per track, in original order
         failed_ids: list = []
 
         with concurrent.futures.ThreadPoolExecutor(
@@ -1219,7 +1215,7 @@ async def _do_batch_download(
                 idx = future_to_idx[future]
                 fp = future.result()  # never raises — _download_one catches everything
                 if fp is not None:
-                    results[idx] = fp
+                    track_files[idx] = fp
                 else:
                     failed_ids.append(track_ids[idx])
 
@@ -1241,7 +1237,7 @@ async def _do_batch_download(
                         pass
 
         # Collect only successful downloads in original track order
-        downloaded = [r for r in results if r is not None]
+        downloaded = [r for r in track_files if r is not None]
 
         if not downloaded:
             await app.edit_message(object_guid, status_id,

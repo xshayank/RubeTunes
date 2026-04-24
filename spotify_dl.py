@@ -3118,8 +3118,13 @@ def _is_circuit_open(service: str, provider: str) -> bool:
         return False
 
 
-def _record_provider_outcome(service: str, provider: str, success: bool, reason: str = "") -> None:
-    """Record a provider outcome and manage circuit-breaker state transitions."""
+def _record_provider_outcome(
+    service: str, provider: str, success: bool, reason: str = "", *, force_open: bool = False
+) -> None:
+    """Record a provider outcome and manage circuit-breaker state transitions.
+
+    *force_open* immediately opens the circuit (used for 429 responses).
+    """
     now = time.time()
     key = _cb_key(service, provider)
 
@@ -3154,15 +3159,20 @@ def _record_provider_outcome(service: str, provider: str, success: bool, reason:
         else:
             # Count failures only within the failure window
             in_window = (now - cb.get("last_failure_ts", 0)) < CIRCUIT_FAIL_WINDOW_SEC
-            cb["consecutive_failures"] = (cb.get("consecutive_failures", 0) + 1) if in_window else 1
+            if in_window:
+                cb["consecutive_failures"] = cb.get("consecutive_failures", 0) + 1
+            else:
+                cb["consecutive_failures"] = 1
             cb["last_failure_ts"] = now
             cb["last_reason"]     = reason or "unknown"
 
-            if state == _CB_STATE_HALF_OPEN:
-                # Failed the probe → re-open
-                cb["state"]      = _CB_STATE_OPEN
-                cb["opened_at"]  = now
-                log.warning("circuit breaker [%s] → open (failed in half_open: %s)", key, cb["last_reason"])
+            if force_open or (
+                state == _CB_STATE_HALF_OPEN
+            ):
+                # Re-open immediately (rate-limit or failed probe)
+                cb["state"]     = _CB_STATE_OPEN
+                cb["opened_at"] = now
+                log.warning("circuit breaker [%s] → open (%s)", key, reason or "forced")
             elif (
                 state == _CB_STATE_CLOSED
                 and cb["consecutive_failures"] >= CIRCUIT_FAIL_THRESHOLD
@@ -3260,11 +3270,13 @@ def _get_qobuz_stream_url(track_id: str, quality_num: int) -> str | None:
             if not resp.ok:
                 reason = "HTTP {}".format(resp.status_code)
                 log.debug("qobuz proxy %s → HTTP %d", url, resp.status_code)
-                # 429 = rate-limited; open circuit immediately by counting as a full threshold
+                # 429 = rate-limited; open the circuit immediately regardless of threshold
                 if resp.status_code == 429:
                     reason = "HTTP 429 rate-limit"
-                    log.warning("qobuz proxy %s → 429 rate-limit; tripping circuit breaker", url)
-                _record_provider_outcome("qobuz", template, False, reason=reason)
+                    log.warning("qobuz proxy %s → 429 rate-limit; opening circuit breaker", url)
+                    _record_provider_outcome("qobuz", template, False, reason=reason, force_open=True)
+                else:
+                    _record_provider_outcome("qobuz", template, False, reason=reason)
                 continue
 
             ct = resp.headers.get("content-type", "")
