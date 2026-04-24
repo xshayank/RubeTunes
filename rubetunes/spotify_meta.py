@@ -87,6 +87,13 @@ __all__ = [
     "_fetch_lyrics_lrclib",
     "_LRCLIB_BASE",
     "_LRCLIB_UA",
+    "parse_spotify_playlist_id",
+    "parse_spotify_album_id",
+    "parse_spotify_artist_id",
+    "get_spotify_playlist_tracks",
+    "get_spotify_album_tracks",
+    "get_spotify_artist_info",
+    "get_spotify_artist_albums",
 ]
 
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID",     "").strip()
@@ -1075,6 +1082,200 @@ def get_lyrics(track_name: str, artist_name: str, album_name: str = "", duration
     if result["plain_lyrics"]:
         return result["plain_lyrics"]
     return None
+
+
+def parse_spotify_playlist_id(text: str) -> str | None:
+    text = text.strip()
+    for pattern in (
+        r"open\.spotify\.com/playlist/([A-Za-z0-9]{22})",
+        r"spotify:playlist:([A-Za-z0-9]{22})",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def parse_spotify_album_id(text: str) -> str | None:
+    text = text.strip()
+    for pattern in (
+        r"open\.spotify\.com/album/([A-Za-z0-9]{22})",
+        r"spotify:album:([A-Za-z0-9]{22})",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def parse_spotify_artist_id(text: str) -> str | None:
+    text = text.strip()
+    for pattern in (
+        r"open\.spotify\.com/artist/([A-Za-z0-9]{22})",
+        r"spotify:artist:([A-Za-z0-9]{22})",
+    ):
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list[str]]:
+    """Return (playlist_info, track_ids) for a Spotify playlist.
+
+    Handles pagination (Spotify returns up to 100 items per page).
+    Skips local/None tracks.
+    """
+    url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
+    resp = requests.get(url, headers=_auth_headers(), timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Spotify playlist API error: HTTP {resp.status_code}")
+    data = resp.json()
+
+    images = data.get("images") or []
+    playlist_info = {
+        "name": data.get("name", ""),
+        "owner": (data.get("owner") or {}).get("display_name", ""),
+        "total_tracks": (data.get("tracks") or {}).get("total", 0),
+        "image_url": images[0].get("url", "") if images else "",
+    }
+
+    track_ids: list[str] = []
+    tracks_page = data.get("tracks") or {}
+    while True:
+        for item in tracks_page.get("items") or []:
+            track = (item or {}).get("track")
+            if not track:
+                continue
+            tid = track.get("id")
+            if tid:
+                track_ids.append(tid)
+        next_url = tracks_page.get("next")
+        if not next_url:
+            break
+        resp = requests.get(next_url, headers=_auth_headers(), timeout=15)
+        if not resp.ok:
+            raise RuntimeError(f"Spotify playlist tracks API error: HTTP {resp.status_code}")
+        tracks_page = resp.json()
+
+    return playlist_info, track_ids
+
+
+def get_spotify_album_tracks(album_id: str) -> tuple[dict, list[str]]:
+    """Return (album_info, track_ids) for a Spotify album.
+
+    Handles pagination if total_tracks > 50.
+    """
+    url = f"https://api.spotify.com/v1/albums/{album_id}"
+    resp = requests.get(url, headers=_auth_headers(), timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Spotify album API error: HTTP {resp.status_code}")
+    data = resp.json()
+
+    images = data.get("images") or []
+    album_info = {
+        "name": data.get("name", ""),
+        "artists": [a["name"] for a in (data.get("artists") or []) if a.get("name")],
+        "release_date": data.get("release_date", ""),
+        "total_tracks": data.get("total_tracks", 0),
+        "image_url": images[0].get("url", "") if images else "",
+    }
+
+    track_ids: list[str] = []
+    tracks_page = data.get("tracks") or {}
+    while True:
+        for item in tracks_page.get("items") or []:
+            if not item:
+                continue
+            tid = item.get("id")
+            if tid:
+                track_ids.append(tid)
+        next_url = tracks_page.get("next")
+        if not next_url:
+            break
+        resp = requests.get(next_url, headers=_auth_headers(), timeout=15)
+        if not resp.ok:
+            raise RuntimeError(f"Spotify album tracks API error: HTTP {resp.status_code}")
+        tracks_page = resp.json()
+
+    return album_info, track_ids
+
+
+def get_spotify_artist_info(artist_id: str) -> dict:
+    """Return artist metadata including top-5 tracks.
+
+    Top tracks are fetched via /v1/artists/{id}/top-tracks?market=US.
+    """
+    artist_url = f"https://api.spotify.com/v1/artists/{artist_id}"
+    resp = requests.get(artist_url, headers=_auth_headers(), timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Spotify artist API error: HTTP {resp.status_code}")
+    artist_data = resp.json()
+
+    images = artist_data.get("images") or []
+    image_url = images[0].get("url", "") if images else ""
+
+    top_url = f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks"
+    resp = requests.get(top_url, params={"market": "US"}, headers=_auth_headers(), timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Spotify artist top-tracks API error: HTTP {resp.status_code}")
+    top_data = resp.json()
+
+    top_tracks = []
+    for track in (top_data.get("tracks") or [])[:5]:
+        ms = track.get("duration_ms", 0)
+        secs = ms // 1000
+        minutes, seconds = divmod(secs, 60)
+        top_tracks.append({
+            "id": track.get("id", ""),
+            "title": track.get("name", ""),
+            "artists": [a["name"] for a in (track.get("artists") or []) if a.get("name")],
+            "duration": f"{minutes}:{seconds:02d}",
+        })
+
+    return {
+        "name": artist_data.get("name", ""),
+        "image_url": image_url,
+        "top_tracks": top_tracks,
+    }
+
+
+def get_spotify_artist_albums(
+    artist_id: str, group: str, offset: int, limit: int
+) -> tuple[list[dict], int]:
+    """Return (items, total) for an artist's albums or singles.
+
+    group must be "album" or "single". offset and limit are passed straight
+    through to the Spotify API.
+    """
+    url = f"https://api.spotify.com/v1/artists/{artist_id}/albums"
+    params = {
+        "include_groups": group,
+        "market": "US",
+        "limit": limit,
+        "offset": offset,
+    }
+    resp = requests.get(url, params=params, headers=_auth_headers(), timeout=15)
+    if not resp.ok:
+        raise RuntimeError(f"Spotify artist albums API error: HTTP {resp.status_code}")
+    data = resp.json()
+
+    total = data.get("total", 0)
+    items = []
+    for alb in data.get("items") or []:
+        if not alb:
+            continue
+        images = alb.get("images") or []
+        items.append({
+            "id": alb.get("id", ""),
+            "name": alb.get("name", ""),
+            "artists": [a["name"] for a in (alb.get("artists") or []) if a.get("name")],
+            "release_date": alb.get("release_date", ""),
+            "total_tracks": alb.get("total_tracks", 0),
+            "image_url": images[0].get("url", "") if images else "",
+        })
+
+    return items, total
 
 
 def spotify_search(query: str, limit: int = 10) -> list[dict]:
