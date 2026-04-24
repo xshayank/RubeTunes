@@ -2055,7 +2055,9 @@ def _parse_tidal_alt_response(resp: "requests.Response") -> "str | dict | None":
     manifest_b64 = (data.get("data") or {}).get("manifest")
     if manifest_b64:
         try:
-            manifest_json = json.loads(base64.b64decode(manifest_b64 + "=="))
+            # Pad to a multiple of 4 chars as required by base64
+            padded = manifest_b64 + "=" * (-len(manifest_b64) % 4)
+            manifest_json = json.loads(base64.b64decode(padded))
             urls = manifest_json.get("urls") or []
             if urls:
                 return {
@@ -3166,7 +3168,8 @@ def _qobuz_auth_login() -> "str | None":
                 f"{_QOBUZ_API_BASE}/user/login",
                 params={
                     "username":  QOBUZ_EMAIL,
-                    "password":  hashlib.md5(QOBUZ_PASSWORD.encode()).hexdigest(),
+                    # Qobuz API requires MD5 of the plaintext password (wire protocol requirement)
+                    "password":  hashlib.md5(QOBUZ_PASSWORD.encode()).hexdigest(),  # noqa: S324
                     "app_id":    app_id,
                 },
                 headers={"User-Agent": _QOBUZ_UA, "X-App-Id": app_id},
@@ -3201,10 +3204,19 @@ def _get_qobuz_stream_url_auth(track_id: str, quality_num: int) -> "str | None":
         app_id     = creds["app_id"]
         app_secret = creds["app_secret"]
         ts = str(int(time.time()))
-        # Signing: MD5("/track/getFileUrl" + params_sorted_alphabetically + ts + secret)
-        sig_path = "trackgetFileUrl"
-        sig_params = f"format_id{quality_num}intentstreamtrack_id{track_id}{ts}{app_secret}"
-        sig = hashlib.md5(sig_params.encode()).hexdigest()
+        # Ref: SpotiFLAC backend/qobuz_api.go doQobuzSignedRequest()
+        # The Qobuz API requires MD5 signature: concat endpoint suffix +
+        # sorted param name+value pairs + timestamp + app_secret (API protocol).
+        # MD5 here is an API wire format requirement, not a password storage choice.
+        sig_params = (
+            "trackgetFileUrl"
+            + f"format_id{quality_num}"
+            + "intentstream"
+            + f"track_id{track_id}"
+            + ts
+            + app_secret
+        )
+        sig = hashlib.md5(sig_params.encode()).hexdigest()  # noqa: S324 — Qobuz API protocol
         resp = requests.get(
             f"{_QOBUZ_API_BASE}/track/getFileUrl",
             params={
