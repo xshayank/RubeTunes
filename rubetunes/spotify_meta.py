@@ -83,6 +83,7 @@ __all__ = [
     "_isrc_soundplate",
     "get_token",
     "get_lyrics",
+    "spotify_search",
     "_fetch_lyrics_lrclib",
     "_LRCLIB_BASE",
     "_LRCLIB_UA",
@@ -1074,3 +1075,50 @@ def get_lyrics(track_name: str, artist_name: str, album_name: str = "", duration
     if result["plain_lyrics"]:
         return result["plain_lyrics"]
     return None
+
+
+def spotify_search(query: str, limit: int = 10) -> list[dict]:
+    """Search Spotify for tracks matching *query*.
+
+    Returns up to *limit* track info dicts with keys:
+    track_id, title, artists, album, duration, url.
+    Uses the public search API with the anonymous bearer token.
+    """
+    try:
+        token = get_token()
+    except Exception as exc:
+        log.warning("spotify_search: could not get token: %s", exc)
+        return []
+
+    try:
+        resp = requests.get(
+            "https://api.spotify.com/v1/search",
+            params={"q": query, "type": "track", "limit": min(limit, 50)},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.warning("spotify_search: API call failed: %s", exc)
+        return []
+
+    results = []
+    for item in (data.get("tracks") or {}).get("items") or []:
+        if not item:
+            continue
+        track_id = item.get("id", "")
+        artists = [a["name"] for a in (item.get("artists") or []) if a.get("name")]
+        ms = item.get("duration_ms", 0)
+        secs = ms // 1000
+        minutes, seconds = divmod(secs, 60)
+        duration = f"{minutes}:{seconds:02d}"
+        results.append({
+            "track_id": track_id,
+            "title": item.get("name", "Unknown"),
+            "artists": artists,
+            "album": (item.get("album") or {}).get("name", ""),
+            "duration": duration,
+            "url": f"https://open.spotify.com/track/{track_id}",
+        })
+    return results

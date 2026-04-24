@@ -4,3 +4,6 @@ rubpy==7.3.4
 python-dotenv==1.2.2
 requests>=2.30.0
 mutagen==1.47.0
+python-json-logger>=2.0
+prometheus-client>=0.20
+sentry-sdk>=2.0

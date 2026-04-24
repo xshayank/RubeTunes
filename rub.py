@@ -18,6 +18,33 @@ from rubpy import Client as RubikaClient, filters
 import spotify_dl as _spodl
 import zip_split as _zip_split
 
+# New rubetunes modules
+try:
+    from rubetunes.rate_limiter import check_rate_limit, record_usage
+    _HAS_RATE_LIMITER = True
+except ImportError:
+    _HAS_RATE_LIMITER = False
+    def check_rate_limit(guid): return (True, "")  # noqa: E704
+    def record_usage(guid): pass  # noqa: E704
+
+try:
+    from rubetunes.disk_guard import check_disk_space
+    _HAS_DISK_GUARD = True
+except ImportError:
+    _HAS_DISK_GUARD = False
+    def check_disk_space(n, d): return (True, "")  # noqa: E704
+
+try:
+    from rubetunes.providers.soundcloud import parse_soundcloud_url, download_soundcloud
+    _HAS_SOUNDCLOUD = True
+except ImportError:
+    _HAS_SOUNDCLOUD = False
+
+try:
+    from rubetunes.providers.bandcamp import parse_bandcamp_url, download_bandcamp
+    _HAS_BANDCAMP = True
+except ImportError:
+    _HAS_BANDCAMP = False
 
 load_dotenv()
 
@@ -91,6 +118,14 @@ QOBUZ_RE = re.compile(
 AMAZON_RE = re.compile(
     r'https?://music\.amazon\.[a-z.]+/tracks/([A-Z0-9]{10,})'
     r'|[?&]trackAsin=([A-Z0-9]{10,})'
+)
+
+SOUNDCLOUD_RE = re.compile(
+    r'https?://(?:www\.)?soundcloud\.com/[\w\-]+/[\w\-]+'
+)
+
+BANDCAMP_RE = re.compile(
+    r'https?://[\w\-]+\.bandcamp\.com/(?:track|album)/[\w\-]+'
 )
 
 PROGRESS_RE = re.compile(
@@ -488,15 +523,20 @@ async def start_handler(update):
         update.object_guid,
         "\U0001f3ac Welcome!\n\n"
         "\U0001f4cc Commands:\n"
-        "  !download <url>  \u2014 Download a YouTube video (choose quality)\n"
-        "  !spotify <url>   \u2014 Download a Spotify track / album / playlist\n"
-        "                       or browse a Spotify artist page\n"
-        "  !tidal <url>     \u2014 Download a Tidal track\n"
-        "  !qobuz <url>     \u2014 Download a Qobuz track\n"
-        "  !amazon <url>    \u2014 Download an Amazon Music track\n"
-        "  !cancel          \u2014 Cancel any pending selection\n"
-        "  !history [N]     \u2014 Show your last N downloads (default 10)\n"
-        "  !start           \u2014 Show this message\n\n"
+        "  !download <url>        \u2014 Download a YouTube video\n"
+        "  !spotify <url>         \u2014 Download a Spotify track / album / playlist\n"
+        "  !tidal <url>           \u2014 Download a Tidal track\n"
+        "  !qobuz <url>           \u2014 Download a Qobuz track\n"
+        "  !amazon <url>          \u2014 Download an Amazon Music track\n"
+        "  !soundcloud <url>      \u2014 Download a SoundCloud track\n"
+        "  !bandcamp <url>        \u2014 Download a Bandcamp track\n"
+        "  !search <query>        \u2014 Search Spotify (top 10 results)\n"
+        "  !queue                 \u2014 Show your position in the download queue\n"
+        "  !cancel                \u2014 Cancel any pending selection\n"
+        "  !history [N]           \u2014 Show your last N downloads (default 10)\n"
+        "  !start                 \u2014 Show this message\n\n"
+        "\U0001f3b5 Format hint: append mp3 / flac / m4a to music commands\n"
+        "  e.g. !spotify <url> mp3\n\n"
         "\U0001f3b5 Music download flow:\n"
         "  1\ufe0f\u20e3 Send a music command with a URL\n"
         "  2\ufe0f\u20e3 Choose audio quality (MP3 / FLAC CD / FLAC Hi-Res)\n"
@@ -1152,6 +1192,14 @@ async def _do_batch_download(
             return
 
         total = len(track_ids)
+
+        # D2: Disk space guard
+        if _HAS_DISK_GUARD:
+            ok, disk_msg = check_disk_space(total, DOWNLOAD_DIR)
+            if not ok:
+                await app.edit_message(object_guid, status_id, disk_msg)
+                return
+
         await app.edit_message(
             object_guid, status_id,
             "\U0001f4c2 {} — {} tracks\n\U0001f3b5 Quality: {}".format(
@@ -1744,7 +1792,8 @@ async def admin_handler(update):
             "  !admin logs [N]\n"
             "  !admin status\n"
             "  !admin clearcache [lru|isrc|all]\n"
-            "  !admin breakers"
+            "  !admin breakers\n"
+            "  !admin health"
         )
         return
 
@@ -1970,6 +2019,45 @@ async def admin_handler(update):
         await app.send_message(object_guid, "\n".join(lines))
         return
 
+    # ------------------------------------------------------------------
+    # health — D1: ping each provider endpoint
+    # ------------------------------------------------------------------
+    if sub == "health":
+        import concurrent.futures as _cf
+        endpoints = {
+            "Qobuz API":    "https://www.qobuz.com",
+            "Deezer API":   "https://api.deezer.com/track/3135556",
+            "Tidal API":    "https://api.tidal.com",
+            "lrclib":       "https://lrclib.net/api/search?q=test",
+            "MusicBrainz":  "https://musicbrainz.org/ws/2/",
+            "Odesli":       "https://odesli.co",
+            "YouTube Music":"https://music.youtube.com",
+        }
+        _HEALTH_TIMEOUT = 5
+
+        def _ping(name_url):
+            name, url = name_url
+            try:
+                import requests as _req
+                t0 = time.time()
+                r = _req.head(url, timeout=_HEALTH_TIMEOUT, allow_redirects=True)
+                elapsed = time.time() - t0
+                status = "🟢 up" if r.status_code < 500 else "🔴 down"
+                if elapsed > 2:
+                    status = "🟡 slow"
+                return f"{status} {name} ({elapsed*1000:.0f}ms)"
+            except Exception as exc:
+                return f"🔴 down {name} ({exc})"
+
+        status_msg = await app.send_message(object_guid, "⏳ Pinging all endpoints…")
+        with _cf.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(_ping, endpoints.items()))
+        await app.edit_message(
+            object_guid, status_msg.message_id,
+            "🩺 Health check:\n" + "\n".join(results)
+        )
+        return
+
     await app.send_message(
         object_guid,
         "❌ Unknown admin sub-command: {}".format(sub)
@@ -2125,6 +2213,13 @@ async def spotify_handler(update):
     if not allowed:
         await app.send_message(object_guid, reason)
         return
+
+    # D3: rate limiting (single tracks only — batch goes through _do_batch_download)
+    if _HAS_RATE_LIMITER and not _is_admin(object_guid):
+        ok, rl_msg = check_rate_limit(object_guid)
+        if not ok:
+            await app.send_message(object_guid, rl_msg)
+            return
 
     args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
     args = args.strip()
@@ -2338,6 +2433,246 @@ async def _run_music_and_queue(object_guid: str, url: str, platform: str) -> Non
             _dispatch_queue_entry(next_entry)
         else:
             is_downloading = False
+
+
+# ---------------------------------------------------------------------------
+# B1: !search <query> — Spotify search, show top 10 results as numbered menu
+# ---------------------------------------------------------------------------
+@app.on_message_updates(filters.commands("search", prefixes="!"))
+async def search_handler(update):
+    log = logging.getLogger("search")
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    query = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    query = query.strip()
+    if not query:
+        await app.send_message(
+            object_guid,
+            "❌ Please provide a search query.\nExample: !search bohemian rhapsody queen"
+        )
+        return
+
+    _append_log(object_guid, "search", query)
+    status = await app.send_message(object_guid, f"🔍 Searching Spotify for: {query}…")
+
+    try:
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            None, _spodl.spotify_search, query, 10
+        )
+    except AttributeError:
+        # Fallback if spotify_search not yet exported
+        await app.edit_message(
+            object_guid, status.message_id,
+            "❌ Spotify search is not available. Try a direct link instead."
+        )
+        return
+    except Exception as exc:
+        log.error("search failed: %s", exc)
+        await app.edit_message(object_guid, status.message_id, f"❌ Search failed: {exc}")
+        return
+
+    if not results:
+        await app.edit_message(object_guid, status.message_id, "❌ No results found.")
+        return
+
+    lines = [f"🔍 Spotify results for: {query}\n"]
+    choices = []
+    for i, track in enumerate(results[:10], 1):
+        title = track.get("title", "Unknown")
+        artist = ", ".join(track.get("artists", ["Unknown"]))
+        album = track.get("album", "")
+        duration = track.get("duration", "")
+        url = track.get("url") or track.get("spotify_url") or f"https://open.spotify.com/track/{track.get('track_id','')}"
+        lines.append(f"  !{i} — {artist} — {title}" + (f" [{duration}]" if duration else ""))
+        choices.append({"label": f"{artist} — {title}", "url": url, "type": "spotify_track"})
+
+    lines.append("\n  !cancel — Cancel\n⏰ Expires in 5 minutes.")
+
+    await app.edit_message(object_guid, status.message_id, "\n".join(lines))
+
+    # Cancel any existing pending selection
+    old = pending_selections.pop(object_guid, None)
+    if old and old.get("timeout_task"):
+        old["timeout_task"].cancel()
+
+    timeout_task = asyncio.create_task(_expire_selection(object_guid))
+    pending_selections[object_guid] = {
+        "type": "search_result",
+        "choices": choices,
+        "timeout_task": timeout_task,
+    }
+    log.info("search menu sent | %d results | guid=%s", len(choices), object_guid)
+
+
+# ---------------------------------------------------------------------------
+# B3: !queue — Show queue position and ETA
+# ---------------------------------------------------------------------------
+@app.on_message_updates(filters.commands("queue", prefixes="!"))
+async def queue_handler(update):
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    queue_list = list(download_queue)
+    total = len(queue_list)
+
+    # Find user's position(s) in queue
+    user_positions = [i + 1 for i, e in enumerate(queue_list) if e.get("object_guid") == object_guid]
+
+    if is_downloading:
+        current_user = queue_list[0]["object_guid"] if queue_list else "someone"
+        busy_note = "⏳ A download is currently in progress."
+    else:
+        busy_note = "✅ The bot is idle."
+
+    if not user_positions:
+        await app.send_message(
+            object_guid,
+            f"{busy_note}\n"
+            f"📋 Queue depth: {total} item{'s' if total != 1 else ''}\n"
+            "You are not currently in the queue."
+        )
+        return
+
+    pos = user_positions[0]
+    ahead = pos - 1
+    await app.send_message(
+        object_guid,
+        f"{busy_note}\n"
+        f"📋 Your position: #{pos} ({ahead} item{'s' if ahead != 1 else ''} ahead)\n"
+        f"Total queue depth: {total}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C1: !soundcloud <url> — Download a SoundCloud track
+# ---------------------------------------------------------------------------
+@app.on_message_updates(filters.commands("soundcloud", prefixes="!"))
+async def soundcloud_handler(update):
+    log = logging.getLogger("soundcloud")
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    # D3: rate limiting
+    if _HAS_RATE_LIMITER:
+        ok, msg = check_rate_limit(object_guid)
+        if not ok:
+            await app.send_message(object_guid, msg)
+            return
+
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    url = SOUNDCLOUD_RE.search(args)
+    if not url:
+        await app.send_message(
+            object_guid,
+            "❌ Please provide a valid SoundCloud track URL.\n"
+            "Example: !soundcloud https://soundcloud.com/artist/track"
+        )
+        return
+
+    sc_url = url.group(0)
+    _append_log(object_guid, "soundcloud", sc_url)
+
+    if not _HAS_SOUNDCLOUD:
+        await app.send_message(
+            object_guid, "❌ SoundCloud provider not available. Install rubetunes package."
+        )
+        return
+
+    status = await app.send_message(object_guid, "⬇️ Downloading from SoundCloud…")
+
+    try:
+        ytdlp = str(_ytdlp_bin())
+        safe = _spodl._safe_filename(sc_url.split("/")[-1]) if hasattr(_spodl, "_safe_filename") else "soundcloud_track"
+
+        import tempfile as _tmp
+        with _tmp.TemporaryDirectory() as tmpdir:
+            fp = await download_soundcloud(sc_url, Path(tmpdir), ytdlp, safe)
+            if _HAS_RATE_LIMITER:
+                record_usage(object_guid)
+            await app.send_message(object_guid, "📤 Uploading…")
+            with fp.open("rb") as f:
+                await app.send_document(object_guid, file=f, file_name=fp.name)
+            await app.delete_messages(object_guid, [status.message_id])
+    except Exception as exc:
+        log.error("SoundCloud download failed: %s", exc)
+        await app.edit_message(
+            object_guid, status.message_id, f"❌ SoundCloud download failed: {exc}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# C2: !bandcamp <url> — Download a Bandcamp track
+# ---------------------------------------------------------------------------
+@app.on_message_updates(filters.commands("bandcamp", prefixes="!"))
+async def bandcamp_handler(update):
+    log = logging.getLogger("bandcamp")
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    # D3: rate limiting
+    if _HAS_RATE_LIMITER:
+        ok, msg = check_rate_limit(object_guid)
+        if not ok:
+            await app.send_message(object_guid, msg)
+            return
+
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    url = BANDCAMP_RE.search(args)
+    if not url:
+        await app.send_message(
+            object_guid,
+            "❌ Please provide a valid Bandcamp track/album URL.\n"
+            "Example: !bandcamp https://artist.bandcamp.com/track/song-name"
+        )
+        return
+
+    bc_url = url.group(0)
+    _append_log(object_guid, "bandcamp", bc_url)
+
+    if not _HAS_BANDCAMP:
+        await app.send_message(
+            object_guid, "❌ Bandcamp provider not available. Install rubetunes package."
+        )
+        return
+
+    status = await app.send_message(object_guid, "⬇️ Downloading from Bandcamp…")
+
+    try:
+        ytdlp = str(_ytdlp_bin())
+        safe = _spodl._safe_filename(bc_url.split("/")[-1]) if hasattr(_spodl, "_safe_filename") else "bandcamp_track"
+
+        import tempfile as _tmp
+        with _tmp.TemporaryDirectory() as tmpdir:
+            fp = await download_bandcamp(bc_url, Path(tmpdir), ytdlp, safe)
+            if _HAS_RATE_LIMITER:
+                record_usage(object_guid)
+            await app.send_message(object_guid, "📤 Uploading…")
+            with fp.open("rb") as f:
+                await app.send_document(object_guid, file=f, file_name=fp.name)
+            await app.delete_messages(object_guid, [status.message_id])
+    except Exception as exc:
+        log.error("Bandcamp download failed: %s", exc)
+        await app.edit_message(
+            object_guid, status.message_id, f"❌ Bandcamp download failed: {exc}"
+        )
 
 
 if __name__ == "__main__":
