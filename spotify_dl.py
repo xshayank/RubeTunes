@@ -72,6 +72,16 @@ TIDAL_ALT_BASES: list[str] = (
     ]
 )
 
+# Timeout (seconds) for each Tidal Alt proxy request.
+# With up to 4 bases, worst-case total is _TIDAL_ALT_TIMEOUT * len(TIDAL_ALT_BASES).
+# Ref: SpotiFLAC backend/tidal_api_list.go
+_TIDAL_ALT_TIMEOUT = 8
+
+# Module-level thread-pool for parallel platform resolution (Gap 3).
+# Reused across all _resolve_all_platforms() calls to avoid thread-creation overhead.
+# Ref: SpotiFLAC backend/analysis.go CheckTrackAvailability()
+_resolution_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="resolve")
+
 # ---------------------------------------------------------------------------
 # Recent-fetch metadata cache (Gap 6 — port of SpotiFLAC backend/recent_fetches.go)
 # ---------------------------------------------------------------------------
@@ -2056,7 +2066,8 @@ def _parse_tidal_alt_response(resp: "requests.Response") -> "str | dict | None":
     if manifest_b64:
         try:
             # Pad to a multiple of 4 chars as required by base64
-            padded = manifest_b64 + "=" * (-len(manifest_b64) % 4)
+            padding_needed = (4 - len(manifest_b64) % 4) % 4
+            padded = manifest_b64 + "=" * padding_needed
             manifest_json = json.loads(base64.b64decode(padded))
             urls = manifest_json.get("urls") or []
             if urls:
@@ -2098,7 +2109,7 @@ def _get_tidal_alt_url(spotify_track_id: str) -> "str | dict | None":
             resp = requests.get(
                 f"{base}/{spotify_track_id}",
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=8,
+                timeout=_TIDAL_ALT_TIMEOUT,
                 allow_redirects=False,
             )
             result = _parse_tidal_alt_response(resp)
@@ -2121,7 +2132,7 @@ def _get_tidal_alt_url_by_tidal_id(tidal_track_id: str) -> "str | dict | None":
             resp = requests.get(
                 f"{base}/{tidal_track_id}",
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=8,
+                timeout=_TIDAL_ALT_TIMEOUT,
                 allow_redirects=False,
             )
             result = _parse_tidal_alt_response(resp)
@@ -2260,18 +2271,18 @@ def _resolve_all_platforms(info: dict) -> dict:
             log.debug("parallel odesli: %s", exc)
         return {}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-        f_dz   = pool.submit(_fetch_deezer)
-        f_qz   = pool.submit(_fetch_qobuz)
-        f_td   = pool.submit(_fetch_tidal)
-        f_talt = pool.submit(_fetch_tidal_alt)
-        f_od   = pool.submit(_fetch_odesli)
+    # Use the module-level pool to avoid thread-creation overhead per call
+    f_dz   = _resolution_pool.submit(_fetch_deezer)
+    f_qz   = _resolution_pool.submit(_fetch_qobuz)
+    f_td   = _resolution_pool.submit(_fetch_tidal)
+    f_talt = _resolution_pool.submit(_fetch_tidal_alt)
+    f_od   = _resolution_pool.submit(_fetch_odesli)
 
-        dz   = f_dz.result()
-        qz   = f_qz.result()
-        td   = f_td.result()
-        talt = f_talt.result()
-        od   = f_od.result()
+    dz   = f_dz.result()
+    qz   = f_qz.result()
+    td   = f_td.result()
+    talt = f_talt.result()
+    od   = f_od.result()
 
     # ── 1. Deezer ──────────────────────────────────────────────────────────
     if dz:
