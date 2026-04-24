@@ -457,3 +457,288 @@ class TestTrackInfoCache:
         count = sdl.clear_track_info_cache()
         assert count == 2
         assert sdl._cache_get_track_info("x") is None
+
+
+# ===========================================================================
+# 9.  New Spotify URL parsers
+# ===========================================================================
+
+_BARE_22 = "4iV5W9uYEdYUVa79Axb7Rh"  # valid 22-char base62 id
+
+
+class TestParseSpotifyPlaylistId:
+    def test_full_url(self):
+        assert sdl.parse_spotify_playlist_id(
+            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
+        ) == "37i9dQZF1DXcBWIGoYBM5M"
+
+    def test_full_url_with_si_query(self):
+        assert sdl.parse_spotify_playlist_id(
+            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M?si=abc123"
+        ) == "37i9dQZF1DXcBWIGoYBM5M"
+
+    def test_spotify_uri(self):
+        assert sdl.parse_spotify_playlist_id(
+            "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"
+        ) == "37i9dQZF1DXcBWIGoYBM5M"
+
+    def test_invalid(self):
+        assert sdl.parse_spotify_playlist_id("https://example.com/not-spotify") is None
+
+    def test_bare_id_returns_none(self):
+        assert sdl.parse_spotify_playlist_id(_BARE_22) is None
+
+
+class TestParseSpotifyAlbumId:
+    def test_full_url(self):
+        assert sdl.parse_spotify_album_id(
+            "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3"
+        ) == "1DFixLWuPkv3KT3TnV35m3"
+
+    def test_full_url_with_si_query(self):
+        assert sdl.parse_spotify_album_id(
+            "https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3?si=xyz"
+        ) == "1DFixLWuPkv3KT3TnV35m3"
+
+    def test_spotify_uri(self):
+        assert sdl.parse_spotify_album_id(
+            "spotify:album:1DFixLWuPkv3KT3TnV35m3"
+        ) == "1DFixLWuPkv3KT3TnV35m3"
+
+    def test_invalid(self):
+        assert sdl.parse_spotify_album_id("https://example.com/not-spotify") is None
+
+    def test_bare_id_returns_none(self):
+        assert sdl.parse_spotify_album_id(_BARE_22) is None
+
+
+class TestParseSpotifyArtistId:
+    def test_full_url(self):
+        assert sdl.parse_spotify_artist_id(
+            "https://open.spotify.com/artist/06HL4z0CvFAxyc27GXpf02"
+        ) == "06HL4z0CvFAxyc27GXpf02"
+
+    def test_full_url_with_si_query(self):
+        assert sdl.parse_spotify_artist_id(
+            "https://open.spotify.com/artist/06HL4z0CvFAxyc27GXpf02?si=abc"
+        ) == "06HL4z0CvFAxyc27GXpf02"
+
+    def test_spotify_uri(self):
+        assert sdl.parse_spotify_artist_id(
+            "spotify:artist:06HL4z0CvFAxyc27GXpf02"
+        ) == "06HL4z0CvFAxyc27GXpf02"
+
+    def test_invalid(self):
+        assert sdl.parse_spotify_artist_id("https://example.com/not-spotify") is None
+
+    def test_bare_id_returns_none(self):
+        assert sdl.parse_spotify_artist_id(_BARE_22) is None
+
+
+# ===========================================================================
+# 10.  New Spotify metadata fetchers (mocked via `responses`)
+# ===========================================================================
+
+_FAKE_TOKEN = "fake-access-token"
+_PL_ID      = "37i9dQZF1DXcBWIGoYBM5M"
+_ALB_ID     = "1DFixLWuPkv3KT3TnV35m3"
+_ART_ID     = "06HL4z0CvFAxyc27GXpf02"
+
+
+class TestGetSpotifyPlaylistTracks:
+    @resp_lib.activate
+    def test_happy_path(self):
+        with patch("rubetunes.spotify_meta.get_token", return_value=_FAKE_TOKEN):
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/playlists/{_PL_ID}",
+                json={
+                    "name": "Test Playlist",
+                    "owner": {"display_name": "Test Owner"},
+                    "images": [{"url": "https://example.com/img.jpg"}],
+                    "tracks": {
+                        "total": 2,
+                        "next": None,
+                        "items": [
+                            {"track": {"id": "track1"}},
+                            {"track": {"id": "track2"}},
+                        ],
+                    },
+                },
+                status=200,
+            )
+            info, track_ids = sdl.get_spotify_playlist_tracks(_PL_ID)
+
+        assert info["name"] == "Test Playlist"
+        assert info["owner"] == "Test Owner"
+        assert info["total_tracks"] == 2
+        assert info["image_url"] == "https://example.com/img.jpg"
+        assert track_ids == ["track1", "track2"]
+
+    @resp_lib.activate
+    def test_skips_null_tracks(self):
+        with patch("rubetunes.spotify_meta.get_token", return_value=_FAKE_TOKEN):
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/playlists/{_PL_ID}",
+                json={
+                    "name": "PL",
+                    "owner": {"display_name": "o"},
+                    "images": [],
+                    "tracks": {
+                        "total": 1,
+                        "next": None,
+                        "items": [
+                            {"track": None},
+                            {"track": {"id": "realtrack"}},
+                        ],
+                    },
+                },
+                status=200,
+            )
+            _, track_ids = sdl.get_spotify_playlist_tracks(_PL_ID)
+        assert track_ids == ["realtrack"]
+
+
+class TestGetSpotifyAlbumTracks:
+    @resp_lib.activate
+    def test_happy_path(self):
+        with patch("rubetunes.spotify_meta.get_token", return_value=_FAKE_TOKEN):
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/albums/{_ALB_ID}",
+                json={
+                    "name": "Test Album",
+                    "artists": [{"name": "Artist A"}],
+                    "release_date": "2023-01-01",
+                    "total_tracks": 2,
+                    "images": [{"url": "https://example.com/alb.jpg"}],
+                    "tracks": {
+                        "next": None,
+                        "items": [
+                            {"id": "t1"},
+                            {"id": "t2"},
+                        ],
+                    },
+                },
+                status=200,
+            )
+            info, track_ids = sdl.get_spotify_album_tracks(_ALB_ID)
+
+        assert info["name"] == "Test Album"
+        assert info["artists"] == ["Artist A"]
+        assert info["release_date"] == "2023-01-01"
+        assert info["total_tracks"] == 2
+        assert info["image_url"] == "https://example.com/alb.jpg"
+        assert track_ids == ["t1", "t2"]
+
+
+class TestGetSpotifyArtistInfo:
+    @resp_lib.activate
+    def test_happy_path(self):
+        with patch("rubetunes.spotify_meta.get_token", return_value=_FAKE_TOKEN):
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/artists/{_ART_ID}",
+                json={
+                    "name": "Taylor Swift",
+                    "images": [{"url": "https://example.com/ts.jpg"}],
+                },
+                status=200,
+            )
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/artists/{_ART_ID}/top-tracks",
+                json={
+                    "tracks": [
+                        {
+                            "id": "tid1",
+                            "name": "Song A",
+                            "artists": [{"name": "Taylor Swift"}],
+                            "duration_ms": 225000,
+                        }
+                    ]
+                },
+                status=200,
+            )
+            info = sdl.get_spotify_artist_info(_ART_ID)
+
+        assert info["name"] == "Taylor Swift"
+        assert info["image_url"] == "https://example.com/ts.jpg"
+        assert len(info["top_tracks"]) == 1
+        t = info["top_tracks"][0]
+        assert t["id"] == "tid1"
+        assert t["title"] == "Song A"
+        assert t["artists"] == ["Taylor Swift"]
+        assert t["duration"] == "3:45"
+
+    @resp_lib.activate
+    def test_limits_top_tracks_to_5(self):
+        with patch("rubetunes.spotify_meta.get_token", return_value=_FAKE_TOKEN):
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/artists/{_ART_ID}",
+                json={"name": "Artist", "images": []},
+                status=200,
+            )
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/artists/{_ART_ID}/top-tracks",
+                json={
+                    "tracks": [
+                        {"id": f"t{i}", "name": f"S{i}", "artists": [], "duration_ms": 0}
+                        for i in range(10)
+                    ]
+                },
+                status=200,
+            )
+            info = sdl.get_spotify_artist_info(_ART_ID)
+        assert len(info["top_tracks"]) == 5
+
+
+class TestGetSpotifyArtistAlbums:
+    @resp_lib.activate
+    def test_happy_path_albums(self):
+        with patch("rubetunes.spotify_meta.get_token", return_value=_FAKE_TOKEN):
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/artists/{_ART_ID}/albums",
+                json={
+                    "total": 3,
+                    "items": [
+                        {
+                            "id": "alb1",
+                            "name": "Album One",
+                            "artists": [{"name": "Taylor Swift"}],
+                            "release_date": "2020-01-01",
+                            "total_tracks": 12,
+                            "images": [{"url": "https://example.com/a1.jpg"}],
+                        }
+                    ],
+                },
+                status=200,
+            )
+            items, total = sdl.get_spotify_artist_albums(_ART_ID, "album", 0, 10)
+
+        assert total == 3
+        assert len(items) == 1
+        a = items[0]
+        assert a["id"] == "alb1"
+        assert a["name"] == "Album One"
+        assert a["artists"] == ["Taylor Swift"]
+        assert a["release_date"] == "2020-01-01"
+        assert a["total_tracks"] == 12
+        assert a["image_url"] == "https://example.com/a1.jpg"
+
+    @resp_lib.activate
+    def test_happy_path_singles(self):
+        with patch("rubetunes.spotify_meta.get_token", return_value=_FAKE_TOKEN):
+            resp_lib.add(
+                resp_lib.GET,
+                f"https://api.spotify.com/v1/artists/{_ART_ID}/albums",
+                json={"total": 0, "items": []},
+                status=200,
+            )
+            items, total = sdl.get_spotify_artist_albums(_ART_ID, "single", 0, 10)
+        assert total == 0
+        assert items == []
