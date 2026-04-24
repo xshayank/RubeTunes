@@ -9,6 +9,7 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square&logo=python)](https://python.org)
 [![Rubika](https://img.shields.io/badge/Platform-Rubika-orange?style=flat-square)](https://rubika.ir)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![Tests](https://github.com/xshayank/RubeTunes/actions/workflows/tests.yml/badge.svg)](https://github.com/xshayank/RubeTunes/actions/workflows/tests.yml)
 
 </div>
 
@@ -35,7 +36,10 @@
 | 🎙 **Amazon Music** | Track download via ISRC resolution |
 | 📄 **Subtitles** | Auto-detected subtitles in SRT format |
 | ⚡ **Download Queue** | One download at a time — crash-proof & conflict-free |
-| 🔒 **Admin Controls** | Whitelist mode, per-user bans, usage logs |
+| 🔀 **Concurrent Batch** | Albums & playlists download up to 3 tracks in parallel |
+| 🛡️ **Circuit Breaker** | Failing providers are temporarily disabled automatically |
+| 🕘 **Download History** | `!history` shows your recent downloads |
+| 🔒 **Admin Controls** | Whitelist mode, per-user bans, usage logs, cache management |
 | 💾 **2 GB file limit** | Files up to **2 GB** sent natively via Rubika |
 
 ---
@@ -83,6 +87,17 @@ The following features were ported from the [SpotiFLAC](https://github.com/spotb
 | 6 | **In-process metadata cache** — track info is cached for 10 min (LRU, 256 entries) to avoid redundant API calls | `backend/recent_fetches.go` |
 | 7 | **Download history** — successful downloads are recorded in `downloads_history.json`; repeat requests reuse the existing file | `backend/history.go` |
 | 8 | **Authenticated Qobuz fallback** — optional `QOBUZ_EMAIL` / `QOBUZ_PASSWORD` env vars enable a signed `track/getFileUrl` call when all proxy APIs fail | `backend/qobuz_api.go` `userLogin` |
+
+And the following UX & resilience improvements:
+
+| # | Feature |
+|---|---|
+| 9 | **`!history` command** — users see their own recent downloads; admins can view global history |
+| 10 | **`!admin clearcache`** — flush the in-memory LRU and/or ISRC disk cache on demand |
+| 11 | **`!admin breakers`** — inspect provider circuit-breaker states in real time |
+| 12 | **Concurrent batch downloads** — albums/playlists download up to 3 tracks in parallel (configurable) |
+| 13 | **Provider circuit breaker** — providers that fail repeatedly are automatically skipped until they recover |
+| 14 | **Resolver unit tests** — `pytest`-based test suite covering parsers, resolvers, circuit breaker, and LRU cache |
 
 ---
 
@@ -152,6 +167,18 @@ TIDAL_TOKEN=
 # Defaults to the built-in list if not set.
 # (port of SpotiFLAC backend/tidal_api_list.go)
 TIDAL_ALT_BASES=
+
+# ── Batch download concurrency ────────────────────────────────────────────────
+# Number of tracks downloaded in parallel for albums/playlists.
+# Default: 3  |  Min: 1  |  Max: 6
+BATCH_CONCURRENCY=3
+
+# ── Provider circuit breaker ──────────────────────────────────────────────────
+# Open the circuit after N consecutive failures within W seconds.
+# Keep it open for T seconds, then allow one probe (half-open state).
+CIRCUIT_FAIL_THRESHOLD=3
+CIRCUIT_FAIL_WINDOW_SEC=300
+CIRCUIT_OPEN_DURATION_SEC=600
 ```
 
 ---
@@ -187,19 +214,53 @@ python3 main.py
 
 ---
 
-## 👑 Admin Commands
-
-Send these commands in your Rubika chat with the bot (admin only):
+## 📋 User Commands
 
 | Command | Description |
 |---|---|
-| `/whitelist on` | Enable whitelist mode — only approved users can use the bot |
-| `/whitelist off` | Disable whitelist mode |
-| `/whitelist add <guid>` | Add a user to the whitelist |
-| `/whitelist remove <guid>` | Remove a user from the whitelist |
-| `/ban <guid>` | Permanently ban a user |
-| `/unban <guid>` | Remove a user's ban |
-| `/logs` | View recent usage logs |
+| `!start` | Show the welcome / help message |
+| `!download <url>` | Download a YouTube video (choose quality) |
+| `!spotify <url>` | Download a Spotify track / album / playlist, or browse an artist page |
+| `!tidal <url>` | Download a Tidal track |
+| `!qobuz <url>` | Download a Qobuz track |
+| `!amazon <url>` | Download an Amazon Music track |
+| `!cancel` | Cancel a pending quality-selection menu |
+| `!history [N]` | Show your N most recent downloads (default 10, max 25) |
+
+---
+
+## 👑 Admin Commands
+
+Send these commands in your Rubika chat with the bot (admin only — set via `ADMIN_GUIDS` env var):
+
+| Command | Description |
+|---|---|
+| `!admin whitelist on` | Enable whitelist mode — only approved users can use the bot |
+| `!admin whitelist off` | Disable whitelist mode |
+| `!admin whitelist add <guid>` | Add a user to the whitelist |
+| `!admin whitelist remove <guid>` | Remove a user from the whitelist |
+| `!admin ban <guid>` | Permanently ban a user |
+| `!admin unban <guid>` | Remove a user's ban |
+| `!admin logs [N]` | View last N usage log entries (default 20) |
+| `!admin status` | Show current bot settings summary |
+| `!admin clearcache [lru\|isrc\|all]` | Flush in-memory LRU cache and/or ISRC disk cache |
+| `!admin breakers` | Show current circuit-breaker state for every provider |
+| `!history all` | View global recent download history (admin only) |
+
+---
+
+## 🧪 Running Tests
+
+```bash
+# Install dev dependencies (adds pytest + responses)
+pip install -r requirements-dev.txt
+
+# Run the test suite
+pytest -q tests/
+```
+
+Tests run fully **offline** — all HTTP calls are mocked via the `responses` library.
+CI runs automatically on every push and pull request via GitHub Actions (`.github/workflows/tests.yml`).
 
 ---
 
@@ -213,6 +274,7 @@ Send these commands in your Rubika chat with the bot (admin only):
 | Spotify metadata | Internal GraphQL persisted-query client |
 | Qobuz metadata | Auto-scraped credentials from `open.qobuz.com` |
 | Environment config | [`python-dotenv`](https://github.com/theskumar/python-dotenv) |
+| Testing | [`pytest`](https://pytest.org) + [`responses`](https://github.com/getsentry/responses) |
 
 ---
 
