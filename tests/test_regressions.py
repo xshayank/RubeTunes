@@ -185,9 +185,9 @@ class TestBuildPlatformChoices:
     def test_no_auto_for_single_source(self):
         """If only one platform is available, no 'auto' entry."""
         info = {
-            "track_id": "abc123", "isrc": "USUM12345678",
-            "title": "T", "artists": ["A"],
-            # Only YouTube will match (no qobuz_id, no tidal, no deezer, no amazon)
+            "amazon_id": "B01EXAMPLE123",
+            # No title, isrc, or track_id — so only Amazon qualifies.
+            # youtube/monochrome/musicdl all need isrc/title/track_id.
         }
         choices = sdl.build_platform_choices(info, "mp3")
         sources = [c["source"] for c in choices]
@@ -486,6 +486,142 @@ class TestYouTubeMusic:
             )
         assert result.exists()
         assert result.suffix == ".mp3"
+
+
+# ===========================================================================
+# Monochrome + musicdl in build_platform_choices waterfall
+# ===========================================================================
+
+class TestMonochromeAndMusicdlInWaterfall:
+    def test_monochrome_and_musicdl_included_with_isrc_and_title(self):
+        """build_platform_choices includes monochrome and musicdl when isrc+title present."""
+        info = {
+            "isrc": "USUM71703861",
+            "title": "Never Gonna Give You Up",
+            "artists": ["Rick Astley"],
+        }
+        choices = sdl.build_platform_choices(info, "any")
+        sources = [c["source"] for c in choices]
+        assert "monochrome" in sources, "monochrome should be present with isrc+title"
+        assert "musicdl" in sources, "musicdl should be present with title"
+
+    def test_monochrome_appears_with_track_id_only(self):
+        """monochrome appears in choices when only track_id is present."""
+        info = {"track_id": "spotify_abc123"}
+        choices = sdl.build_platform_choices(info, "any")
+        sources = [c["source"] for c in choices]
+        assert "monochrome" in sources
+
+    def test_musicdl_requires_title(self):
+        """musicdl only appears when title is present; not when only isrc/track_id."""
+        info = {"track_id": "spotify_abc123", "isrc": "USUM71703861"}  # no title
+        choices = sdl.build_platform_choices(info, "any")
+        sources = [c["source"] for c in choices]
+        assert "musicdl" not in sources
+
+        info_with_title = {**info, "title": "Some Track"}
+        choices2 = sdl.build_platform_choices(info_with_title, "any")
+        sources2 = [c["source"] for c in choices2]
+        assert "musicdl" in sources2
+
+    def test_monochrome_rank_after_youtube(self):
+        """monochrome rank (7) comes after YouTube rank (6)."""
+        info = {"isrc": "USUM71703861", "title": "T", "artists": ["A"]}
+        choices = sdl.build_platform_choices(info, "any")
+        non_auto = [c for c in choices if c["source"] != "auto"]
+        mono = [c for c in non_auto if c["source"] == "monochrome"]
+        yt = [c for c in non_auto if c["source"] == "youtube"]
+        assert mono, "monochrome must be in choices"
+        assert yt, "youtube must be in choices"
+        assert mono[0]["rank"] > yt[0]["rank"]
+
+    def test_musicdl_rank_after_monochrome(self):
+        """musicdl rank (8) comes after monochrome rank (7)."""
+        info = {"title": "T", "artists": ["A"]}
+        choices = sdl.build_platform_choices(info, "any")
+        non_auto = [c for c in choices if c["source"] != "auto"]
+        mono = [c for c in non_auto if c["source"] == "monochrome"]
+        mdl = [c for c in non_auto if c["source"] == "musicdl"]
+        assert mono, "monochrome must be in choices"
+        assert mdl, "musicdl must be in choices"
+        assert mdl[0]["rank"] > mono[0]["rank"]
+
+
+# ===========================================================================
+# YouTube Music cookies support
+# ===========================================================================
+
+class TestYouTubeMusicCookies:
+    def test_find_cookies_file_returns_none_or_path(self):
+        """_find_cookies_file returns None or a Path named cookies.txt."""
+        from rubetunes.providers.youtube import _find_cookies_file
+        result = _find_cookies_file()
+        assert result is None or (result.exists() and result.name == "cookies.txt")
+
+    def test_cookies_appended_to_search_cmd_when_file_exists(self, tmp_path):
+        """--cookies is appended to yt-dlp search cmd when _find_cookies_file returns a path."""
+        from rubetunes.providers.youtube import _ytdlp_search
+        fake_cookies = tmp_path / "cookies.txt"
+        fake_cookies.write_text("# Netscape HTTP Cookie File\n")
+
+        captured = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(list(cmd))
+            return MagicMock(returncode=1, stdout="", stderr="")
+
+        with patch("rubetunes.providers.youtube._find_cookies_file", return_value=fake_cookies):
+            with patch("subprocess.run", side_effect=fake_run):
+                _ytdlp_search("test query", "yt-dlp")
+
+        assert captured, "subprocess.run should have been called"
+        cmd = captured[0]
+        assert "--cookies" in cmd
+        assert str(fake_cookies) in cmd
+
+    def test_cookies_not_appended_when_file_missing(self):
+        """--cookies is NOT added when _find_cookies_file returns None."""
+        from rubetunes.providers.youtube import _ytdlp_search
+
+        captured = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(list(cmd))
+            return MagicMock(returncode=1, stdout="", stderr="")
+
+        with patch("rubetunes.providers.youtube._find_cookies_file", return_value=None):
+            with patch("subprocess.run", side_effect=fake_run):
+                _ytdlp_search("test query", "yt-dlp")
+
+        assert captured, "subprocess.run should have been called"
+        assert "--cookies" not in captured[0]
+
+    def test_cookies_appended_to_download_cmd_when_file_exists(self, tmp_path):
+        """--cookies is appended to yt-dlp download cmd when _find_cookies_file returns a path."""
+        from rubetunes.providers.youtube import _download_youtube_music
+        fake_cookies = tmp_path / "cookies.txt"
+        fake_cookies.write_text("# Netscape HTTP Cookie File\n")
+        expected = tmp_path / "Artist - Track.mp3"
+        expected.write_bytes(b"FAKEMP3")
+
+        captured = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(list(cmd))
+            return MagicMock(returncode=0, stdout=str(expected) + "\n", stderr="")
+
+        with patch("rubetunes.providers.youtube._find_cookies_file", return_value=fake_cookies):
+            with patch("subprocess.run", side_effect=fake_run):
+                _download_youtube_music(
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    tmp_path, "yt-dlp",
+                    info={"title": "Track", "artists": ["Artist"]},
+                )
+
+        assert captured
+        cmd = captured[0]
+        assert "--cookies" in cmd
+        assert str(fake_cookies) in cmd
 
 
 # ===========================================================================

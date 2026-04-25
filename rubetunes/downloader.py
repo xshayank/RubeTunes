@@ -138,6 +138,26 @@ def build_platform_choices(info: dict, quality: str) -> list:
                 "label": "YouTube Music MP3", "url": None, "rank": 6,
             })
 
+    # 6. monochrome (Tidal via community proxy) — fallback after YouTube
+    if want_flac or want_mp3:
+        if info.get("track_id") or info.get("isrc") or info.get("title"):
+            choices.append({
+                "source": "monochrome",
+                "quality": "flac_cd" if want_flac else "mp3",
+                "label": "Monochrome (Tidal proxy)",
+                "url": None, "rank": 7,
+            })
+
+    # 7. musicdl (multi-source CN/global) — last-resort fallback
+    if want_flac or want_mp3:
+        if info.get("title"):
+            choices.append({
+                "source": "musicdl",
+                "quality": "mp3",
+                "label": "musicdl (multi-source)",
+                "url": None, "rank": 8,
+            })
+
     # Sort by rank
     choices.sort(key=lambda c: c["rank"])
 
@@ -427,6 +447,81 @@ def _download_youtube_music(info: dict, output_dir: Path, ytdlp_bin: str) -> Pat
     return _yt_dl(query_or_url, output_dir, ytdlp_bin, info=info)
 
 
+# --- Monochrome (Tidal proxy) ---
+
+def _download_monochrome(info: dict, quality: str, output_dir: Path) -> Path:
+    try:
+        from rubetunes.providers.monochrome import MonochromeClient, download_track
+    except ImportError as exc:
+        raise DownloadError("monochrome", f"monochrome provider not available: {exc}") from exc
+
+    isrc   = info.get("isrc") or ""
+    title  = info.get("title") or ""
+    artist = (info.get("artists") or [""])[0]
+
+    tidal_quality = (
+        "HI_RES_LOSSLESS" if quality == "flac_hi"
+        else "LOSSLESS" if quality == "flac_cd"
+        else "HIGH"
+    )
+
+    async def _run() -> Path:
+        async with MonochromeClient() as client:
+            tracks: list = []
+            if isrc:
+                tracks = await client.search_tracks(isrc)
+            if not tracks and title:
+                query = f"{title} {artist}".strip()
+                tracks = await client.search_tracks(query)
+            if not tracks:
+                raise DownloadError("monochrome", "No tracks found on Monochrome/Tidal")
+            track = tracks[0]
+            stream_info = await client.get_stream_info(track.id, tidal_quality)
+            out_path = output_dir / f"{_safe_name(info)}.flac"
+            return await download_track(track, stream_info, out_path)
+
+    try:
+        return asyncio.run(_run())
+    except DownloadError:
+        raise
+    except Exception as exc:
+        raise DownloadError("monochrome", str(exc)) from exc
+
+
+# --- musicdl (multi-source) ---
+
+def _download_musicdl(info: dict, output_dir: Path) -> Path:
+    try:
+        from rubetunes.providers.musicdl import MusicdlClient
+    except ImportError as exc:
+        raise DownloadError("musicdl", f"musicdl provider not available: {exc}") from exc
+
+    title  = info.get("title") or ""
+    artist = (info.get("artists") or [""])[0]
+    if not title:
+        raise DownloadError("musicdl", "No title to search musicdl")
+
+    query = f"{title} {artist}".strip()
+
+    async def _run() -> Path:
+        client = MusicdlClient()
+        result = await client.search(query, limit=5)
+        if not result.tracks:
+            raise DownloadError("musicdl", f"No results for {query!r}")
+        track = result.tracks[0]
+        dl = await client.download(track, dest_dir=output_dir)
+        if not dl.success or not dl.file_path:
+            raise DownloadError("musicdl", dl.error or "Download failed")
+        return Path(dl.file_path)
+
+    try:
+        return asyncio.run(_run())
+    except DownloadError:
+        raise
+    except Exception as exc:
+        raise DownloadError("musicdl", str(exc)) from exc
+
+
 # ---------------------------------------------------------------------------
 # Waterfall helper
 # ---------------------------------------------------------------------------
@@ -477,6 +572,10 @@ def _download_by_source(info: dict, choice: dict, output_dir: Path, ytdlp_bin: s
         return _download_amazon(info, quality, output_dir, ytdlp_bin)
     if src == "youtube":
         return _download_youtube_music(info, output_dir, ytdlp_bin)
+    if src == "monochrome":
+        return _download_monochrome(info, quality, output_dir)
+    if src == "musicdl":
+        return _download_musicdl(info, output_dir)
     raise DownloadError(src, f"Unknown source: {src!r}")
 
 
