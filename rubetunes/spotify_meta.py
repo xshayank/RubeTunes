@@ -42,6 +42,7 @@ __all__ = [
     "_totp",
     "_get_totp_secret",
     "_token_cache",
+    "_token_lock",
     "_spotify_token_cache_path",
     "_load_spotify_token",
     "_save_spotify_token",
@@ -279,6 +280,10 @@ _anon_session_lock = threading.Lock()
 _anon_session_created_at: float = 0.0
 _ANON_SESSION_TTL = 3600.0  # recreate the session every hour
 
+# Lock that serialises token refreshes so concurrent batch-download threads
+# never simultaneously hammer /api/token (which Spotify rate-limits with 429).
+_token_lock = threading.Lock()
+
 _SP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -329,20 +334,22 @@ def _fetch_spotify_server_time(session: "requests.Session") -> int | None:
     """Fetch Spotify's server-side Unix timestamp for TOTP clock-sync.
 
     Returns the server time in seconds, or None if the endpoint is unavailable.
+
+    NOTE: Only ``/api/server-time`` is tried.  The old fallback to
+    ``/get_access_token`` has been removed because that URL is itself a
+    TOTP-gated token endpoint — calling it *without* the required ``totp``
+    parameters was causing Spotify to return 429 Rate-Limit responses on
+    every token refresh, which cascaded into permanent rate-limiting.
     """
-    for url in (
-        "https://open.spotify.com/api/server-time",
-        "https://open.spotify.com/get_access_token?reason=transport&productType=web_player",
-    ):
-        try:
-            resp = session.get(url, timeout=10)
-            if resp.ok:
-                data = resp.json()
-                t = data.get("serverTime") or data.get("server_time")
-                if t:
-                    return int(t)
-        except Exception:
-            pass
+    try:
+        resp = session.get("https://open.spotify.com/api/server-time", timeout=10)
+        if resp.ok:
+            data = resp.json()
+            t = data.get("serverTime") or data.get("server_time")
+            if t:
+                return int(t)
+    except Exception:
+        pass
     return None
 
 
@@ -388,6 +395,11 @@ def _fetch_anon_token() -> tuple[str, float]:
 
     Uses a persistent session (with sp_t cookie) and syncs the TOTP counter
     to Spotify's server time to handle host clock skew.
+
+    Raises ``RuntimeError`` on failure.  If Spotify returns 429 the function
+    reads the ``Retry-After`` response header (defaulting to 5 s) and sleeps
+    before re-raising so the caller's retry loop does not immediately hammer
+    the endpoint again.
     """
     sess = _ensure_anon_session()
     server_time = _fetch_spotify_server_time(sess)
@@ -406,6 +418,16 @@ def _fetch_anon_token() -> tuple[str, float]:
         headers={"Content-Type": "application/json;charset=UTF-8"},
         timeout=15,
     )
+    if resp.status_code == 429:
+        retry_after = int(resp.headers.get("Retry-After", "5"))
+        log.warning(
+            "Spotify /api/token returned 429 — sleeping %ds before propagating",
+            retry_after,
+        )
+        time.sleep(retry_after)
+        raise RuntimeError(
+            f"Spotify /api/token rate-limited (429); waited {retry_after}s"
+        )
     resp.raise_for_status()
     data = resp.json()
     token = data.get("accessToken", "")
@@ -433,63 +455,74 @@ def get_token() -> str:
     """Return a valid Spotify access token, refreshing as needed.
 
     Priority:
-    1. Unexpired in-memory cache.
-    2. Unexpired on-disk cache.
-    3. Fresh anon token via TOTP (with retry + session reset).
-    4. Scraped TOTP secret (if hardcoded secret stops working).
-    5. Client-credentials token (if SPOTIFY_CLIENT_ID/SECRET are set).
+    1. Unexpired in-memory cache  (lock-free fast path).
+    2. Unexpired on-disk cache    (under lock, checked again after acquiring).
+    3. Fresh anon token via TOTP  (under lock, with retry + session reset).
+    4. Scraped TOTP secret        (if hardcoded secret stops working).
+    5. Client-credentials token   (if SPOTIFY_CLIENT_ID/SECRET are set).
+
+    The token refresh is serialised by ``_token_lock`` so that concurrent
+    batch-download threads never all rush to call ``/api/token`` at the same
+    time and trigger Spotify's 429 rate-limiter.
     """
     now = time.time()
 
-    # 1 — in-memory
+    # 1 — fast path: in-memory cache (no lock needed for a read)
     if _token_cache.get("expires_at", 0) > now + 30:
         return _token_cache["token"]
 
-    # 2 — disk cache
-    if not _token_cache:
-        disk = _load_spotify_token()
-        if disk.get("expires_at", 0) > now + 30:
-            _token_cache.update(disk)
+    with _token_lock:
+        # Re-check after acquiring lock — another thread may have just
+        # refreshed the token while we were waiting.
+        now = time.time()
+        if _token_cache.get("expires_at", 0) > now + 30:
             return _token_cache["token"]
 
-    # 3 — fresh anon token with up to 2 attempts (second attempt resets session)
-    last_exc: Exception | None = None
-    for attempt in range(2):
+        # 2 — disk cache (only consulted when in-memory cache is empty)
+        if not _token_cache:
+            disk = _load_spotify_token()
+            if disk.get("expires_at", 0) > now + 30:
+                _token_cache.update(disk)
+                return _token_cache["token"]
+
+        # 3 — fresh anon token with up to 2 attempts (second attempt resets session)
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                if attempt == 1:
+                    # Force a fresh session — the previous sp_t may have expired
+                    _reset_anon_session()
+                token, expires = _fetch_anon_token()
+                _token_cache.update({"token": token, "expires_at": expires})
+                _save_spotify_token(token, expires)
+                return token
+            except Exception as exc:
+                log.warning("anon token attempt %d failed: %s", attempt + 1, exc)
+                last_exc = exc
+
+        # 4 — try scraping a fresh TOTP secret from the bundle then retry once more
         try:
-            if attempt == 1:
-                # Force a fresh session — the previous sp_t may have expired
-                _reset_anon_session()
-            token, expires = _fetch_anon_token()
-            _token_cache.update({"token": token, "expires_at": expires})
-            _save_spotify_token(token, expires)
-            return token
+            sess = _ensure_anon_session()
+            scraped = _try_scrape_totp_secret(sess)
+            if scraped and scraped != _SPOTIFY_TOTP_SECRET:
+                log.info("retrying anon token with scraped TOTP secret")
+                token, expires = _fetch_anon_token()
+                _token_cache.update({"token": token, "expires_at": expires})
+                _save_spotify_token(token, expires)
+                return token
         except Exception as exc:
-            log.warning("anon token attempt %d failed: %s", attempt + 1, exc)
-            last_exc = exc
+            log.warning("anon token (scraped secret) failed: %s", exc)
 
-    # 4 — try scraping a fresh TOTP secret from the bundle then retry once more
-    try:
-        sess = _ensure_anon_session()
-        scraped = _try_scrape_totp_secret(sess)
-        if scraped and scraped != _SPOTIFY_TOTP_SECRET:
-            log.info("retrying anon token with scraped TOTP secret")
-            token, expires = _fetch_anon_token()
-            _token_cache.update({"token": token, "expires_at": expires})
-            _save_spotify_token(token, expires)
-            return token
-    except Exception as exc:
-        log.warning("anon token (scraped secret) failed: %s", exc)
+        # 5 — client credentials fallback
+        if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
+            try:
+                token, expires = _fetch_cc_token()
+                _token_cache.update({"token": token, "expires_at": expires})
+                return token
+            except Exception as exc:
+                log.error("CC token also failed: %s", exc)
 
-    # 5 — client credentials fallback
-    if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
-        try:
-            token, expires = _fetch_cc_token()
-            _token_cache.update({"token": token, "expires_at": expires})
-            return token
-        except Exception as exc:
-            log.error("CC token also failed: %s", exc)
-
-    raise RuntimeError(f"Cannot get Spotify token. Last error: {last_exc}")
+        raise RuntimeError(f"Cannot get Spotify token. Last error: {last_exc}")
 
 
 def _auth_headers() -> dict:
