@@ -216,6 +216,12 @@ RubeTunes/
 │   ├── sentry_setup.py  # Sentry SDK init + capture helpers
 │   ├── spotify_meta.py  # Spotify TOTP, tokens, GraphQL, SpotifyClient, ISRC
 │   ├── tagging.py       # embed_metadata (MP3/FLAC/M4A)
+│   ├── spotify/         # SpotiFLAC port — strict pathfinder-only endpoint policy
+│   │   ├── __init__.py  # re-exports SpotifyClient, TOTPGenerator, get_token
+│   │   ├── totp.py      # HMAC-SHA1 TOTP (no pyotp); known-vector constant
+│   │   ├── session.py   # scrape/anon-token/cc-token/client-token chain
+│   │   ├── client.py    # SpotifyClient (session + pathfinder v2 POST)
+│   │   └── models.py    # dataclass models (SpotifyTrack, SpotifyAlbum, …)
 │   └── providers/
 │       ├── amazon.py    # Amazon Music
 │       ├── apple_music.py  # iTunes Search API (cover art + metadata)
@@ -226,8 +232,10 @@ RubeTunes/
 │       ├── tidal.py     # Tidal API (TIDAL_TOKEN)
 │       └── tidal_alt.py # Tidal Alt proxy (no token)
 └── tests/
-    ├── test_spotify_dl.py   # Core resolver tests (40 tests)
-    └── test_new_modules.py  # New module tests (18 tests)
+    ├── test_spotify_dl.py      # Core resolver tests
+    ├── test_new_modules.py     # Rate-limiter, disk-guard, Apple Music provider tests
+    ├── test_regressions.py     # Regression tests + Spotify TOTP session fix
+    └── test_spotify_pathfinder.py  # SpotiFLAC port: TOTP known-vector + GraphQL policy
 ```
 
 ### Music quality resolution chain
@@ -247,7 +255,80 @@ Spotify / Tidal / Qobuz / Amazon / SoundCloud / Bandcamp URL
 
 ---
 
-## 🔧 Development
+## 🎵 Spotify Backend: SpotiFLAC Port
+
+This repo includes a full port of the [spotbye/SpotiFLAC](https://github.com/spotbye/SpotiFLAC)
+backend (Go → Python), implementing **strict endpoint policy** — Spotify's public REST API
+(`api.spotify.com/v1/*`) is **never called** for track info, album, playlist, search, or artist
+operations.
+
+### Endpoint policy
+
+| Purpose | Endpoint |
+|---------|----------|
+| Web-player HTML scrape (`clientVersion`) | `https://open.spotify.com` |
+| Anonymous token via TOTP | `https://open.spotify.com/api/token` |
+| Client-credentials fallback | `https://accounts.spotify.com/api/token` |
+| `client-token` header (v2 GraphQL) | `https://clienttoken.spotify.com/v1/clienttoken` |
+| Internal track metadata (ISRC enrichment) | `https://spclient.wg.spotify.com/metadata/4/track/{gid}` |
+| Internal album metadata (UPC enrichment) | `https://spclient.wg.spotify.com/metadata/4/album/{gid}` |
+| **GraphQL v1 — getTrack, getAlbum, fetchPlaylist, queryArtistOverview, queryArtistDiscographyAll, searchDesktop** | `https://api-partner.spotify.com/pathfinder/v1/query` |
+| **GraphQL v2 — session POST queries** | `https://api-partner.spotify.com/pathfinder/v2/query` |
+| Cover art CDN | `https://i.scdn.co/image/{hex}` |
+
+**Forbidden endpoints (never called):**
+- `https://api.spotify.com/v1/tracks/*`
+- `https://api.spotify.com/v1/playlists/*`
+- `https://api.spotify.com/v1/albums/*`
+- `https://api.spotify.com/v1/artists/*`
+- `https://api.spotify.com/v1/search`
+
+### Auth chain
+
+1. Scrape `https://open.spotify.com` → `clientVersion` from `<script id="appServerConfig">`.
+2. HMAC-SHA1 TOTP (secret embedded in the web-player, version 61) → call `/api/token`.
+3. Fallback to `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` client-credentials flow.
+4. `client-token` via `clienttoken.spotify.com` (required for pathfinder/v2).
+
+### TOTP generator
+
+A pure-Python HMAC-SHA1 TOTP implementation (no `pyotp`) lives in
+`rubetunes/spotify/totp.py`.  The same secret bytes, period (30 s), digit count (6),
+and `totpVer` (61) as SpotiFLAC are used.
+
+A pinned known-vector test in `tests/test_spotify_pathfinder.py` verifies parity
+with SpotiFLAC:
+```python
+# timestamp 1_700_000_000 → deterministic 6-digit code
+assert _totp_raw(SPOTIFY_TOTP_SECRET, 1_700_000_000) == KNOWN_VECTOR_CODE
+```
+
+### New modules
+
+```
+rubetunes/spotify/
+├── __init__.py   # re-exports SpotifyClient, TOTPGenerator, get_token
+├── totp.py       # HMAC-SHA1 TOTP generator + known-vector constant
+├── session.py    # web-player auth: scrape, anon-token, cc-token, client-token
+├── client.py     # SpotifyClient (session + pathfinder v2 POST)
+└── models.py     # dataclass models for track/album/playlist/artist responses
+```
+
+### New environment variables
+
+| Variable | Description |
+|----------|-------------|
+| `SPOTIFY_CLIENT_ID` | Spotify app client ID — used for CC-token fallback when anonymous TOTP fails |
+| `SPOTIFY_CLIENT_SECRET` | Spotify app client secret — same as above |
+
+### Credit
+
+Backend auth flow, TOTP secret/version, and GraphQL persisted-query hashes ported from
+**[spotbye/SpotiFLAC](https://github.com/spotbye/SpotiFLAC)** (Go implementation).
+
+---
+
+
 
 ### Running tests
 
