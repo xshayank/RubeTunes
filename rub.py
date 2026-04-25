@@ -55,6 +55,8 @@ except ImportError:
     MusicdlClient = None  # type: ignore[assignment,misc]
     MusicdlNotInstalledError = None  # type: ignore[assignment,misc]
 
+import rubetunes.upload_retry as _upload_retry
+
 load_dotenv()
 
 logging.basicConfig(
@@ -1458,15 +1460,28 @@ async def _do_batch_download(
                 log.info("batch zip part sent: %s (%.1f MB)", zip_path.name, size_mb)
             except Exception as exc:
                 log.error("send zip part failed: %s", exc)
+                _upload_retry.enqueue_failed_upload(
+                    app_send_document=app.send_document,
+                    object_guid=object_guid,
+                    file_path=zip_path,
+                    file_name=zip_path.name,
+                    caption=caption,
+                    provider="batch_zip_part",
+                    exc=exc,
+                )
                 await app.send_message(
                     object_guid,
-                    "\u274c Failed to send zip part {}/{}: {}".format(i, n_parts, exc)
+                    "📦 Upload of part {}/{} failed ({}). Will retry automatically every hour. "
+                    "Send !uploads to see status, or !uploads cancel <id> to drop it.".format(
+                        i, n_parts, exc
+                    ),
                 )
             finally:
-                try:
-                    zip_path.unlink()
-                except Exception:
-                    pass
+                if zip_path.exists():
+                    try:
+                        zip_path.unlink()
+                    except Exception:
+                        pass
 
         summary = "\u2705 Done! {} tracks sent{}.".format(
             len(downloaded),
@@ -1684,12 +1699,28 @@ async def _do_music_from_choice(object_guid: str, info: dict, choice: dict, log)
             log.info("sent: %s", fp)
         except Exception as exc:
             log.error("send failed: %s", exc)
-            await app.send_message(object_guid, "\u274c Failed to send file: {}".format(exc))
+            _upload_retry.enqueue_failed_upload(
+                app_send_document=app.send_document,
+                object_guid=object_guid,
+                file_path=fp,
+                file_name=fp.name,
+                caption=caption,
+                provider="spotify_track",
+                exc=exc,
+            )
+            await app.send_message(
+                object_guid,
+                "📦 Upload failed. Will retry automatically every hour. "
+                "Send !uploads to see status, or !uploads cancel <id> to drop it.",
+            )
+            await app.edit_message(object_guid, status_id, "\u274c Upload failed \u2014 queued for retry.")
+            return
         finally:
-            try:
-                fp.unlink()
-            except Exception:
-                pass
+            if fp.exists():
+                try:
+                    fp.unlink()
+                except Exception:
+                    pass
 
         await app.edit_message(object_guid, status_id, "\u2705 Done!")
 
@@ -1837,8 +1868,27 @@ async def _do_download(object_guid: str, url: str, choice: dict, title: str, log
 
         await app.edit_message(object_guid, status_id, "\u2705 Download complete. Sending\u2026")
         caption = "{}\n{}".format(title, url) if title else url
-        await app.send_document(object_guid, downloaded_file, caption=caption)
-        log.info("sent successfully")
+        try:
+            await app.send_document(object_guid, downloaded_file, caption=caption)
+            log.info("sent successfully")
+        except Exception as exc:
+            log.error("upload failed: %s", exc)
+            _upload_retry.enqueue_failed_upload(
+                app_send_document=app.send_document,
+                object_guid=object_guid,
+                file_path=file_path,
+                file_name=file_path.name,
+                caption=caption,
+                provider="youtube",
+                exc=exc,
+            )
+            await app.send_message(
+                object_guid,
+                "📦 Upload failed. Will retry automatically every hour. "
+                "Send !uploads to see status, or !uploads cancel <id> to drop it.",
+            )
+            await app.edit_message(object_guid, status_id, "\u274c Upload failed — queued for retry.")
+            return
 
         try:
             file_path.unlink()
@@ -2285,12 +2335,28 @@ async def _do_music_download(object_guid: str, url: str, platform: str, log) -> 
             log.info("sent: %s", fp)
         except Exception as exc:
             log.error("send failed: %s", exc)
-            await app.send_message(object_guid, "\u274c Failed to send file: {}".format(exc))
+            _upload_retry.enqueue_failed_upload(
+                app_send_document=app.send_document,
+                object_guid=object_guid,
+                file_path=fp,
+                file_name=fp.name,
+                caption=caption,
+                provider=platform,
+                exc=exc,
+            )
+            await app.send_message(
+                object_guid,
+                "📦 Upload failed. Will retry automatically every hour. "
+                "Send !uploads to see status, or !uploads cancel <id> to drop it.",
+            )
+            await app.edit_message(object_guid, status_id, "\u274c Upload failed \u2014 queued for retry.")
+            return
         finally:
-            try:
-                fp.unlink()
-            except Exception:
-                pass
+            if fp.exists():
+                try:
+                    fp.unlink()
+                except Exception:
+                    pass
 
         await app.edit_message(object_guid, status_id, "\u2705 Done!")
 
@@ -2708,9 +2774,26 @@ async def soundcloud_handler(update):
             if _HAS_RATE_LIMITER:
                 record_usage(object_guid)
             await app.send_message(object_guid, "📤 Uploading…")
-            with fp.open("rb") as f:
-                await app.send_document(object_guid, file=f, file_name=fp.name)
-            await app.delete_messages(object_guid, [status.message_id])
+            try:
+                with fp.open("rb") as f:
+                    await app.send_document(object_guid, file=f, file_name=fp.name)
+                await app.delete_messages(object_guid, [status.message_id])
+            except Exception as upload_exc:
+                log.error("SoundCloud upload failed: %s", upload_exc)
+                _upload_retry.enqueue_failed_upload(
+                    app_send_document=app.send_document,
+                    object_guid=object_guid,
+                    file_path=fp,
+                    file_name=fp.name,
+                    caption="",
+                    provider="soundcloud",
+                    exc=upload_exc,
+                )
+                await app.edit_message(
+                    object_guid, status.message_id,
+                    "📦 Upload failed. Will retry automatically every hour. "
+                    "Send !uploads to see status, or !uploads cancel <id> to drop it.",
+                )
     except Exception as exc:
         log.error("SoundCloud download failed: %s", exc)
         await app.edit_message(
@@ -2769,9 +2852,26 @@ async def bandcamp_handler(update):
             if _HAS_RATE_LIMITER:
                 record_usage(object_guid)
             await app.send_message(object_guid, "📤 Uploading…")
-            with fp.open("rb") as f:
-                await app.send_document(object_guid, file=f, file_name=fp.name)
-            await app.delete_messages(object_guid, [status.message_id])
+            try:
+                with fp.open("rb") as f:
+                    await app.send_document(object_guid, file=f, file_name=fp.name)
+                await app.delete_messages(object_guid, [status.message_id])
+            except Exception as upload_exc:
+                log.error("Bandcamp upload failed: %s", upload_exc)
+                _upload_retry.enqueue_failed_upload(
+                    app_send_document=app.send_document,
+                    object_guid=object_guid,
+                    file_path=fp,
+                    file_name=fp.name,
+                    caption="",
+                    provider="bandcamp",
+                    exc=upload_exc,
+                )
+                await app.edit_message(
+                    object_guid, status.message_id,
+                    "📦 Upload failed. Will retry automatically every hour. "
+                    "Send !uploads to see status, or !uploads cancel <id> to drop it.",
+                )
     except Exception as exc:
         log.error("Bandcamp download failed: %s", exc)
         await app.edit_message(
@@ -2989,6 +3089,7 @@ async def _musicdl_pick(object_guid: str, choice: int, log) -> None:
     fp = dl_result.file_path
     log.info("musicdl download ok | file=%s | guid=%s", fp, object_guid)
     await app.edit_message(object_guid, status_id, "📤 Uploading…")
+    file_moved_to_retry = False
     try:
         try:
             with fp.open("rb") as f:
@@ -2996,35 +3097,126 @@ async def _musicdl_pick(object_guid: str, choice: int, log) -> None:
             await app.delete_messages(object_guid, [status_id])
         except Exception as exc:
             log.error("musicdl upload failed: %s", exc)
-            await app.edit_message(object_guid, status_id, f"❌ Upload failed: {exc}")
+            _upload_retry.enqueue_failed_upload(
+                app_send_document=app.send_document,
+                object_guid=object_guid,
+                file_path=fp,
+                file_name=fp.name,
+                caption="",
+                provider="musicdl",
+                exc=exc,
+            )
+            file_moved_to_retry = True
+            await app.edit_message(
+                object_guid, status_id,
+                "📦 Upload failed. Will retry automatically every hour. "
+                "Send !uploads to see status, or !uploads cancel <id> to drop it.",
+            )
     finally:
-        # Always clean up the downloaded file, even if upload failed
-        try:
-            if fp.exists():
-                fp.unlink()
-                log.info("musicdl: cleaned up %s", fp)
-        except Exception as exc:
-            log.warning("musicdl cleanup failed for %s: %s", fp, exc)
-        # Best-effort removal of empty parent dirs, but never touch MUSICDL_DOWNLOAD_DIR
-        try:
-            from rubetunes.providers.musicdl.config import MUSICDL_DOWNLOAD_DIR as _ROOT
-            root = Path(_ROOT).resolve()
-            parent = fp.parent.resolve()
-            while parent != root and root in parent.parents:
-                try:
-                    parent.rmdir()
-                except OSError:
-                    break  # not empty or perms — stop walking up
-                parent = parent.parent
-        except Exception:
-            pass
+        # Only clean up the file if it wasn't moved to the retry queue
+        if not file_moved_to_retry:
+            try:
+                if fp.exists():
+                    fp.unlink()
+                    log.info("musicdl: cleaned up %s", fp)
+            except Exception as exc:
+                log.warning("musicdl cleanup failed for %s: %s", fp, exc)
+            # Best-effort removal of empty parent dirs, but never touch MUSICDL_DOWNLOAD_DIR
+            try:
+                from rubetunes.providers.musicdl.config import MUSICDL_DOWNLOAD_DIR as _ROOT
+                root = Path(_ROOT).resolve()
+                parent = fp.parent.resolve()
+                while parent != root and root in parent.parents:
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break  # not empty or perms — stop walking up
+                    parent = parent.parent
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# !uploads — inspect and manage the upload retry queue
+# ---------------------------------------------------------------------------
+
+@app.on_message_updates(filters.commands("uploads", prefixes="!"))
+async def uploads_handler(update):
+    """
+    Manage the upload retry queue.
+
+    Usage:
+      !uploads                    — list all pending retry uploads
+      !uploads cancel <id>        — cancel a specific queued upload (by UUID prefix)
+    """
+    log = logging.getLogger("uploads")
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    args = update.command[1:] if update.command and len(update.command) > 1 else []
+    subcmd = args[0].lower() if args else ""
+
+    if subcmd == "cancel":
+        if len(args) < 2:
+            await app.send_message(object_guid, "❌ Usage: !uploads cancel <id>")
+            return
+        target_id = args[1]
+        # Allow prefix matching so users don't have to type the full UUID
+        entries = _upload_retry.list_entries()
+        matched = [e for e in entries if e["id"].startswith(target_id)]
+        if not matched:
+            await app.send_message(object_guid, f"❌ No queued upload found with id starting with: {target_id}")
+            return
+        if len(matched) > 1:
+            await app.send_message(
+                object_guid,
+                f"❌ Ambiguous id prefix '{target_id}' matches {len(matched)} entries. "
+                "Please provide more characters."
+            )
+            return
+        entry = matched[0]
+        if _upload_retry.cancel_entry(entry["id"]):
+            await app.send_message(
+                object_guid,
+                f"🗑️ Cancelled queued upload: {entry['file_name']} (id: {entry['id'][:8]}…)"
+            )
+        else:
+            await app.send_message(object_guid, "❌ Could not cancel — entry may have already completed.")
+        return
+
+    # Default: list all entries
+    entries = _upload_retry.list_entries()
+    if not entries:
+        await app.send_message(object_guid, "✅ No pending uploads in the retry queue.")
+        return
+
+    lines = [f"📋 Upload retry queue ({len(entries)} item{'s' if len(entries) != 1 else ''}):"]
+    for e in entries:
+        short_id = e["id"][:8]
+        lines.append(
+            f"• [{short_id}…] {e['file_name']} | provider={e['provider']} | "
+            f"attempts={e['attempts']} | last_error={e['last_error'][:60]}"
+        )
+    lines.append("\nUse !uploads cancel <id> to remove an entry.")
+    await app.send_message(object_guid, "\n".join(lines))
 
 
 if __name__ == "__main__":
+    _upload_retry.load_on_startup()
     _restore_queue_snapshot()
     print("[rub] Connecting to Rubika...")
+
+    async def _main():
+        await app.start(phone_number=PHONE_NUMBER)
+        _upload_retry.start_retry_loop(app)
+        await app.get_updates()
+
     try:
-        app.run(phone_number=PHONE_NUMBER)
+        asyncio.run(_main())
     except Exception as exc:
         print("[rub] Connection failed: {}".format(exc))
         raise
