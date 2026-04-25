@@ -138,7 +138,7 @@ def build_platform_choices(info: dict, quality: str) -> list:
                 "label": "YouTube Music MP3", "url": None, "rank": 6,
             })
 
-    # 6. monochrome (Tidal via community proxy) — fallback after YouTube
+    # 7. monochrome (Tidal via community proxy) — fallback after YouTube
     if want_flac or want_mp3:
         if info.get("track_id") or info.get("isrc") or info.get("title"):
             choices.append({
@@ -148,7 +148,7 @@ def build_platform_choices(info: dict, quality: str) -> list:
                 "url": None, "rank": 7,
             })
 
-    # 7. musicdl (multi-source CN/global) — last-resort fallback
+    # 8. musicdl (multi-source CN/global) — last-resort fallback
     if want_flac or want_mp3:
         if info.get("title"):
             choices.append({
@@ -451,7 +451,9 @@ def _download_youtube_music(info: dict, output_dir: Path, ytdlp_bin: str) -> Pat
 
 def _download_monochrome(info: dict, quality: str, output_dir: Path) -> Path:
     try:
-        from rubetunes.providers.monochrome import MonochromeClient, download_track
+        from rubetunes.providers.monochrome import (
+            MonochromeClient, download_track, extension_for_quality,
+        )
     except ImportError as exc:
         raise DownloadError("monochrome", f"monochrome provider not available: {exc}") from exc
 
@@ -477,7 +479,8 @@ def _download_monochrome(info: dict, quality: str, output_dir: Path) -> Path:
                 raise DownloadError("monochrome", "No tracks found on Monochrome/Tidal")
             track = tracks[0]
             stream_info = await client.get_stream_info(track.id, tidal_quality)
-            out_path = output_dir / f"{_safe_name(info)}.flac"
+            ext = extension_for_quality(tidal_quality)
+            out_path = output_dir / f"{_safe_name(info)}.{ext}"
             return await download_track(track, stream_info, out_path)
 
     try:

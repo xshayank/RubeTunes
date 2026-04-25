@@ -524,8 +524,8 @@ class TestMonochromeAndMusicdlInWaterfall:
         sources2 = [c["source"] for c in choices2]
         assert "musicdl" in sources2
 
-    def test_monochrome_rank_after_youtube(self):
-        """monochrome rank (7) comes after YouTube rank (6)."""
+    def test_monochrome_lower_priority_than_youtube(self):
+        """monochrome rank (7) is lower priority (higher number) than YouTube rank (6)."""
         info = {"isrc": "USUM71703861", "title": "T", "artists": ["A"]}
         choices = sdl.build_platform_choices(info, "any")
         non_auto = [c for c in choices if c["source"] != "auto"]
@@ -535,8 +535,8 @@ class TestMonochromeAndMusicdlInWaterfall:
         assert yt, "youtube must be in choices"
         assert mono[0]["rank"] > yt[0]["rank"]
 
-    def test_musicdl_rank_after_monochrome(self):
-        """musicdl rank (8) comes after monochrome rank (7)."""
+    def test_musicdl_lower_priority_than_monochrome(self):
+        """musicdl rank (8) is lower priority (higher number) than monochrome rank (7)."""
         info = {"title": "T", "artists": ["A"]}
         choices = sdl.build_platform_choices(info, "any")
         non_auto = [c for c in choices if c["source"] != "auto"]
@@ -556,7 +556,11 @@ class TestYouTubeMusicCookies:
         """_find_cookies_file returns None or a Path named cookies.txt."""
         from rubetunes.providers.youtube import _find_cookies_file
         result = _find_cookies_file()
-        assert result is None or (result.exists() and result.name == "cookies.txt")
+        if result is None:
+            pass  # file absent — acceptable
+        else:
+            assert result.exists()
+            assert result.name == "cookies.txt"
 
     def test_cookies_appended_to_search_cmd_when_file_exists(self, tmp_path):
         """--cookies is appended to yt-dlp search cmd when _find_cookies_file returns a path."""
