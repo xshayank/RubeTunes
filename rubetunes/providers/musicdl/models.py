@@ -85,7 +85,8 @@ class MusicdlSearchResult:
 class MusicdlDownloadResult:
     """Result of a musicdl download operation."""
 
-    track: MusicdlTrack = field(default_factory=MusicdlTrack)
+    track: MusicdlTrack | None = None
+    """The downloaded track's metadata, or ``None`` if the download failed before a track was resolved."""
     file_path: Path = field(default_factory=Path)
     success: bool = False
     error: str = ""

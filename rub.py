@@ -2865,7 +2865,7 @@ async def _musicdl_sources(object_guid: str, log) -> None:
         return
     try:
         client = MusicdlClient()
-        sources = await asyncio.get_event_loop().run_in_executor(None, client.list_sources)
+        sources = client.list_sources()
         lines = ["🎵 musicdl registered sources ({} total):".format(len(sources)), ""]
         lines.extend("  • {}".format(s) for s in sources)
         await app.send_message(object_guid, "\n".join(lines))

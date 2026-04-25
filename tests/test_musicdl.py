@@ -239,9 +239,6 @@ class TestMusicdlSearch:
         from rubetunes.providers.musicdl.client import MusicdlClient
         from rubetunes.providers.musicdl.errors import MusicdlNotInstalledError
 
-        def _raise():
-            raise MusicdlNotInstalledError()
-
         with patch.object(client_mod, "_import_musicdl", side_effect=MusicdlNotInstalledError):
             c = MusicdlClient(sources=["NeteaseMusicClient"])
             with pytest.raises(MusicdlNotInstalledError):
