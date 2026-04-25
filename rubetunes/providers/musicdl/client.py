@@ -33,6 +33,44 @@ __all__ = ["MusicdlClient"]
 
 log = logging.getLogger(__name__)
 
+AUDIO_EXTS: frozenset[str] = frozenset({".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac"})
+
+
+def _find_downloaded_file(
+    dirs: list[Path],
+    song_name: str,
+    existing: frozenset[Path],
+) -> Path | None:
+    """Return the most recently modified audio file under any of *dirs*.
+
+    Prefers files that were not present in *existing* (i.e. written during
+    the download).  Falls back to a name-based match, then to the newest
+    file overall.
+    """
+    candidates: list[Path] = []
+    for d in dirs:
+        if not d.exists():
+            continue
+        for p in d.rglob("*"):
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+                candidates.append(p)
+    if not candidates:
+        return None
+
+    # Prefer files that weren't there before the download
+    new_candidates = [p for p in candidates if p not in existing]
+    if new_candidates:
+        candidates = new_candidates
+
+    # Prefer files whose stem contains the song_name (best-effort)
+    if song_name:
+        name_matches = [p for p in candidates if song_name.lower() in p.stem.lower()]
+        if name_matches:
+            candidates = name_matches
+
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
 
 def _import_musicdl() -> Any:
     """Lazy-import musicdl.MusicClient; raises MusicdlNotInstalledError if absent."""
@@ -202,7 +240,31 @@ class MusicdlClient:
             effective_dir,
         )
         effective_dir.mkdir(parents=True, exist_ok=True)
+
+        # Snapshot audio files present BEFORE the download so we can identify
+        # the file that musicdl writes (it doesn't populate file_path on SongInfo).
+        if effective_dir.exists():
+            existing_files: frozenset[Path] = frozenset(
+                p for p in effective_dir.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXTS
+            )
+        else:
+            existing_files = frozenset()
+
         result_track: MusicdlTrack = await asyncio.to_thread(_blocking_download)
+
+        # If musicdl didn't populate file_path (the common case), locate the
+        # newly written audio file by scanning effective_dir recursively.
+        if not result_track.file_path:
+            dirs_to_scan: list[Path] = [effective_dir]
+            if track.source:
+                source_subdir = effective_dir / track.source
+                if source_subdir != effective_dir:
+                    dirs_to_scan.append(source_subdir)
+            resolved = _find_downloaded_file(dirs_to_scan, track.song_name, existing_files)
+            if resolved:
+                result_track.file_path = str(resolved)
+                log.debug("musicdl: resolved file_path via disk scan → %s", resolved)
+
         fp = Path(result_track.file_path) if result_track.file_path else effective_dir
         return MusicdlDownloadResult(
             track=result_track,
