@@ -1471,8 +1471,10 @@ async def _do_batch_download(
                 )
                 await app.send_message(
                     object_guid,
-                    "📦 Upload of part {}/{} failed. Will retry automatically every hour. "
-                    "Send !uploads to see status, or !uploads cancel <id> to drop it.".format(i, n_parts),
+                    "📦 Upload of part {}/{} failed ({}). Will retry automatically every hour. "
+                    "Send !uploads to see status, or !uploads cancel <id> to drop it.".format(
+                        i, n_parts, exc
+                    ),
                 )
             finally:
                 if zip_path.exists():
@@ -3087,7 +3089,7 @@ async def _musicdl_pick(object_guid: str, choice: int, log) -> None:
     fp = dl_result.file_path
     log.info("musicdl download ok | file=%s | guid=%s", fp, object_guid)
     await app.edit_message(object_guid, status_id, "📤 Uploading…")
-    upload_queued = False
+    file_moved_to_retry = False
     try:
         try:
             with fp.open("rb") as f:
@@ -3104,7 +3106,7 @@ async def _musicdl_pick(object_guid: str, choice: int, log) -> None:
                 provider="musicdl",
                 exc=exc,
             )
-            upload_queued = True
+            file_moved_to_retry = True
             await app.edit_message(
                 object_guid, status_id,
                 "📦 Upload failed. Will retry automatically every hour. "
@@ -3112,7 +3114,7 @@ async def _musicdl_pick(object_guid: str, choice: int, log) -> None:
             )
     finally:
         # Only clean up the file if it wasn't moved to the retry queue
-        if not upload_queued:
+        if not file_moved_to_retry:
             try:
                 if fp.exists():
                     fp.unlink()

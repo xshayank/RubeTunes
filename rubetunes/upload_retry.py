@@ -53,7 +53,7 @@ _QUEUE_FILE: Path = _BASE_DIR / "upload_retry_queue.json"
 
 # Attempt numbers on which to notify the user after the initial failure.
 # Roughly: 1st retry (2), 5th retry (6), 24th retry, 168th retry.
-_NOTIFY_ATTEMPTS: frozenset[int] = frozenset({1, 2, 6, 24, 168})
+_NOTIFY_ATTEMPTS: frozenset[int] = frozenset({2, 6, 24, 168})
 
 # ---------------------------------------------------------------------------
 # In-memory queue — protected by a simple asyncio.Lock
