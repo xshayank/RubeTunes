@@ -105,7 +105,76 @@ class TestParseAmazonTrackId:
 
 
 # ===========================================================================
-# 2.  _resolve_deezer
+# 2.  TOTP generator — mirrors spotbye/SpotiFLAC backend/spotify_totp.go
+#
+# SpotiFLAC uses HMAC-SHA1 TOTP (RFC 6238) with the Spotify web-player
+# secret and a 30-second time step.  The expected codes below were computed
+# independently with the same algorithm to confirm byte-for-byte parity.
+# ===========================================================================
+
+class TestTOTPGenerator:
+    """Verify _totp() matches SpotiFLAC's generateSpotifyTOTP() for known inputs."""
+
+    SECRET = sdl._SPOTIFY_TOTP_SECRET
+
+    def test_known_timestamp_1(self):
+        """t=1700000000 → counter 56666666 → '371599'."""
+        assert sdl._totp(self.SECRET, server_time=1700000000) == "371599"
+
+    def test_known_timestamp_2(self):
+        """t=1700000030 (next 30-second window) → counter 56666667 → '947302'."""
+        assert sdl._totp(self.SECRET, server_time=1700000030) == "947302"
+
+    def test_known_timestamp_epoch(self):
+        """t=0 → counter 0 → '204513'."""
+        assert sdl._totp(self.SECRET, server_time=0) == "204513"
+
+    def test_known_timestamp_round(self):
+        """t=1000000000 → counter 33333333 → '371947'."""
+        assert sdl._totp(self.SECRET, server_time=1000000000) == "371947"
+
+    def test_output_is_six_digits(self):
+        """Output is always exactly 6 decimal digits (zero-padded)."""
+        code = sdl._totp(self.SECRET, server_time=1700000000)
+        assert len(code) == 6
+        assert code.isdigit()
+
+    def test_same_window_produces_same_code(self):
+        """Two timestamps in the same 30-second window yield the same code."""
+        t_base = 1700000060
+        assert sdl._totp(self.SECRET, server_time=t_base) == sdl._totp(self.SECRET, server_time=t_base + 29)
+
+    def test_adjacent_windows_differ(self):
+        """Adjacent 30-second windows (typically) produce different codes."""
+        t = 1700000000
+        code_a = sdl._totp(self.SECRET, server_time=t)
+        code_b = sdl._totp(self.SECRET, server_time=t + 30)
+        assert code_a != code_b, "Adjacent windows should produce different TOTP codes"
+
+    def test_totp_version_constant(self):
+        """SpotiFLAC hardcodes totpVer=61; confirm the constant is unchanged."""
+        assert sdl._SPOTIFY_TOTP_VERSION == 61
+
+    def test_secret_constant(self):
+        """The hardcoded TOTP secret must match SpotiFLAC's spotify_totp.go constant."""
+        expected = (
+            "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YT"
+            "CMRUGQ4DQOJUGQYTAMRRGA2TCMJSHE3TCMBY"
+        )
+        assert self.SECRET == expected
+
+    def test_uses_local_clock_when_no_server_time(self):
+        """Without server_time the function uses the real clock and returns 6 digits."""
+        with patch("spotify_dl.time") as mock_time:
+            mock_time.time.return_value = 1700000000
+            code = sdl._totp(self.SECRET)
+        assert len(code) == 6
+        assert code.isdigit()
+        assert code == "371599"
+
+
+# ===========================================================================
+# 3.  _resolve_deezer
 # ===========================================================================
 
 class TestResolveDeezer:
