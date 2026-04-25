@@ -15,9 +15,22 @@ from pathlib import Path
 log = logging.getLogger("spotify_dl")
 
 __all__ = [
+    "_find_cookies_file",
     "_get_youtube_music_url_by_isrc",
     "_download_youtube_music",
 ]
+
+
+def _find_cookies_file() -> Path | None:
+    """Return the cookies.txt at the repo root if present, else None.
+
+    This matches the file _base_cmd() in rub.py uses for the YouTube video
+    downloader, so YouTube Music benefits from the same login state.
+    """
+    # rubetunes/providers/youtube.py → repo root is parents[2]
+    root = Path(__file__).resolve().parents[2]
+    cookies = root / "cookies.txt"
+    return cookies if cookies.exists() else None
 
 
 def _get_youtube_music_url_by_isrc(
@@ -51,16 +64,21 @@ def _get_youtube_music_url_by_isrc(
 def _ytdlp_search(query: str, ytdlp_bin: str) -> str | None:
     """Run a yt-dlp --default-search query and return the first result URL."""
     try:
+        cmd = [
+            ytdlp_bin,
+            "--default-search", "ytsearch1:",
+            "--dump-json",
+            "--quiet",
+            "--no-warnings",
+            "--no-playlist",
+        ]
+        cookies = _find_cookies_file()
+        if cookies:
+            cmd += ["--cookies", str(cookies)]
+            log.debug("using cookies file: %s", cookies)
+        cmd.append(query)
         result = subprocess.run(
-            [
-                ytdlp_bin,
-                "--default-search", "ytsearch1:",
-                "--dump-json",
-                "--quiet",
-                "--no-warnings",
-                "--no-playlist",
-                query,
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=30,
@@ -113,6 +131,10 @@ def _download_youtube_music(
         "--no-warnings",
         "--print", "after_move:filepath",
     ]
+    cookies = _find_cookies_file()
+    if cookies:
+        cmd += ["--cookies", str(cookies)]
+        log.debug("using cookies file: %s", cookies)
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
