@@ -521,7 +521,7 @@ class TestParseFormatHint:
     def test_no_hint_returns_none(self):
         args, quality = self._parse("https://open.spotify.com/track/abc")
         assert quality is None
-        assert "spotify.com" in args
+        assert args == "https://open.spotify.com/track/abc"
 
     def test_unknown_token_returns_none(self):
         _, quality = self._parse("!spotify https://open.spotify.com/track/abc ogg")

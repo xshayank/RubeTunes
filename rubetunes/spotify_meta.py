@@ -108,7 +108,13 @@ DEEZER_ARL            = os.getenv("DEEZER_ARL",            "").strip()
 QOBUZ_EMAIL           = os.getenv("QOBUZ_EMAIL",           "").strip()
 QOBUZ_PASSWORD        = os.getenv("QOBUZ_PASSWORD",        "").strip()
 
-# Hardcoded fallback — override with SPOTIFY_TOTP_SECRET env var if Spotify rotates it.
+# Hardcoded fallback TOTP secret.
+# SECURITY NOTE: This is *not* a user credential or private key.  It is the
+# public Spotify web-player TOTP secret, embedded in Spotify's own client-side
+# JavaScript bundle and widely documented in open-source projects (SpotiFLAC,
+# librespot, etc.).  It allows anonymous read-only access identical to opening
+# open.spotify.com in a browser.  Spotify rotates this value periodically;
+# set SPOTIFY_TOTP_SECRET env var to override without a code change.
 _SPOTIFY_TOTP_SECRET  = "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4DQOJUGQYTAMRRGA2TCMJSHE3TCMBY"
 _SPOTIFY_TOTP_VERSION = 61
 _SPOTIFY_CLIENT_VERSION_FALLBACK = "1.2.52.442.g55a7e7d3"

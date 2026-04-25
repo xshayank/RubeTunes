@@ -216,7 +216,9 @@ def _qobuz_signed_params(path: str, params: dict, creds: dict) -> dict:
             payload += k + str(v)
     payload += timestamp + creds["app_secret"]
 
-    # MD5 is mandated by the Qobuz API wire protocol for request signing — not our choice.
+    # MD5 is mandated by the Qobuz API wire protocol for request integrity signing
+    # (not for cryptographic security). Binds timestamp+path+app-secret for replay protection.
+    # Required by the Qobuz API spec — not our choice.  noqa: S324
     sig = hashlib.md5(payload.encode()).hexdigest()  # noqa: S324
     out = dict(params)
     out["app_id"]      = creds["app_id"]
@@ -329,7 +331,9 @@ def _qobuz_auth_login(email: str, password: str) -> dict | None:
     Uses MD5 hex of the password as required by the Qobuz wire format.
     The result is cached in memory with a 1-hour TTL.
     """
-    # MD5 is mandated by the Qobuz authentication wire protocol — not our choice.
+    # MD5 is mandated by the Qobuz authentication wire protocol for the password field.
+    # SECURITY WARNING: Because Qobuz requires MD5, use a unique password for Qobuz that is
+    # not reused on other services — MD5 is cryptographically broken for password security.
     pw_md5 = hashlib.md5(password.encode()).hexdigest()  # noqa: S324
     try:
         creds = _get_qobuz_api_credentials()
@@ -399,7 +403,7 @@ def _get_qobuz_stream_url_auth(qobuz_track_id: str, quality: int = 6) -> str | N
 
         timestamp  = str(int(time.time()))
         # Qobuz signed request for track/getFileUrl
-        # MD5 is mandated by the Qobuz signing spec — not our choice.
+        # MD5 is mandated by the Qobuz signing spec for request integrity (not security).
         sig_payload = (
             f"trackgetFileUrlformat_id{quality}intentstreamtrack_id{qobuz_track_id}"
             f"{timestamp}{app_secret}"
@@ -632,7 +636,9 @@ def _qobuz_signed_params(path: str, params: dict, creds: dict) -> dict:
             payload += k + str(v)
     payload += timestamp + creds["app_secret"]
 
-    # MD5 is mandated by the Qobuz API wire protocol for request signing — not our choice.
+    # MD5 is mandated by the Qobuz API wire protocol for request integrity signing
+    # (not for cryptographic security). Binds timestamp+path+app-secret for replay protection.
+    # Required by the Qobuz API spec — not our choice.  noqa: S324
     sig = hashlib.md5(payload.encode()).hexdigest()  # noqa: S324
     out = dict(params)
     out["app_id"]      = creds["app_id"]
