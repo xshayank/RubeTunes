@@ -145,7 +145,7 @@ class TestMusicdlPickCleanup:
     def test_file_deleted_after_failed_upload(
         self, tmp_path, mock_app, mock_musicdl_client, pending_selection, monkeypatch
     ):
-        """Upload failure: downloaded file is still removed from disk (no orphans)."""
+        """Upload failure: file is queued for retry (moved to retry dir, not left as orphan)."""
         guid, _ = pending_selection
 
         source_dir = tmp_path / "FakeMusicClient"
@@ -159,10 +159,27 @@ class TestMusicdlPickCleanup:
         # Make send_document raise to simulate an upload failure
         mock_app.send_document.side_effect = RuntimeError("network error")
 
+        # Patch enqueue_failed_upload to record the call and simulate the move
+        import rubetunes.upload_retry as _ur
+        enqueue_calls = []
+
+        def _fake_enqueue(**kwargs):
+            enqueue_calls.append(kwargs)
+            # Simulate the move: delete the source file
+            fp = kwargs["file_path"]
+            if fp.exists():
+                fp.unlink()
+            return "fake-uuid"
+
+        monkeypatch.setattr(_rub._upload_retry, "enqueue_failed_upload", _fake_enqueue)
+
         log = logging.getLogger("test_musicdl_pick")
         asyncio.run(_rub._musicdl_pick(guid, 1, log))
 
-        assert not audio_file.exists(), "Downloaded file should be deleted even when upload fails"
+        assert len(enqueue_calls) == 1, "enqueue_failed_upload should be called once"
+        assert enqueue_calls[0]["provider"] == "musicdl"
+        assert enqueue_calls[0]["object_guid"] == guid
+        assert not audio_file.exists(), "Downloaded file should not be left as an orphan"
 
     def test_empty_source_dir_removed(
         self, tmp_path, mock_app, mock_musicdl_client, pending_selection, monkeypatch
