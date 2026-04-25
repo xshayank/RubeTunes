@@ -395,6 +395,14 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ---
 
+## 📚 Documentation
+
+| Document | Description |
+|----------|-------------|
+| [`docs/SPOTIFLAC_COMPARISON.md`](docs/SPOTIFLAC_COMPARISON.md) | Full side-by-side backend comparison between SpotiFLAC and RubeTunes — auth chain, TOTP, GraphQL, providers, downloads, routes, deps, docker, and port checklist |
+
+---
+
 ## 📄 License
 
 MIT © xshayank
