@@ -129,7 +129,7 @@ class TestTOTPGenerator:
         """t=0 → counter 0 → '204513'."""
         assert sdl._totp(self.SECRET, server_time=0) == "204513"
 
-    def test_known_timestamp_round(self):
+    def test_known_timestamp_billion(self):
         """t=1000000000 → counter 33333333 → '371947'."""
         assert sdl._totp(self.SECRET, server_time=1000000000) == "371947"
 
@@ -141,7 +141,9 @@ class TestTOTPGenerator:
 
     def test_same_window_produces_same_code(self):
         """Two timestamps in the same 30-second window yield the same code."""
-        t_base = 1700000060
+        # Use a multiple-of-30 base so +29 stays within the same window.
+        # 1700000040 = 56666668 × 30, so [1700000040, 1700000069] all share counter 56666668.
+        t_base = 1700000040
         assert sdl._totp(self.SECRET, server_time=t_base) == sdl._totp(self.SECRET, server_time=t_base + 29)
 
     def test_adjacent_windows_differ(self):
@@ -165,7 +167,7 @@ class TestTOTPGenerator:
 
     def test_uses_local_clock_when_no_server_time(self):
         """Without server_time the function uses the real clock and returns 6 digits."""
-        with patch("spotify_dl.time") as mock_time:
+        with patch("rubetunes.spotify_meta.time") as mock_time:
             mock_time.time.return_value = 1700000000
             code = sdl._totp(self.SECRET)
         assert len(code) == 6
@@ -174,7 +176,200 @@ class TestTOTPGenerator:
 
 
 # ===========================================================================
-# 3.  _resolve_deezer
+# 3.  Spotify 429 / token infrastructure fixes
+#
+# Three root causes of Spotify HTTP 429 "Too Many Requests" errors were
+# identified and fixed:
+#   A) get_token() had no threading lock — concurrent batch-download threads
+#      all refreshed the token simultaneously.
+#   B) _fetch_spotify_server_time() used get_access_token as a fallback — that
+#      URL is a TOTP-gated token endpoint; calling it without TOTP params
+#      triggered 429s on every token refresh.
+#   C) _fetch_anon_token() did not honour Retry-After — it re-raised
+#      immediately, making the retry loop hammer the endpoint.
+# ===========================================================================
+
+class TestSpotify429Fixes:
+    """Regression tests for the three root causes of Spotify HTTP 429 errors."""
+
+    # -----------------------------------------------------------------------
+    # A) Token lock prevents concurrent refreshes
+    # -----------------------------------------------------------------------
+
+    def test_token_lock_exists(self):
+        """_token_lock must be a threading.Lock so concurrent threads serialise."""
+        import threading
+        assert isinstance(sdl._token_lock, type(threading.Lock()))
+
+    def test_get_token_returns_cached_without_lock_contention(self):
+        """get_token() returns from the fast path (cache) without any network call."""
+        import threading
+        original_cache = dict(sdl._token_cache)
+        sdl._token_cache.update({"token": "tok_cached", "expires_at": time.time() + 3600})
+        try:
+            result = sdl.get_token()
+            assert result == "tok_cached"
+        finally:
+            sdl._token_cache.clear()
+            sdl._token_cache.update(original_cache)
+
+    def test_concurrent_token_refreshes_serialised(self):
+        """Only one real token fetch happens when multiple threads call get_token()."""
+        import threading
+
+        fetch_count = {"n": 0}
+
+        def counting_fetch():
+            fetch_count["n"] += 1
+            # Simulate the cache being written as a real fetch would do
+            sdl._token_cache.update({"token": "tok_concurrent", "expires_at": time.time() + 3600})
+            return ("tok_concurrent", time.time() + 3600)
+
+        # Ensure both in-memory and disk caches are empty so threads need to refresh
+        original_cache = dict(sdl._token_cache)
+        sdl._token_cache.clear()
+
+        errors = []
+        results = []
+
+        def worker():
+            try:
+                with (
+                    patch("rubetunes.spotify_meta._fetch_anon_token", counting_fetch),
+                    patch("rubetunes.spotify_meta._load_spotify_token", return_value={}),
+                    patch("rubetunes.spotify_meta._save_spotify_token"),
+                ):
+                    tok = sdl.get_token()
+                results.append(tok)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        sdl._token_cache.clear()
+        sdl._token_cache.update(original_cache)
+
+        assert not errors, f"Workers raised errors: {errors}"
+        # All workers must have gotten a token
+        assert len(results) == 5
+        # The lock + double-check means only ONE actual fetch should fire;
+        # the remaining threads find the cache populated inside the lock.
+        assert fetch_count["n"] == 1, (
+            f"Expected exactly 1 token fetch (lock serialises), got {fetch_count['n']}"
+        )
+
+    # -----------------------------------------------------------------------
+    # B) _fetch_spotify_server_time() no longer falls back to get_access_token
+    # -----------------------------------------------------------------------
+
+    @resp_lib.activate
+    def test_server_time_only_hits_api_server_time(self):
+        """_fetch_spotify_server_time() only calls /api/server-time, never get_access_token."""
+        resp_lib.add(
+            resp_lib.GET,
+            "https://open.spotify.com/api/server-time",
+            json={"serverTime": 1700000000},
+            status=200,
+        )
+        import requests as _req
+        sess = _req.Session()
+        result = sdl._fetch_spotify_server_time(sess)
+        assert result == 1700000000
+        # get_access_token must NOT have been called — if it were, responses
+        # would raise ConnectionError because we didn't register it.
+
+    @resp_lib.activate
+    def test_server_time_returns_none_on_failure_no_fallback(self):
+        """When /api/server-time fails, function returns None without hitting any other URL."""
+        resp_lib.add(
+            resp_lib.GET,
+            "https://open.spotify.com/api/server-time",
+            status=503,
+        )
+        import requests as _req
+        sess = _req.Session()
+        result = sdl._fetch_spotify_server_time(sess)
+        # Must return None — no fallback to get_access_token
+        assert result is None
+
+    # -----------------------------------------------------------------------
+    # C) _fetch_anon_token() honours Retry-After on 429
+    # -----------------------------------------------------------------------
+
+    @resp_lib.activate
+    def test_fetch_anon_token_sleeps_on_429(self):
+        """_fetch_anon_token() sleeps Retry-After seconds and raises RuntimeError on 429."""
+        # Stub session initialisation endpoints
+        resp_lib.add(resp_lib.GET, "https://open.spotify.com",
+                     body="<html></html>", status=200)
+        resp_lib.add(resp_lib.GET, "https://open.spotify.com/api/server-time",
+                     json={"serverTime": 1700000000}, status=200)
+        resp_lib.add(
+            resp_lib.GET,
+            "https://open.spotify.com/api/token",
+            status=429,
+            headers={"Retry-After": "2"},
+        )
+
+        slept = {"seconds": 0.0}
+
+        def fake_sleep(s):
+            slept["seconds"] = s
+
+        with patch("rubetunes.spotify_meta._reset_anon_session"):
+            with patch("rubetunes.spotify_meta._ensure_anon_session") as mock_sess:
+                import requests as _req
+                mock_sess.return_value = _req.Session()
+                with patch("rubetunes.spotify_meta.time") as mock_time:
+                    mock_time.time.return_value = 1700000000
+                    mock_time.sleep = fake_sleep
+                    with pytest.raises(RuntimeError, match="rate-limited"):
+                        sdl._fetch_anon_token()
+
+        assert slept["seconds"] == 2.0, (
+            f"Expected sleep(2) for Retry-After: 2, got sleep({slept['seconds']})"
+        )
+
+    @resp_lib.activate
+    def test_fetch_anon_token_default_sleep_when_no_retry_after(self):
+        """Without Retry-After header, _fetch_anon_token() sleeps the default 5 s."""
+        resp_lib.add(resp_lib.GET, "https://open.spotify.com",
+                     body="<html></html>", status=200)
+        resp_lib.add(resp_lib.GET, "https://open.spotify.com/api/server-time",
+                     json={"serverTime": 1700000000}, status=200)
+        resp_lib.add(
+            resp_lib.GET,
+            "https://open.spotify.com/api/token",
+            status=429,
+            # No Retry-After header
+        )
+
+        slept = {"seconds": 0.0}
+
+        def fake_sleep(s):
+            slept["seconds"] = s
+
+        with patch("rubetunes.spotify_meta._reset_anon_session"):
+            with patch("rubetunes.spotify_meta._ensure_anon_session") as mock_sess:
+                import requests as _req
+                mock_sess.return_value = _req.Session()
+                with patch("rubetunes.spotify_meta.time") as mock_time:
+                    mock_time.time.return_value = 1700000000
+                    mock_time.sleep = fake_sleep
+                    with pytest.raises(RuntimeError, match="rate-limited"):
+                        sdl._fetch_anon_token()
+
+        assert slept["seconds"] == 5.0, (
+            f"Expected default sleep(5), got sleep({slept['seconds']})"
+        )
+
+
+# ===========================================================================
+# 4.  _resolve_deezer
 # ===========================================================================
 
 class TestResolveDeezer:
@@ -213,7 +408,7 @@ class TestResolveDeezer:
 
 
 # ===========================================================================
-# 3.  _resolve_qobuz_by_isrc  (mocks the whole signed-request machinery)
+# 5.  _resolve_qobuz_by_isrc  (mocks the whole signed-request machinery)
 # ===========================================================================
 
 class TestResolveQobuzByIsrc:
@@ -252,7 +447,7 @@ class TestResolveQobuzByIsrc:
 
 
 # ===========================================================================
-# 4.  _resolve_tidal_by_isrc
+# 6.  _resolve_tidal_by_isrc
 # ===========================================================================
 
 class TestResolveTidalByIsrc:
@@ -288,7 +483,7 @@ class TestResolveTidalByIsrc:
 
 
 # ===========================================================================
-# 5.  _get_tidal_alt_url_by_tidal_id — four response shapes
+# 7.  _get_tidal_alt_url_by_tidal_id — four response shapes
 # ===========================================================================
 
 class TestGetTidalAltUrlByTidalId:
@@ -362,7 +557,7 @@ class TestGetTidalAltUrlByTidalId:
 
 
 # ===========================================================================
-# 6.  _download_tidal_manifest — mock segment URLs, assert concatenated bytes
+# 8.  _download_tidal_manifest — mock segment URLs, assert concatenated bytes
 # ===========================================================================
 
 class TestDownloadTidalManifest:
@@ -389,7 +584,7 @@ class TestDownloadTidalManifest:
 
 
 # ===========================================================================
-# 7.  Circuit breaker state machine (monkey-patch time.time)
+# 9.  Circuit breaker state machine (monkey-patch time.time)
 # ===========================================================================
 
 class TestCircuitBreaker:
@@ -473,7 +668,7 @@ class TestCircuitBreaker:
 
 
 # ===========================================================================
-# 8.  LRU cache correctness and TTL expiry (monkey-patch time.time)
+# 10.  LRU cache correctness and TTL expiry (monkey-patch time.time)
 # ===========================================================================
 
 class TestTrackInfoCache:
@@ -529,7 +724,7 @@ class TestTrackInfoCache:
 
 
 # ===========================================================================
-# 9.  New Spotify URL parsers
+# 11.  New Spotify URL parsers
 # ===========================================================================
 
 _BARE_22 = "4iV5W9uYEdYUVa79Axb7Rh"  # valid 22-char base62 id
