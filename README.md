@@ -16,6 +16,10 @@
 
 ---
 
+> See [`docs/SPOTIFLAC_COMPARISON.md`](docs/SPOTIFLAC_COMPARISON.md) for a full backend-parity comparison with spotbye/SpotiFLAC.
+
+---
+
 ## 🌟 What is RubeTunes?
 
 **RubeTunes** is a self-hosted Rubika bot that lets you send any YouTube, Spotify, Qobuz, Tidal,
