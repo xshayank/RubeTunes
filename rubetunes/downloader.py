@@ -514,13 +514,6 @@ def _download_musicdl(info: dict, output_dir: Path) -> Path:
         track = result.tracks[0]
         dl = await client.download(track, dest_dir=output_dir)
         if not dl.success or not dl.file_path:
-            # Belt-and-braces: scan output_dir for any audio file created during
-            # the download window (covers edge cases the client-level fix may miss).
-            if dl.error == "No file path in result":
-                from rubetunes.providers.musicdl.client import AUDIO_EXTS, _find_downloaded_file
-                resolved = _find_downloaded_file([output_dir], "", frozenset())
-                if resolved:
-                    return resolved
             raise DownloadError("musicdl", dl.error or "Download failed")
         return Path(dl.file_path)
 
