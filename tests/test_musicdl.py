@@ -107,7 +107,9 @@ class TestConfig:
         import rubetunes.providers.musicdl.config as cfg_module
 
         monkeypatch.setattr(cfg_module, "MUSICDL_PROXY", None)
-        assert cfg_module.build_requests_overrides() == {}
+        overrides = cfg_module.build_requests_overrides()
+        assert "timeout" in overrides
+        assert "proxies" not in overrides
 
     def test_build_requests_overrides_with_proxy(self, monkeypatch):
         import rubetunes.providers.musicdl.config as cfg_module

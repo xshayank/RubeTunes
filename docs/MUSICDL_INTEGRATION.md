@@ -25,6 +25,9 @@ system-level `nodejs` installation for most sources.
 | `MUSICDL_DOWNLOAD_DIR` | `<repo>/downloads/musicdl` | Directory where downloaded files are saved. |
 | `MUSICDL_DEFAULT_SOURCES` | *(musicdl upstream defaults)* | Comma-separated source client names, e.g. `NeteaseMusicClient,QQMusicClient`. Leave empty to use musicdl's own defaults. |
 | `MUSICDL_PROXY` | *(none)* | HTTP/HTTPS proxy URL for all musicdl requests, e.g. `http://user:pass@host:8080`. |
+| `MUSICDL_MAX_RETRIES` | `1` | Per-request retry count for every musicdl source. Lower than musicdl's default of 3 for faster failover on dead sources. |
+| `MUSICDL_CONNECT_TIMEOUT` | `5` | Seconds to wait for a TCP connection to a musicdl source endpoint. |
+| `MUSICDL_READ_TIMEOUT` | `15` | Seconds to wait for the response body from a musicdl source endpoint. |
 
 Add these to your `.env` file:
 
@@ -33,7 +36,24 @@ Add these to your `.env` file:
 MUSICDL_DOWNLOAD_DIR=/app/downloads/musicdl
 MUSICDL_DEFAULT_SOURCES=NeteaseMusicClient,QQMusicClient,KuwoMusicClient
 MUSICDL_PROXY=
+# MUSICDL_MAX_RETRIES=1
+# MUSICDL_CONNECT_TIMEOUT=5
+# MUSICDL_READ_TIMEOUT=15
 ```
+
+### Tuning timeouts and retries
+
+- **`MUSICDL_MAX_RETRIES`** controls how many times each HTTP request is retried before
+  giving up.  Lowering it (e.g. `1`) means faster failover when a source endpoint is dead
+  or unreachable — the source is skipped sooner instead of blocking the queue.
+- **`MUSICDL_READ_TIMEOUT`** is the most impactful knob for stuck downloads of large files.
+  If you have a slow connection and FLAC downloads of long tracks get cut off, raise it
+  (e.g. `60`).
+- **`MUSICDL_CONNECT_TIMEOUT`** governs only the initial TCP handshake.  A value of `5`
+  seconds is enough for nearly all reachable servers; raise it only if your network has
+  high latency.
+- These values apply to **every** source uniformly.  Per-source overrides are not
+  currently supported.
 
 ---
 

@@ -16,9 +16,12 @@ Exposes:
 
 from rubetunes.providers.musicdl.client import MusicdlClient
 from rubetunes.providers.musicdl.config import (
+    MUSICDL_CONNECT_TIMEOUT,
     MUSICDL_DEFAULT_SOURCES,
     MUSICDL_DOWNLOAD_DIR,
+    MUSICDL_MAX_RETRIES,
     MUSICDL_PROXY,
+    MUSICDL_READ_TIMEOUT,
 )
 from rubetunes.providers.musicdl.errors import (
     MusicdlDownloadError,
@@ -39,6 +42,9 @@ __all__ = [
     "MUSICDL_DOWNLOAD_DIR",
     "MUSICDL_DEFAULT_SOURCES",
     "MUSICDL_PROXY",
+    "MUSICDL_MAX_RETRIES",
+    "MUSICDL_CONNECT_TIMEOUT",
+    "MUSICDL_READ_TIMEOUT",
     # Models
     "MusicdlTrack",
     "MusicdlSearchResult",

@@ -16,18 +16,91 @@ MUSICDL_DEFAULT_SOURCES
 MUSICDL_PROXY
     Optional HTTP/HTTPS proxy URL applied to all musicdl requests
     (e.g. ``http://user:pass@host:port``).
+MUSICDL_MAX_RETRIES
+    Per-request retry count for every musicdl source.  Defaults to ``1``
+    (lower than musicdl's upstream default of 3 for faster failover).
+    Set to ``0`` or a negative number to use the default.
+MUSICDL_CONNECT_TIMEOUT
+    Seconds to wait for a TCP connection to a musicdl source endpoint.
+    Defaults to ``5``.  Set to ``0`` or a negative number to use the default.
+MUSICDL_READ_TIMEOUT
+    Seconds to wait for the response body from a musicdl source endpoint.
+    Defaults to ``15``.  Set to ``0`` or a negative number to use the default.
 """
 
+import logging
 import os
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "MUSICDL_DOWNLOAD_DIR",
     "MUSICDL_DEFAULT_SOURCES",
     "MUSICDL_PROXY",
+    "MUSICDL_MAX_RETRIES",
+    "MUSICDL_CONNECT_TIMEOUT",
+    "MUSICDL_READ_TIMEOUT",
     "build_init_cfg",
     "build_requests_overrides",
 ]
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_positive_int(env_var: str, default: int) -> int:
+    """Read *env_var* as a positive integer, falling back to *default* on error."""
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        log.warning(
+            "MUSICDL: invalid value %r for %s (must be a positive integer); using default %d",
+            raw,
+            env_var,
+            default,
+        )
+        return default
+    if val <= 0:
+        log.warning(
+            "MUSICDL: invalid value %r for %s (must be > 0); using default %d",
+            raw,
+            env_var,
+            default,
+        )
+        return default
+    return val
+
+
+def _parse_positive_float(env_var: str, default: float) -> float:
+    """Read *env_var* as a positive float, falling back to *default* on error."""
+    raw = os.getenv(env_var, "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        log.warning(
+            "MUSICDL: invalid value %r for %s (must be a positive number); using default %.1f",
+            raw,
+            env_var,
+            default,
+        )
+        return default
+    if val <= 0:
+        log.warning(
+            "MUSICDL: invalid value %r for %s (must be > 0); using default %.1f",
+            raw,
+            env_var,
+            default,
+        )
+        return default
+    return val
+
 
 # ---------------------------------------------------------------------------
 # Resolved configuration values
@@ -46,6 +119,15 @@ MUSICDL_DEFAULT_SOURCES: list[str] = (
 
 MUSICDL_PROXY: str | None = os.getenv("MUSICDL_PROXY", "").strip() or None
 
+MUSICDL_MAX_RETRIES: int = _parse_positive_int("MUSICDL_MAX_RETRIES", 1)
+"""Per-request retry count for every musicdl source (default: 1)."""
+
+MUSICDL_CONNECT_TIMEOUT: float = _parse_positive_float("MUSICDL_CONNECT_TIMEOUT", 5.0)
+"""Seconds to wait for TCP connect to a musicdl source (default: 5)."""
+
+MUSICDL_READ_TIMEOUT: float = _parse_positive_float("MUSICDL_READ_TIMEOUT", 15.0)
+"""Seconds to wait for response body from a musicdl source (default: 15)."""
+
 
 # ---------------------------------------------------------------------------
 # Config dict builders
@@ -60,6 +142,7 @@ def build_init_cfg(source: str) -> dict:
         "disable_print": True,
         "auto_set_proxies": False,
         "random_update_ua": False,
+        "max_retries": MUSICDL_MAX_RETRIES,
     }
     return cfg
 
@@ -67,10 +150,13 @@ def build_init_cfg(source: str) -> dict:
 def build_requests_overrides() -> dict:
     """Return a ``requests_overrides`` dict suitable for MusicClient.
 
-    If ``MUSICDL_PROXY`` is set, every source will route its HTTP calls
-    through that proxy.
+    Always includes a ``timeout`` tuple ``(connect, read)`` so musicdl
+    sources never hang indefinitely on unresponsive endpoints.  If
+    ``MUSICDL_PROXY`` is also set, a ``proxies`` key is included.
     """
-    if not MUSICDL_PROXY:
-        return {}
-    proxy_cfg = {"proxies": {"http": MUSICDL_PROXY, "https": MUSICDL_PROXY}}
-    return proxy_cfg
+    overrides: dict = {
+        "timeout": (MUSICDL_CONNECT_TIMEOUT, MUSICDL_READ_TIMEOUT),
+    }
+    if MUSICDL_PROXY:
+        overrides["proxies"] = {"http": MUSICDL_PROXY, "https": MUSICDL_PROXY}
+    return overrides
