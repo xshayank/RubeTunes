@@ -46,6 +46,15 @@ try:
 except ImportError:
     _HAS_BANDCAMP = False
 
+try:
+    from rubetunes.providers.musicdl import MusicdlClient
+    from rubetunes.providers.musicdl.errors import MusicdlNotInstalledError
+    _HAS_MUSICDL = True
+except ImportError:
+    _HAS_MUSICDL = False
+    MusicdlClient = None  # type: ignore[assignment,misc]
+    MusicdlNotInstalledError = None  # type: ignore[assignment,misc]
+
 load_dotenv()
 
 logging.basicConfig(
@@ -2770,7 +2779,226 @@ async def bandcamp_handler(update):
         )
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# musicdl commands
+# ---------------------------------------------------------------------------
+
+# Pending musicdl search selections: {object_guid: {"tracks": [...], "timeout_task": ...}}
+_musicdl_selections: dict = {}
+
+
+@app.on_message_updates(filters.commands("musicdl", prefixes="!"))
+async def musicdl_handler(update):
+    """
+    Multi-source music downloader via musicdl.
+
+    Usage:
+      !musicdl sources              — list all available musicdl sources
+      !musicdl search <query>       — search for tracks
+      !musicdl search <query> [src] — search a specific source (e.g. NeteaseMusicClient)
+    After a search, reply with a number to download that track.
+    """
+    log = logging.getLogger("musicdl")
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    args = update.command[1:] if update.command and len(update.command) > 1 else []
+    subcmd = args[0].lower() if args else ""
+
+    if not subcmd or subcmd == "help":
+        await app.send_message(
+            object_guid,
+            "🎵 musicdl — multi-source music downloader\n\n"
+            "Commands:\n"
+            "  !musicdl sources             — list available sources\n"
+            "  !musicdl search <query>      — search across default sources\n"
+            "  !musicdl search <query> [src]— search a specific source\n\n"
+            "After !musicdl search, reply with a number to download.\n"
+            "Sources: Netease, QQ, Kuwo, Migu, Kugou, Deezer, Qobuz, Tidal, Spotify, …"
+        )
+        return
+
+    if subcmd == "sources":
+        await _musicdl_sources(object_guid, log)
+        return
+
+    if subcmd == "search":
+        query_parts = args[1:]
+        if not query_parts:
+            await app.send_message(object_guid, "❌ Usage: !musicdl search <query>")
+            return
+        # Last token may be a source name (ends with MusicClient)
+        sources = None
+        if query_parts and query_parts[-1].endswith("MusicClient"):
+            sources = [query_parts[-1]]
+            query_parts = query_parts[:-1]
+        query = " ".join(query_parts)
+        if not query:
+            await app.send_message(object_guid, "❌ Usage: !musicdl search <query>")
+            return
+        await _musicdl_search(object_guid, query, sources, log)
+        return
+
+    # Otherwise try to parse as a number (selection after a search)
+    try:
+        choice = int(subcmd)
+    except ValueError:
+        await app.send_message(
+            object_guid,
+            "❌ Unknown musicdl subcommand. Try !musicdl help"
+        )
+        return
+    await _musicdl_pick(object_guid, choice, log)
+
+
+async def _musicdl_sources(object_guid: str, log) -> None:
+    """Handle !musicdl sources."""
+    if not _HAS_MUSICDL:
+        await app.send_message(
+            object_guid,
+            "❌ musicdl is not installed. Install it with: pip install musicdl==2.11.1"
+        )
+        return
+    try:
+        client = MusicdlClient()
+        sources = await asyncio.get_event_loop().run_in_executor(None, client.list_sources)
+        lines = ["🎵 musicdl registered sources ({} total):".format(len(sources)), ""]
+        lines.extend("  • {}".format(s) for s in sources)
+        await app.send_message(object_guid, "\n".join(lines))
+    except Exception as exc:
+        log.error("musicdl sources error: %s", exc)
+        await app.send_message(object_guid, f"❌ Could not list musicdl sources: {exc}")
+
+
+async def _musicdl_search(
+    object_guid: str, query: str, sources: list | None, log
+) -> None:
+    """Handle !musicdl search."""
+    if not _HAS_MUSICDL:
+        await app.send_message(
+            object_guid,
+            "❌ musicdl is not installed. Install it with: pip install musicdl==2.11.1"
+        )
+        return
+
+    # Cancel any previous pending selection
+    old = _musicdl_selections.pop(object_guid, None)
+    if old and old.get("timeout_task"):
+        old["timeout_task"].cancel()
+
+    status = await app.send_message(object_guid, f"🔍 Searching musicdl for: {query!r}…")
+    status_id = status.message_id
+
+    try:
+        client = MusicdlClient(sources=sources)
+        result = await client.search(query, sources=sources, limit=10)
+    except Exception as exc:
+        log.error("musicdl search error: %s", exc)
+        await app.edit_message(object_guid, status_id, f"❌ musicdl search failed: {exc}")
+        return
+
+    if not result.tracks:
+        await app.edit_message(
+            object_guid, status_id,
+            f"🔍 No results found for {query!r} on musicdl."
+        )
+        return
+
+    lines = [f"🎵 musicdl results for {query!r} ({result.total} tracks):"]
+    for i, track in enumerate(result.tracks[:15], 1):
+        src_short = track.source.replace("MusicClient", "")
+        ext_hint = f" [{track.ext.upper()}]" if track.ext else ""
+        lines.append(
+            f"  {i}. {track.display_title} — {track.album} [{src_short}{ext_hint}]"
+        )
+    lines += ["", "Reply !musicdl <number> to download, or !musicdl search <new query>"]
+
+    await app.edit_message(object_guid, status_id, "\n".join(lines))
+
+    async def _expire():
+        await asyncio.sleep(300)
+        _musicdl_selections.pop(object_guid, None)
+
+    timeout_task = asyncio.create_task(_expire())
+    _musicdl_selections[object_guid] = {
+        "tracks": result.tracks[:15],
+        "timeout_task": timeout_task,
+    }
+    log.info("musicdl search done | %d results | guid=%s", result.total, object_guid)
+
+
+async def _musicdl_pick(object_guid: str, choice: int, log) -> None:
+    """Download the track chosen after !musicdl search."""
+    pending = _musicdl_selections.get(object_guid)
+    if not pending:
+        await app.send_message(
+            object_guid,
+            "❌ No active musicdl search. Use !musicdl search <query> first."
+        )
+        return
+
+    tracks = pending.get("tracks", [])
+    if choice < 1 or choice > len(tracks):
+        await app.send_message(
+            object_guid,
+            f"❌ Please enter a number between 1 and {len(tracks)}."
+        )
+        return
+
+    track = tracks[choice - 1]
+    # Remove selection so a second press doesn't trigger a second download
+    _musicdl_selections.pop(object_guid, None)
+    if pending.get("timeout_task"):
+        pending["timeout_task"].cancel()
+
+    # Rate limit
+    if _HAS_RATE_LIMITER:
+        ok, msg = check_rate_limit(object_guid)
+        if not ok:
+            await app.send_message(object_guid, f"🚦 {msg}")
+            return
+
+    status = await app.send_message(
+        object_guid,
+        f"⬇️ Downloading: {track.display_title} via {track.source.replace('MusicClient', '')}…"
+    )
+    status_id = status.message_id
+
+    try:
+        client = MusicdlClient()
+        dl_result = await client.download(track)
+    except Exception as exc:
+        log.error("musicdl download error: %s", exc)
+        await app.edit_message(object_guid, status_id, f"❌ musicdl download failed: {exc}")
+        return
+
+    if not dl_result.success or not dl_result.file_path.exists():
+        await app.edit_message(
+            object_guid, status_id,
+            f"❌ musicdl download failed: {dl_result.error or 'file not found'}"
+        )
+        return
+
+    if _HAS_RATE_LIMITER:
+        record_usage(object_guid)
+
+    fp = dl_result.file_path
+    log.info("musicdl download ok | file=%s | guid=%s", fp, object_guid)
+    await app.edit_message(object_guid, status_id, "📤 Uploading…")
+    try:
+        with fp.open("rb") as f:
+            await app.send_document(object_guid, file=f, file_name=fp.name)
+        await app.delete_messages(object_guid, [status_id])
+    except Exception as exc:
+        log.error("musicdl upload failed: %s", exc)
+        await app.edit_message(object_guid, status_id, f"❌ Upload failed: {exc}")
+
+
+
     _restore_queue_snapshot()
     print("[rub] Connecting to Rubika...")
     try:

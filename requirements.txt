@@ -8,3 +8,6 @@ python-json-logger>=2.0
 prometheus-client>=0.20
 sentry-sdk>=2.0
 httpx>=0.27.0
+# musicdl — multi-source music downloader (CharlesPikachu/musicdl, PolyForm-Noncommercial-1.0.0)
+# Lazy-imported in rubetunes/providers/musicdl/; a missing install only disables musicdl routes.
+musicdl==2.11.1

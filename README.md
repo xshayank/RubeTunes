@@ -38,6 +38,7 @@ directly in your Rubika chat.
 | **SoundCloud** | MP3 | Direct URL download via yt-dlp |
 | **Bandcamp** | FLAC / MP3 | Direct URL download via yt-dlp |
 | **YouTube Music** | MP3 | Always available as fallback |
+| **musicdl sources** | MP3 / FLAC | 40+ sources: Netease, QQ, Kuwo, Kugou, Migu, Deezer, Qobuz, Tidal, Spotify, Apple, … via `!musicdl` |
 
 ### 📺 Video
 
@@ -57,6 +58,7 @@ directly in your Rubika chat.
 | 💾 **Download History** | Repeat requests reuse cached files |
 | 📊 **Prometheus Metrics** | `/metrics` endpoint on port 9090 |
 | 🔒 **Admin Controls** | Whitelist, ban, logs, health check, cache management |
+| 🎵 **`!musicdl`** | Multi-source music search \& download (40+ platforms via musicdl) |
 | �� **Structured Logging** | JSON logs via `LOG_FORMAT=json` |
 | 🛡️ **Rate Limiting** | Per-user rolling-hour track limit |
 | 💾 **Disk Guard** | Rejects batches if insufficient disk space |
@@ -448,3 +450,49 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 ## 📄 License
 
 MIT © xshayank
+
+---
+
+## 🎵 musicdl Integration
+
+RubeTunes ships an optional **musicdl** backend that brings 40+ music platforms to the bot
+via the [CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl) library.
+
+### Bot commands
+
+| Command | Description |
+|---|---|
+| `!musicdl sources` | List all registered source client names |
+| `!musicdl search <query>` | Search across default sources |
+| `!musicdl search <query> <SrcMusicClient>` | Search a specific source |
+| `!musicdl <number>` | Download a track from the last search result |
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `MUSICDL_DOWNLOAD_DIR` | `downloads/musicdl` | Directory for downloaded files |
+| `MUSICDL_DEFAULT_SOURCES` | *(musicdl defaults)* | Comma-separated source list |
+| `MUSICDL_PROXY` | *(none)* | HTTP/HTTPS proxy for all musicdl requests |
+
+### Supported sources (as of v2.11.1)
+
+QQ, Netease, Kuwo, Kugou, Migu, Qianqian, Bilibili, Fivesing, Soda, StreetVoice,
+Spotify, Deezer, Qobuz, Tidal, Apple Music, YouTube Music, JOOX, SoundCloud, Jamendo,
+Free Music Archive, Ximalaya, Lizhi, Qingting, LRTS, GDStudio, TuneHub, MP3Juice,
+MyFreeMP3, JBSou, and many more.  Use `!musicdl sources` to see the full live list.
+
+### Installation
+
+```bash
+pip install musicdl==2.11.1
+```
+
+musicdl bundles a Node.js binary via `nodejs-wheel` — no system `nodejs` required.
+
+See [`docs/MUSICDL_INTEGRATION.md`](docs/MUSICDL_INTEGRATION.md) for full setup,
+proxy configuration, geo-restriction notes, and known limitations.
+
+> **Attribution**: musicdl is developed by [Zhenchao Jin (CharlesPikachu)](https://github.com/CharlesPikachu/musicdl)
+> and licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/).
+> Commercial use of musicdl is **prohibited** per upstream license terms.
