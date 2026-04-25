@@ -328,7 +328,57 @@ Backend auth flow, TOTP secret/version, and GraphQL persisted-query hashes porte
 
 ---
 
+## 🎵 Monochrome/Tidal Backend Port
 
+This repo includes a full port of the backend logic from
+**[monochrome-music/monochrome](https://github.com/monochrome-music/monochrome)**
+(itself a fork of [edideaur/monochrome](https://github.com/edideaur/monochrome))
+— a JavaScript/Bun/Vite application that streams and downloads Hi-Res FLACs
+from Tidal.
+
+### New module
+
+```
+rubetunes/providers/monochrome/
+├── __init__.py      # Public exports
+├── constants.py     # Base URLs, client ID/secret, proxy instances, quality maps
+├── models.py        # Dataclass models (Track, Album, Playlist, Artist, ...)
+├── auth.py          # Client-credentials token bootstrap + on-disk cache
+├── client.py        # Async httpx client: search, track, album, playlist, artist, stream
+├── manifest.py      # Streaming manifest parser (BTS JSON / DASH MPD / HLS)
+└── download.py      # Track download helper with mutagen tag embedding
+```
+
+### API summary
+
+| Feature | Endpoints |
+|---------|-----------|
+| Auth | POST `https://auth.tidal.com/v1/oauth2/token` (client_credentials) |
+| Track metadata | `GET /info/?id=N` (proxy) → `GET https://api.tidal.com/v1/tracks/{id}/` |
+| Album | `GET /album/?id=N` (proxy) → `GET https://api.tidal.com/v1/albums/{id}` |
+| Playlist | `GET /playlist/?id=N` (proxy) → `GET https://api.tidal.com/v1/playlists/{id}` |
+| Artist | `GET /artist/?id=N` (proxy) → `GET https://api.tidal.com/v1/artists/{id}` |
+| Search | `GET /search/?q=N` (combined), `?s=`, `?a=`, `?al=`, `?p=`, `?v=` |
+| Stream | `GET /trackManifests/…` then `/stream?id=N&quality=Q` |
+| Cover art | `https://resources.tidal.com/images/{uuid}/{size}x{size}.jpg` |
+
+Full endpoint inventory with upstream file:line citations:
+**[docs/MONOCHROME_API_INVENTORY.md](docs/MONOCHROME_API_INVENTORY.md)**
+
+### New environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MONOCHROME_COUNTRY` | `US` | Country code passed to all Tidal API calls |
+| `MONOCHROME_INSTANCES` | _(auto-discovered)_ | Comma-separated proxy instance base URLs; overrides auto-discovery |
+
+### Credit
+
+Backend logic ported from
+**[monochrome-music/monochrome](https://github.com/monochrome-music/monochrome)**
+(MIT-licensed community Tidal frontend).
+
+---
 
 ### Running tests
 
