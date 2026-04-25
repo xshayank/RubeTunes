@@ -474,6 +474,9 @@ via the [CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl) libr
 | `MUSICDL_DOWNLOAD_DIR` | `downloads/musicdl` | Directory for downloaded files |
 | `MUSICDL_DEFAULT_SOURCES` | *(musicdl defaults)* | Comma-separated source list |
 | `MUSICDL_PROXY` | *(none)* | HTTP/HTTPS proxy for all musicdl requests |
+| `MUSICDL_MAX_RETRIES` | `1` | Per-request retry count per source (lower = faster failover) |
+| `MUSICDL_CONNECT_TIMEOUT` | `5` | Seconds to wait for TCP connect to a source endpoint |
+| `MUSICDL_READ_TIMEOUT` | `15` | Seconds to wait for response body (raise for slow connections) |
 
 ### Supported sources (as of v2.11.1)
 
