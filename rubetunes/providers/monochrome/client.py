@@ -766,9 +766,16 @@ def _parse_search_result(data: Any) -> SearchResult:
     artists = _extract_items(data, "artists", Artist.from_dict)
     playlists = _extract_items(data, "playlists", Playlist.from_dict)
 
+    _count_by_key = {
+        "tracks": len(tracks),
+        "albums": len(albums),
+        "artists": len(artists),
+        "playlists": len(playlists),
+    }
+
     def _total(d: Any, key: str) -> int:
         section = _find_section(d, key)
-        return int((section or {}).get("totalNumberOfItems", len(tracks) if key == "tracks" else 0))
+        return int((section or {}).get("totalNumberOfItems", _count_by_key.get(key, 0)))
 
     return SearchResult(
         tracks=tracks,
