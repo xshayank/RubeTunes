@@ -80,6 +80,71 @@ COOKIES_FILE = BASE_DIR / "cookies.txt"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# Queue snapshot — save on SIGTERM, restore on startup (R9)
+# ---------------------------------------------------------------------------
+_QUEUE_SNAPSHOT_FILE = BASE_DIR / "queue_snapshot.json"
+
+
+def _save_queue_snapshot() -> None:
+    """Persist the current download queue to disk so it survives a restart."""
+    try:
+        entries = []
+        for entry in download_queue:
+            entries.append({
+                "user_guid":    entry.get("object_guid", ""),
+                "command":      entry.get("command", ""),
+                "args":         entry.get("title", ""),
+                "submitted_at": entry.get("submitted_at", ""),
+            })
+        _QUEUE_SNAPSHOT_FILE.write_text(json.dumps(entries, ensure_ascii=False, indent=2))
+        log_startup = logging.getLogger("startup")
+        log_startup.info("queue snapshot saved: %d entries", len(entries))
+    except Exception as exc:
+        logging.getLogger("startup").warning("queue snapshot save failed: %s", exc)
+
+
+def _restore_queue_snapshot() -> None:
+    """Read queue_snapshot.json (if present) and push entries back into download_queue."""
+    if not _QUEUE_SNAPSHOT_FILE.exists():
+        return
+    log_startup = logging.getLogger("startup")
+    try:
+        data = json.loads(_QUEUE_SNAPSHOT_FILE.read_text())
+        if not isinstance(data, list):
+            return
+        for item in data:
+            if item.get("user_guid"):
+                download_queue.append({
+                    "object_guid":  item["user_guid"],
+                    "url":          "",
+                    "choice":       None,
+                    "title":        item.get("args", ""),
+                    "command":      item.get("command", ""),
+                    "submitted_at": item.get("submitted_at", ""),
+                    "queue_msg_id": None,
+                })
+        _QUEUE_SNAPSHOT_FILE.unlink(missing_ok=True)
+        log_startup.info("queue snapshot restored: %d entries", len(data))
+    except Exception as exc:
+        log_startup.warning("queue snapshot restore failed: %s", exc)
+
+
+import signal as _signal
+
+
+def _handle_sigterm(signum: int, frame: object) -> None:
+    """On SIGTERM/SIGINT, save the queue then re-raise default behavior."""
+    _save_queue_snapshot()
+    _signal.signal(signum, _signal.SIG_DFL)
+    _signal.raise_signal(signum)
+
+
+try:
+    _signal.signal(_signal.SIGTERM, _handle_sigterm)
+except (OSError, AttributeError):
+    pass  # Not available on all platforms
+
 YOUTUBE_RE = re.compile(
     r'https?://(?:(?:(?:www|m|music)\.)?youtube\.com/(?:watch\?[^\s]*v=|shorts/|live/|embed/|v/)|youtu\.be/)[\w\-]+'
 )
@@ -895,6 +960,36 @@ async def selection_handler(update):
                 "queue_msg_id": queue_msg.message_id,
             })
             log.info("music_choice queued at position %d | guid=%s", pos, object_guid)
+        return
+
+    # ------------------------------------------------------------------
+    # Search result selection (R6)
+    # ------------------------------------------------------------------
+    if entry_type == "search_result":
+        choices = entry.get("choices", [])
+        if idx < 0 or idx >= len(choices):
+            await app.send_message(
+                object_guid,
+                "\u274c Please choose between !1 and !{}, or !cancel.".format(len(choices))
+            )
+            return
+
+        # Consume
+        pending_selections.pop(object_guid, None)
+        if entry.get("timeout_task"):
+            entry["timeout_task"].cancel()
+
+        selected = choices[idx]
+        track_url = selected.get("url") or ""
+        label     = selected.get("label") or "Track"
+
+        if not track_url:
+            await app.send_message(object_guid, "\u274c No URL for that result.")
+            return
+
+        _append_log(object_guid, "search_selected", "{} | {}".format(label, track_url))
+        await _ask_quality(object_guid, "\U0001f3b5 {}".format(label),
+                           track_url, "spotify", "track", {})
         return
 
     # ------------------------------------------------------------------
@@ -2676,6 +2771,7 @@ async def bandcamp_handler(update):
 
 
 if __name__ == "__main__":
+    _restore_queue_snapshot()
     print("[rub] Connecting to Rubika...")
     try:
         app.run(phone_number=PHONE_NUMBER)

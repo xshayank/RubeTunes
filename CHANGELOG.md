@@ -56,6 +56,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `requirements.txt` adds `python-json-logger`, `prometheus-client`, `sentry-sdk`
 - `requirements-dev.txt` adds `pre-commit`, `black`, `ruff`, `mypy`
 
+### Fixed / Restored (regression fixes from audit)
+
+- **R1 `build_platform_choices` / `best_source_label` / `download_track`**: Implemented in `rubetunes/downloader.py` and re-exported from `spotify_dl.py` compat shim. Waterfall order: Qobuz → Tidal Alt → Deezer → Amazon → YouTube Music. Auto entry prepended when ≥2 sources available.
+- **R2 `download_track_from_choice`**: Replaced `NotImplementedError` stub with full async implementation using correct call-site signature `(info, choice, output_dir, ytdlp_bin)`. Includes: history dedup, provider dispatch, metadata embedding, circuit breaker reporting, Prometheus counters.
+- **R3 Amazon proxy resolver**: `_get_amazon_stream_url(asin)` added to `rubetunes/providers/amazon.py`. Rotates through `amazon.spotbye.qzz.io` and `afkar.xyz` proxy bases with per-base timeout.
+- **R4 Amazon decryption**: `_convert_or_rename_amazon()` added — applies `ffmpeg -decryption_key`, probes codec with ffprobe, renames/converts to `.flac`.
+- **R5 Qobuz auth fallback**: `_qobuz_auth_login()` and `_get_qobuz_stream_url_auth()` added to `rubetunes/providers/qobuz.py`. Reads `QOBUZ_EMAIL`/`QOBUZ_PASSWORD`; MD5 wire format; cached token with 1-hour TTL.
+- **R6 `!search` selection crash**: Added `search_result` branch to `selection_handler` in `rub.py`. Pulls `choices[idx]["url"]` and calls `_ask_quality`.
+- **R7 YouTube Music MP3 fallback**: Fully implemented `rubetunes/providers/youtube.py` with `_get_youtube_music_url_by_isrc()` (ISRC-first, title fallback) and `_download_youtube_music()` (yt-dlp V0 MP3).
+- **R8 Format hint parsing**: `_parse_format_hint(args)` added to `rubetunes/resolver.py`. Strips trailing `mp3`/`flac`/`m4a`/`hires`/`24bit` tokens.
+- **R9 Queue snapshot restore**: `_save_queue_snapshot()` and `_restore_queue_snapshot()` added to `rub.py`; SIGTERM handler saves queue on shutdown; `__main__` block restores on startup.
+- **R10 MusicBrainz pre-flight guard**: `_mb_available` flag cached for 60 s on failure; short-circuits subsequent calls during outage window. Mirrors SpotiFLAC's `ShouldSkipMusicBrainzMetadataFetch()`.
+
+### Fixed — Spotify TOTP Authentication
+
+- **`_fetch_anon_token`** now uses a persistent `requests.Session` that visits `open.spotify.com` first to obtain the `sp_t` cookie, which Spotify requires for the TOTP token endpoint to succeed.
+- **Server-time sync**: `_fetch_spotify_server_time()` fetches Spotify's server timestamp before computing the TOTP code, eliminating clock-skew failures.
+- **`_totp()` server_time parameter**: Accepts optional `server_time` override so the TOTP counter uses Spotify's clock rather than the bot host clock.
+- **`SPOTIFY_TOTP_SECRET` env var**: Operators can override the hardcoded TOTP secret without code changes if Spotify rotates it.
+- **Bundle scraping fallback**: `_try_scrape_totp_secret()` attempts to extract the active secret from Spotify's web-player JS bundle.
+- **Retry with session reset**: `get_token()` resets the anonymous session and retries on first failure; falls back to client-credentials if both anon attempts fail.
+- **`SpotifyClient._get_access_token`**: Updated to use `_get_totp_secret()` and `_fetch_spotify_server_time()` for consistent behaviour with the standalone token path.
+
 ### TODO (not yet implemented)
 
 - **B4 `!favorite`** — per-user favorites file

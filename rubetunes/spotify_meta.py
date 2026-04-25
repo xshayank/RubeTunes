@@ -40,11 +40,17 @@ __all__ = [
     "parse_qobuz_track_id",
     "parse_amazon_track_id",
     "_totp",
+    "_get_totp_secret",
     "_token_cache",
     "_spotify_token_cache_path",
     "_load_spotify_token",
     "_save_spotify_token",
     "_HEADERS_BASE",
+    "_anon_session",
+    "_anon_session_lock",
+    "_ensure_anon_session",
+    "_reset_anon_session",
+    "_fetch_spotify_server_time",
     "_fetch_anon_token",
     "_fetch_cc_token",
     "get_token",
@@ -102,11 +108,78 @@ DEEZER_ARL            = os.getenv("DEEZER_ARL",            "").strip()
 QOBUZ_EMAIL           = os.getenv("QOBUZ_EMAIL",           "").strip()
 QOBUZ_PASSWORD        = os.getenv("QOBUZ_PASSWORD",        "").strip()
 
+# Hardcoded fallback — override with SPOTIFY_TOTP_SECRET env var if Spotify rotates it.
 _SPOTIFY_TOTP_SECRET  = "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4DQOJUGQYTAMRRGA2TCMJSHE3TCMBY"
 _SPOTIFY_TOTP_VERSION = 61
 _SPOTIFY_CLIENT_VERSION_FALLBACK = "1.2.52.442.g55a7e7d3"
 
 _BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# ---------------------------------------------------------------------------
+# TOTP secret resolution — env var → scraped → hardcoded fallback
+# ---------------------------------------------------------------------------
+_scraped_totp_secret:    str   = ""
+_scraped_totp_secret_at: float = 0.0
+_TOTP_SCRAPE_TTL = 86_400.0  # 24 h
+
+# Bundle URL patterns used to find the Spotify web-player JS
+_SP_BUNDLE_RE = re.compile(
+    r'src=["\']([^"\']+/web-player/[^"\']+\.js)["\']'
+    r'|"(https://[^"]+spotifycdn\.com/cdn/build/[^"]+\.js)"'
+)
+# Pattern inside the bundle JS for the base-32 TOTP secret
+_SP_TOTP_SECRET_RE = re.compile(
+    r'(?:totpSecret|totp_secret)["\']?\s*[=:]\s*["\']([A-Z2-7]{30,})["\']'
+    r'|["\']([A-Z2-7]{60,})["\']'
+)
+
+
+def _get_totp_secret() -> str:
+    """Return the active TOTP secret: env var > scraped > hardcoded fallback."""
+    env_secret = os.getenv("SPOTIFY_TOTP_SECRET", "").strip()
+    if env_secret:
+        return env_secret
+    if _scraped_totp_secret and (time.time() - _scraped_totp_secret_at) < _TOTP_SCRAPE_TTL:
+        return _scraped_totp_secret
+    return _SPOTIFY_TOTP_SECRET
+
+
+def _try_scrape_totp_secret(session: "requests.Session") -> str | None:
+    """Attempt to extract the TOTP secret from Spotify's web-player JS bundle.
+
+    Best-effort — returns None on any failure; never raises.
+    """
+    global _scraped_totp_secret, _scraped_totp_secret_at
+    try:
+        resp = session.get("https://open.spotify.com", timeout=20)
+        if not resp.ok:
+            return None
+        bundle_urls: list[str] = []
+        for m in _SP_BUNDLE_RE.finditer(resp.text):
+            url = m.group(1) or m.group(2) or ""
+            if url:
+                if url.startswith("/"):
+                    url = "https://open.spotify.com" + url
+                bundle_urls.append(url)
+
+        for bundle_url in bundle_urls[:5]:
+            try:
+                br = session.get(bundle_url, timeout=30)
+                if not br.ok:
+                    continue
+                sm = _SP_TOTP_SECRET_RE.search(br.text)
+                if sm:
+                    candidate = sm.group(1) or sm.group(2) or ""
+                    if len(candidate) >= 30:
+                        _scraped_totp_secret    = candidate
+                        _scraped_totp_secret_at = time.time()
+                        log.debug("scraped Spotify TOTP secret from bundle (%d chars)", len(candidate))
+                        return candidate
+            except Exception:
+                continue
+    except Exception as exc:
+        log.debug("totp secret scrape failed: %s", exc)
+    return None
 
 
 def _b62_to_int(s: str) -> int:
@@ -173,15 +246,98 @@ def parse_amazon_track_id(text: str) -> str | None:
     return None
 
 
-def _totp(secret_b32: str) -> str:
+def _totp(secret_b32: str, server_time: int | None = None) -> str:
+    """Compute a 6-digit TOTP code from a base-32 secret.
+
+    *server_time* (Unix seconds) overrides the local clock when provided,
+    so clock skew between the bot host and Spotify servers doesn't break auth.
+    """
     padded = secret_b32.upper() + "=" * (-len(secret_b32) % 8)
     key = base64.b32decode(padded)
-    counter = int(time.time()) // 30
+    t = server_time if server_time is not None else int(time.time())
+    counter = t // 30
     msg = struct.pack(">Q", counter)
     h = hmac.new(key, msg, hashlib.sha1).digest()
     offset = h[-1] & 0x0F
     code = struct.unpack(">I", h[offset: offset + 4])[0] & 0x7FFFFFFF
     return str(code % 1_000_000).zfill(6)
+
+
+# ---------------------------------------------------------------------------
+# Persistent anonymous session — required so Spotify's /api/token receives
+# the sp_t cookie that is set by visiting open.spotify.com first.
+# Without sp_t the TOTP challenge always fails with HTTP 4xx / empty token.
+# ---------------------------------------------------------------------------
+_anon_session: requests.Session | None = None
+_anon_session_lock = threading.Lock()
+_anon_session_created_at: float = 0.0
+_ANON_SESSION_TTL = 3600.0  # recreate the session every hour
+
+_SP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _reset_anon_session() -> None:
+    """Discard the current anonymous session so it will be recreated next call."""
+    global _anon_session, _anon_session_created_at
+    with _anon_session_lock:
+        _anon_session = None
+        _anon_session_created_at = 0.0
+
+
+def _ensure_anon_session(*, force_refresh: bool = False) -> "requests.Session":
+    """Return (and lazily create) the cookie-bearing anonymous Spotify session.
+
+    The session visits open.spotify.com on first creation so the sp_t cookie
+    is populated before any /api/token requests are made.
+    """
+    global _anon_session, _anon_session_created_at
+    with _anon_session_lock:
+        now = time.time()
+        if (
+            force_refresh
+            or _anon_session is None
+            or (now - _anon_session_created_at) > _ANON_SESSION_TTL
+        ):
+            s = requests.Session()
+            s.headers.update({
+                "User-Agent":      _SP_UA,
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            })
+            try:
+                r = s.get("https://open.spotify.com", timeout=20, allow_redirects=True)
+                sp_t = s.cookies.get("sp_t", "(none)")
+                log.debug("anon session init: status=%d sp_t=%s", r.status_code, sp_t)
+            except Exception as exc:
+                log.debug("anon session init error (continuing): %s", exc)
+            _anon_session = s
+            _anon_session_created_at = now
+        return _anon_session
+
+
+def _fetch_spotify_server_time(session: "requests.Session") -> int | None:
+    """Fetch Spotify's server-side Unix timestamp for TOTP clock-sync.
+
+    Returns the server time in seconds, or None if the endpoint is unavailable.
+    """
+    for url in (
+        "https://open.spotify.com/api/server-time",
+        "https://open.spotify.com/get_access_token?reason=transport&productType=web_player",
+    ):
+        try:
+            resp = session.get(url, timeout=10)
+            if resp.ok:
+                data = resp.json()
+                t = data.get("serverTime") or data.get("server_time")
+                if t:
+                    return int(t)
+        except Exception:
+            pass
+    return None
 
 
 _token_cache: dict = {}
@@ -213,11 +369,7 @@ def _save_spotify_token(token: str, expires_at: float) -> None:
 
 
 _HEADERS_BASE = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": _SP_UA,
     "Accept": "application/json",
     "Accept-Language": "en",
     "Referer": "https://open.spotify.com/",
@@ -226,7 +378,15 @@ _HEADERS_BASE = {
 
 
 def _fetch_anon_token() -> tuple[str, float]:
-    totp_code = _totp(_SPOTIFY_TOTP_SECRET)
+    """Obtain a Spotify anonymous access token via the TOTP web-player flow.
+
+    Uses a persistent session (with sp_t cookie) and syncs the TOTP counter
+    to Spotify's server time to handle host clock skew.
+    """
+    sess = _ensure_anon_session()
+    server_time = _fetch_spotify_server_time(sess)
+    secret      = _get_totp_secret()
+    totp_code   = _totp(secret, server_time)
     params: dict = {
         "reason":      "init",
         "productType": "web-player",
@@ -234,18 +394,19 @@ def _fetch_anon_token() -> tuple[str, float]:
         "totpVer":     str(_SPOTIFY_TOTP_VERSION),
         "totpServer":  totp_code,
     }
-    resp = requests.get(
+    resp = sess.get(
         "https://open.spotify.com/api/token",
         params=params,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Content-Type": "application/json;charset=UTF-8",
-        },
+        headers={"Content-Type": "application/json;charset=UTF-8"},
         timeout=15,
     )
     resp.raise_for_status()
     data = resp.json()
-    token = data["accessToken"]
+    token = data.get("accessToken", "")
+    if not token:
+        raise RuntimeError(
+            f"Spotify /api/token returned no accessToken (isAnonymous={data.get('isAnonymous')!r})"
+        )
     expires = (data.get("accessTokenExpirationTimestampMs") or 0) / 1000
     return token, expires or time.time() + 3600
 
@@ -263,21 +424,57 @@ def _fetch_cc_token() -> tuple[str, float]:
 
 
 def get_token() -> str:
+    """Return a valid Spotify access token, refreshing as needed.
+
+    Priority:
+    1. Unexpired in-memory cache.
+    2. Unexpired on-disk cache.
+    3. Fresh anon token via TOTP (with retry + session reset).
+    4. Scraped TOTP secret (if hardcoded secret stops working).
+    5. Client-credentials token (if SPOTIFY_CLIENT_ID/SECRET are set).
+    """
     now = time.time()
+
+    # 1 — in-memory
     if _token_cache.get("expires_at", 0) > now + 30:
         return _token_cache["token"]
+
+    # 2 — disk cache
     if not _token_cache:
         disk = _load_spotify_token()
         if disk.get("expires_at", 0) > now + 30:
             _token_cache.update(disk)
             return _token_cache["token"]
+
+    # 3 — fresh anon token with up to 2 attempts (second attempt resets session)
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            if attempt == 1:
+                # Force a fresh session — the previous sp_t may have expired
+                _reset_anon_session()
+            token, expires = _fetch_anon_token()
+            _token_cache.update({"token": token, "expires_at": expires})
+            _save_spotify_token(token, expires)
+            return token
+        except Exception as exc:
+            log.warning("anon token attempt %d failed: %s", attempt + 1, exc)
+            last_exc = exc
+
+    # 4 — try scraping a fresh TOTP secret from the bundle then retry once more
     try:
-        token, expires = _fetch_anon_token()
-        _token_cache.update({"token": token, "expires_at": expires})
-        _save_spotify_token(token, expires)
-        return token
+        sess = _ensure_anon_session()
+        scraped = _try_scrape_totp_secret(sess)
+        if scraped and scraped != _SPOTIFY_TOTP_SECRET:
+            log.info("retrying anon token with scraped TOTP secret")
+            token, expires = _fetch_anon_token()
+            _token_cache.update({"token": token, "expires_at": expires})
+            _save_spotify_token(token, expires)
+            return token
     except Exception as exc:
-        log.warning("anon token failed: %s", exc)
+        log.warning("anon token (scraped secret) failed: %s", exc)
+
+    # 5 — client credentials fallback
     if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
         try:
             token, expires = _fetch_cc_token()
@@ -285,7 +482,8 @@ def get_token() -> str:
             return token
         except Exception as exc:
             log.error("CC token also failed: %s", exc)
-    raise RuntimeError("Cannot get Spotify token.")
+
+    raise RuntimeError(f"Cannot get Spotify token. Last error: {last_exc}")
 
 
 def _auth_headers() -> dict:
@@ -515,7 +713,8 @@ class SpotifyClient:
             self._device_id = sp_t
 
     def _get_access_token(self) -> None:
-        totp_code = _totp(_SPOTIFY_TOTP_SECRET)
+        server_time = _fetch_spotify_server_time(self._session)
+        totp_code   = _totp(_get_totp_secret(), server_time)
         resp = self._session.get(
             "https://open.spotify.com/api/token",
             params={
@@ -532,6 +731,10 @@ class SpotifyClient:
             raise RuntimeError(f"spotify access token request failed: HTTP {resp.status_code}")
         data = resp.json()
         self._access_token = data.get("accessToken", "")
+        if not self._access_token:
+            raise RuntimeError(
+                f"spotify access token response missing accessToken (isAnonymous={data.get('isAnonymous')!r})"
+            )
         self._client_id = data.get("clientId", "")
         sp_t = self._session.cookies.get("sp_t")
         if sp_t:

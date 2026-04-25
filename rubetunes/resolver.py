@@ -19,10 +19,12 @@ __all__ = [
     "_resolve_via_odesli",
     "_resolve_via_songstats",
     "_musicbrainz_genre",
+    "_mb_available",
     "_resolve_all_platforms",
     "get_track_info",
     "get_tidal_track_info",
     "get_qobuz_track_info",
+    "_parse_format_hint",
 ]
 
 _resolution_pool = concurrent.futures.ThreadPoolExecutor(
@@ -31,6 +33,48 @@ _resolution_pool = concurrent.futures.ThreadPoolExecutor(
 
 _mb_lock = threading.Lock()
 _mb_last_call = 0.0
+# R10 — MusicBrainz pre-flight guard: cache availability for 60 s
+_mb_available: bool = True
+_mb_available_until: float = 0.0
+_MB_UNAVAIL_TTL = 60.0  # seconds to wait before retrying MB on outage
+
+
+# ---------------------------------------------------------------------------
+# R8 — Format hint parser
+# ---------------------------------------------------------------------------
+
+_FORMAT_HINTS = {
+    "mp3":  "mp3",
+    "flac": "flac_cd",
+    "m4a":  "flac_cd",   # treat m4a hint as a CD-quality FLAC request
+    "cd":   "flac_cd",
+    "hires": "flac_hi",
+    "hi-res": "flac_hi",
+    "24bit": "flac_hi",
+    "24-bit": "flac_hi",
+}
+
+
+def _parse_format_hint(args: str) -> tuple[str, str | None]:
+    """Strip a trailing format token from *args* and return (cleaned_args, quality).
+
+    Recognises ``mp3``, ``flac``, ``m4a``, ``cd``, ``hires``, ``hi-res``,
+    ``24bit``, ``24-bit`` as case-insensitive trailing tokens separated by
+    whitespace.  Returns ``(args, None)`` when no token is found.
+
+    Examples::
+
+        _parse_format_hint("!spotify <url> mp3")   → ("<url>", "mp3")
+        _parse_format_hint("!spotify <url> flac")  → ("<url>", "flac_cd")
+        _parse_format_hint("!spotify <url>")       → ("<url>", None)
+    """
+    parts = args.rsplit(None, 1)
+    if len(parts) == 2:
+        hint = parts[1].lower().strip()
+        quality = _FORMAT_HINTS.get(hint)
+        if quality:
+            return parts[0].strip(), quality
+    return args, None
 
 
 def _resolve_via_odesli(track_url: str) -> dict:
@@ -115,9 +159,14 @@ def _resolve_via_songstats(isrc: str) -> dict:
 
 
 def _musicbrainz_genre(isrc: str, max_genres: int = 3) -> str:
-    global _mb_last_call
+    global _mb_last_call, _mb_available, _mb_available_until
     if not isrc:
         return ""
+    # R10 — short-circuit when MB was recently unavailable
+    now = time.time()
+    with _mb_lock:
+        if not _mb_available and now < _mb_available_until:
+            return ""
     try:
         with _mb_lock:
             wait = 1.1 - (time.time() - _mb_last_call)
@@ -131,7 +180,14 @@ def _musicbrainz_genre(isrc: str, max_genres: int = 3) -> str:
             timeout=10,
         )
         if not resp.ok:
+            # Mark MB as temporarily unavailable
+            with _mb_lock:
+                _mb_available       = False
+                _mb_available_until = time.time() + _MB_UNAVAIL_TTL
             return ""
+        # Success — mark as available
+        with _mb_lock:
+            _mb_available = True
         recordings = resp.json().get("recordings") or []
         if not recordings:
             return ""
@@ -142,6 +198,10 @@ def _musicbrainz_genre(isrc: str, max_genres: int = 3) -> str:
         return ", ".join(t["name"].title() for t in tags[:max_genres] if t.get("name"))
     except Exception as exc:
         log.debug("musicbrainz genre lookup: %s", exc)
+        # Mark MB as temporarily unavailable on exception
+        with _mb_lock:
+            _mb_available       = False
+            _mb_available_until = time.time() + _MB_UNAVAIL_TTL
         return ""
 
 
