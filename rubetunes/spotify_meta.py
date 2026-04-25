@@ -1511,7 +1511,9 @@ def get_spotify_album_tracks(album_id: str) -> tuple[dict, list[str]]:
             iso = _sp_str(date_info, "isoString")
             release_date = iso[:10] if iso else ""
             tracksv2 = _sp_map(album_data, "tracksV2")
-            total_tracks = int(_sp_float(tracksv2, "totalCount")) or int(_sp_float(_sp_map(album_data, "tracks"), "totalCount"))
+            total_tracks = int(_sp_float(tracksv2, "totalCount"))
+            if not total_tracks:
+                total_tracks = int(_sp_float(_sp_map(album_data, "tracks"), "totalCount"))
             album_info = {
                 "name": _sp_str(album_data, "name"),
                 "artists": [a["name"] for a in artists],
