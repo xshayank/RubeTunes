@@ -8,3 +8,4 @@ downloads/
 *.session
 *.session-journal
 rubika_session.rp
+*.egg-info/

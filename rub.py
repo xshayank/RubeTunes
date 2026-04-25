@@ -2990,12 +2990,34 @@ async def _musicdl_pick(object_guid: str, choice: int, log) -> None:
     log.info("musicdl download ok | file=%s | guid=%s", fp, object_guid)
     await app.edit_message(object_guid, status_id, "📤 Uploading…")
     try:
-        with fp.open("rb") as f:
-            await app.send_document(object_guid, file=f, file_name=fp.name)
-        await app.delete_messages(object_guid, [status_id])
-    except Exception as exc:
-        log.error("musicdl upload failed: %s", exc)
-        await app.edit_message(object_guid, status_id, f"❌ Upload failed: {exc}")
+        try:
+            with fp.open("rb") as f:
+                await app.send_document(object_guid, file=f, file_name=fp.name)
+            await app.delete_messages(object_guid, [status_id])
+        except Exception as exc:
+            log.error("musicdl upload failed: %s", exc)
+            await app.edit_message(object_guid, status_id, f"❌ Upload failed: {exc}")
+    finally:
+        # Always clean up the downloaded file, even if upload failed
+        try:
+            if fp.exists():
+                fp.unlink()
+                log.info("musicdl: cleaned up %s", fp)
+        except Exception as exc:
+            log.warning("musicdl cleanup failed for %s: %s", fp, exc)
+        # Best-effort removal of empty parent dirs, but never touch MUSICDL_DOWNLOAD_DIR
+        try:
+            from rubetunes.providers.musicdl.config import MUSICDL_DOWNLOAD_DIR as _ROOT
+            root = Path(_ROOT).resolve()
+            parent = fp.parent.resolve()
+            while parent != root and root in parent.parents:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break  # not empty or perms — stop walking up
+                parent = parent.parent
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
