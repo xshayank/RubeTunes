@@ -2998,7 +2998,7 @@ async def _musicdl_pick(object_guid: str, choice: int, log) -> None:
         await app.edit_message(object_guid, status_id, f"❌ Upload failed: {exc}")
 
 
-
+if __name__ == "__main__":
     _restore_queue_snapshot()
     print("[rub] Connecting to Rubika...")
     try:
