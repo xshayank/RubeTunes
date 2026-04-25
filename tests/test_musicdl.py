@@ -306,6 +306,60 @@ class TestMusicdlDownload:
         with pytest.raises(MusicdlDownloadError, match="raw SongInfo"):
             await c.download(track, dest_dir=tmp_path)
 
+    @pytest.mark.asyncio
+    async def test_download_resolves_file_when_file_path_absent(self, tmp_path):
+        """When musicdl doesn't populate file_path, the client scans disk and
+        resolves the actual downloaded file."""
+        from rubetunes.providers.musicdl import client as client_mod
+        from rubetunes.providers.musicdl.client import MusicdlClient
+        from rubetunes.providers.musicdl.models import MusicdlTrack
+
+        # SongInfo with NO file_path — simulates real musicdl behaviour
+        raw = _make_song_info(file_path="", song_name="Test Song")
+        track = MusicdlTrack.from_song_info(raw)
+
+        # Returned SongInfo also has no file_path
+        downloaded_info = _make_song_info(file_path="", song_name="Test Song")
+        mock_instance = MagicMock()
+        mock_instance.download.return_value = [downloaded_info]
+        mock_class = MagicMock(return_value=mock_instance)
+
+        # Write a real audio file into tmp_path (simulates musicdl writing to work_dir)
+        audio_file = tmp_path / "Test Song.mp3"
+        audio_file.write_bytes(b"fake audio data")
+
+        with patch.object(client_mod, "_import_musicdl", return_value=mock_class):
+            c = MusicdlClient(sources=["NeteaseMusicClient"])
+            result = await c.download(track, dest_dir=tmp_path)
+
+        assert result.success is True
+        assert result.file_path == audio_file
+
+    @pytest.mark.asyncio
+    async def test_download_returns_failure_when_no_file_written(self, tmp_path):
+        """When musicdl writes nothing to disk and file_path is absent,
+        the result should have success=False and a meaningful error."""
+        from rubetunes.providers.musicdl import client as client_mod
+        from rubetunes.providers.musicdl.client import MusicdlClient
+        from rubetunes.providers.musicdl.models import MusicdlTrack
+
+        # SongInfo with NO file_path
+        raw = _make_song_info(file_path="", song_name="Ghost Track")
+        track = MusicdlTrack.from_song_info(raw)
+
+        downloaded_info = _make_song_info(file_path="", song_name="Ghost Track")
+        mock_instance = MagicMock()
+        mock_instance.download.return_value = [downloaded_info]
+        mock_class = MagicMock(return_value=mock_instance)
+
+        # Do NOT write any file to tmp_path
+        with patch.object(client_mod, "_import_musicdl", return_value=mock_class):
+            c = MusicdlClient(sources=["NeteaseMusicClient"])
+            result = await c.download(track, dest_dir=tmp_path)
+
+        assert result.success is False
+        assert result.error == "No file path in result"
+
 
 # ===========================================================================
 # 7. Public __init__ exports
