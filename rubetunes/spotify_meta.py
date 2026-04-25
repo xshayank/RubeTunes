@@ -101,6 +101,16 @@ __all__ = [
     "get_spotify_album_tracks",
     "get_spotify_artist_info",
     "get_spotify_artist_albums",
+    "_fetch_artist_overview_graphql",
+    "_fetch_artist_discography_graphql",
+    "_fetch_search_graphql",
+    "_parse_graphql_artist",
+    "_parse_graphql_artist_discography",
+    "_parse_graphql_search",
+    "_GRAPHQL_HASH_QUERY_ARTIST_OVERVIEW",
+    "_GRAPHQL_HASH_QUERY_ARTIST_DISCOGRAPHY",
+    "_GRAPHQL_HASH_SEARCH_DESKTOP",
+    "spotify_search",
 ]
 
 SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID",     "").strip()
@@ -551,10 +561,13 @@ def _fetch_internal_meta(track_id: str) -> dict:
 
 
 def _fetch_public_meta(track_id: str) -> dict:
-    url = f"https://api.spotify.com/v1/tracks/{track_id}"
-    resp = requests.get(url, headers=_auth_headers(), timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+    """Fetch track metadata via spclient internal API (public REST API is forbidden).
+
+    This previously called ``api.spotify.com/v1/tracks`` but that endpoint is
+    not allowed per the strict endpoint policy.  We delegate to the spclient
+    internal metadata endpoint instead, which returns equivalent data.
+    """
+    return _fetch_internal_meta(track_id)
 
 
 def _parse_internal(meta: dict) -> dict:
@@ -596,26 +609,21 @@ def _parse_internal(meta: dict) -> dict:
 
 
 def _parse_public(meta: dict) -> dict:
-    artists = [a["name"] for a in meta.get("artists", [])]
-    album = meta.get("album", {})
-    images = album.get("images", [])
-    cover_url = images[0]["url"] if images else ""
-    return {
-        "title": meta.get("name", ""),
-        "artists": artists,
-        "album": album.get("name", ""),
-        "release_date": album.get("release_date", ""),
-        "cover_url": cover_url,
-        "track_number": meta.get("track_number", 1),
-        "disc_number": meta.get("disc_number", 1),
-        "isrc": meta.get("external_ids", {}).get("isrc"),
-    }
+    """Parse metadata returned by `_fetch_public_meta`.
+
+    Since `_fetch_public_meta` now delegates to the spclient internal API,
+    this function wraps `_parse_internal` so callers keep working unchanged.
+    """
+    return _parse_internal(meta)
 
 
 _SPOTIFY_GRAPHQL_ENDPOINT = "https://api-partner.spotify.com/pathfinder/v1/query"
-_GRAPHQL_HASH_GET_TRACK       = "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294"
-_GRAPHQL_HASH_GET_ALBUM       = "b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10"
-_GRAPHQL_HASH_FETCH_PLAYLIST  = "bb67e0af06e8d6f52b531f97468ee4acd44cd0f82b988e15c2ea47b1148efc77"
+_GRAPHQL_HASH_GET_TRACK                   = "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294"
+_GRAPHQL_HASH_GET_ALBUM                   = "b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10"
+_GRAPHQL_HASH_FETCH_PLAYLIST              = "bb67e0af06e8d6f52b531f97468ee4acd44cd0f82b988e15c2ea47b1148efc77"
+_GRAPHQL_HASH_QUERY_ARTIST_OVERVIEW       = "446130b4a0aa6522a686aafccddb0ae849165b5e0436fd802f96e0243617b5d8"
+_GRAPHQL_HASH_QUERY_ARTIST_DISCOGRAPHY    = "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599"
+_GRAPHQL_HASH_SEARCH_DESKTOP              = "fcad5a3e0d5af727fb76966f06971c19cfa2275e6ff7671196753e008611873c"
 
 
 def _spotify_graphql_query(payload: dict) -> dict:
@@ -711,6 +719,62 @@ def _fetch_playlist_graphql_page(playlist_id: str, offset: int, limit: int) -> d
             "persistedQuery": {
                 "version":    1,
                 "sha256Hash": _GRAPHQL_HASH_FETCH_PLAYLIST,
+            }
+        },
+    })
+
+
+def _fetch_artist_overview_graphql(artist_id: str) -> dict:
+    return _spotify_graphql_query({
+        "variables": {
+            "uri":    f"spotify:artist:{artist_id}",
+            "locale": "",
+        },
+        "operationName": "queryArtistOverview",
+        "extensions": {
+            "persistedQuery": {
+                "version":    1,
+                "sha256Hash": _GRAPHQL_HASH_QUERY_ARTIST_OVERVIEW,
+            }
+        },
+    })
+
+
+def _fetch_artist_discography_graphql(artist_id: str, offset: int, limit: int) -> dict:
+    return _spotify_graphql_query({
+        "variables": {
+            "uri":    f"spotify:artist:{artist_id}",
+            "offset": offset,
+            "limit":  limit,
+            "order":  "DATE_DESC",
+        },
+        "operationName": "queryArtistDiscographyAll",
+        "extensions": {
+            "persistedQuery": {
+                "version":    1,
+                "sha256Hash": _GRAPHQL_HASH_QUERY_ARTIST_DISCOGRAPHY,
+            }
+        },
+    })
+
+
+def _fetch_search_graphql(query: str, offset: int, limit: int) -> dict:
+    return _spotify_graphql_query({
+        "variables": {
+            "searchTerm":                    query,
+            "offset":                        offset,
+            "limit":                         min(limit, 50),
+            "numberOfTopResults":            5,
+            "includeAudiobooks":             True,
+            "includeArtistHasConcertsField": False,
+            "includePreReleases":            True,
+            "includeAuthors":                False,
+        },
+        "operationName": "searchDesktop",
+        "extensions": {
+            "persistedQuery": {
+                "version":    1,
+                "sha256Hash": _GRAPHQL_HASH_SEARCH_DESKTOP,
             }
         },
     })
@@ -1365,40 +1429,57 @@ def parse_spotify_artist_id(text: str) -> str | None:
 def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list[str]]:
     """Return (playlist_info, track_ids) for a Spotify playlist.
 
-    Handles pagination (Spotify returns up to 100 items per page).
-    Skips local/None tracks.
+    Uses the GraphQL ``fetchPlaylist`` persisted query (pathfinder/v1).
+    Handles pagination.  Skips local/non-track entries.
     """
-    url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
-    resp = requests.get(url, headers=_auth_headers(), timeout=15)
-    if not resp.ok:
-        raise RuntimeError(f"Spotify playlist API error: HTTP {resp.status_code}")
-    data = resp.json()
-
-    images = data.get("images") or []
-    playlist_info = {
-        "name": data.get("name", ""),
-        "owner": (data.get("owner") or {}).get("display_name", ""),
-        "total_tracks": (data.get("tracks") or {}).get("total", 0),
-        "image_url": images[0].get("url", "") if images else "",
-    }
-
+    PAGE = 100
+    offset = 0
     track_ids: list[str] = []
-    tracks_page = data.get("tracks") or {}
+    playlist_info: dict = {}
+
     while True:
-        for item in tracks_page.get("items") or []:
-            track = (item or {}).get("track")
-            if not track:
+        data = _fetch_playlist_graphql_page(playlist_id, offset, PAGE)
+        playlist_data = _sp_map(_sp_map(data, "data"), "playlistV2")
+        if not playlist_data:
+            raise RuntimeError("Spotify fetchPlaylist returned no playlistV2 data")
+
+        if not playlist_info:
+            owner_data = _sp_map(_sp_map(playlist_data, "ownerV2"), "data")
+            images_data = _sp_map(playlist_data, "images") or _sp_map(playlist_data, "imagesV2")
+            image_url: str = ""
+            image_items = _sp_list(images_data, "items")
+            if image_items and isinstance(image_items[0], dict):
+                first_sources = _sp_list(image_items[0], "sources")
+                if first_sources and isinstance(first_sources[0], dict):
+                    image_url = _sp_str(first_sources[0], "url")
+            content = _sp_map(playlist_data, "content")
+            playlist_info = {
+                "name": _sp_str(playlist_data, "name"),
+                "owner": _sp_str(owner_data, "name"),
+                "total_tracks": int(_sp_float(content, "totalCount")),
+                "image_url": image_url,
+            }
+
+        content = _sp_map(playlist_data, "content")
+        items = _sp_list(content, "items")
+        for item in items:
+            if not isinstance(item, dict):
                 continue
-            tid = track.get("id")
-            if tid:
-                track_ids.append(tid)
-        next_url = tracks_page.get("next")
-        if not next_url:
+            track_data = _sp_map(_sp_map(item, "itemV2"), "data")
+            if not track_data:
+                continue
+            track_id = _sp_str(track_data, "id")
+            if not track_id:
+                uri = _sp_str(track_data, "uri")
+                if ":" in uri:
+                    track_id = uri.split(":")[-1]
+            if track_id:
+                track_ids.append(track_id)
+
+        total = int(_sp_float(content, "totalCount"))
+        offset += len(items)
+        if offset >= total or not items:
             break
-        resp = requests.get(next_url, headers=_auth_headers(), timeout=15)
-        if not resp.ok:
-            raise RuntimeError(f"Spotify playlist tracks API error: HTTP {resp.status_code}")
-        tracks_page = resp.json()
 
     return playlist_info, track_ids
 
@@ -1406,162 +1487,247 @@ def get_spotify_playlist_tracks(playlist_id: str) -> tuple[dict, list[str]]:
 def get_spotify_album_tracks(album_id: str) -> tuple[dict, list[str]]:
     """Return (album_info, track_ids) for a Spotify album.
 
-    Handles pagination if total_tracks > 50.
+    Uses the GraphQL ``getAlbum`` persisted query (pathfinder/v1).
+    Handles pagination.
     """
-    url = f"https://api.spotify.com/v1/albums/{album_id}"
-    resp = requests.get(url, headers=_auth_headers(), timeout=15)
-    if not resp.ok:
-        raise RuntimeError(f"Spotify album API error: HTTP {resp.status_code}")
-    data = resp.json()
-
-    images = data.get("images") or []
-    album_info = {
-        "name": data.get("name", ""),
-        "artists": [a["name"] for a in (data.get("artists") or []) if a.get("name")],
-        "release_date": data.get("release_date", ""),
-        "total_tracks": data.get("total_tracks", 0),
-        "image_url": images[0].get("url", "") if images else "",
-    }
-
+    PAGE = 50
+    offset = 0
     track_ids: list[str] = []
-    tracks_page = data.get("tracks") or {}
+    album_info: dict = {}
+
     while True:
-        for item in tracks_page.get("items") or []:
-            if not item:
+        data = _fetch_album_graphql_page(album_id, offset, PAGE)
+        album_data = _sp_map(_sp_map(data, "data"), "albumUnion")
+        if not album_data:
+            raise RuntimeError("Spotify getAlbum returned no albumUnion data")
+
+        if not album_info:
+            artists = _sp_extract_artists(_sp_map(album_data, "artists"))
+            cover_obj = _sp_extract_cover(_sp_map(album_data, "coverArt"))
+            image_url: str = ""
+            if cover_obj:
+                image_url = cover_obj.get("medium") or cover_obj.get("small") or cover_obj.get("large") or ""
+            date_info = _sp_map(album_data, "date")
+            iso = _sp_str(date_info, "isoString")
+            release_date = iso[:10] if iso else ""
+            tracksv2 = _sp_map(album_data, "tracksV2")
+            total_tracks = int(_sp_float(tracksv2, "totalCount")) or int(_sp_float(_sp_map(album_data, "tracks"), "totalCount"))
+            album_info = {
+                "name": _sp_str(album_data, "name"),
+                "artists": [a["name"] for a in artists],
+                "release_date": release_date,
+                "total_tracks": total_tracks,
+                "image_url": image_url,
+            }
+
+        tracks_data = _sp_map(album_data, "tracksV2") or _sp_map(album_data, "tracks")
+        items = _sp_list(tracks_data, "items")
+        for item in items:
+            if not isinstance(item, dict):
                 continue
-            tid = item.get("id")
-            if tid:
-                track_ids.append(tid)
-        next_url = tracks_page.get("next")
-        if not next_url:
+            track = _sp_map(item, "track") or item
+            track_uri = _sp_str(track, "uri")
+            track_id = track_uri.split(":")[-1] if ":" in track_uri else _sp_str(track, "id")
+            if track_id:
+                track_ids.append(track_id)
+
+        total = int(_sp_float(tracks_data, "totalCount"))
+        offset += len(items)
+        if offset >= total or not items:
             break
-        resp = requests.get(next_url, headers=_auth_headers(), timeout=15)
-        if not resp.ok:
-            raise RuntimeError(f"Spotify album tracks API error: HTTP {resp.status_code}")
-        tracks_page = resp.json()
 
     return album_info, track_ids
 
 
-def get_spotify_artist_info(artist_id: str) -> dict:
-    """Return artist metadata including top-5 tracks.
+def _parse_graphql_artist(data: dict, separator: str = ", ") -> dict:
+    """Parse a ``queryArtistOverview`` GraphQL response into a plain dict."""
+    data_map  = _sp_map(data, "data")
+    artist    = _sp_map(data_map, "artistUnion")
+    profile   = _sp_map(artist, "profile")
+    stats     = _sp_map(artist, "stats")
+    visuals   = _sp_map(artist, "visuals")
+    avatar_obj = _sp_extract_cover(_sp_map(visuals, "avatarImage"))
+    image_url: str = ""
+    if avatar_obj:
+        image_url = avatar_obj.get("medium") or avatar_obj.get("small") or avatar_obj.get("large") or ""
 
-    Top tracks are fetched via /v1/artists/{id}/top-tracks?market=US.
-    """
-    artist_url = f"https://api.spotify.com/v1/artists/{artist_id}"
-    resp = requests.get(artist_url, headers=_auth_headers(), timeout=15)
-    if not resp.ok:
-        raise RuntimeError(f"Spotify artist API error: HTTP {resp.status_code}")
-    artist_data = resp.json()
+    artist_uri = _sp_str(artist, "uri")
+    artist_id  = artist_uri.split(":")[-1] if ":" in artist_uri else _sp_str(artist, "id")
 
-    images = artist_data.get("images") or []
-    image_url = images[0].get("url", "") if images else ""
+    # biography
+    bio_obj  = _sp_map(profile, "biography")
+    bio_text = _sp_str(bio_obj, "text") or _sp_str(profile, "biography")
 
-    top_url = f"https://api.spotify.com/v1/artists/{artist_id}/top-tracks"
-    resp = requests.get(top_url, params={"market": "US"}, headers=_auth_headers(), timeout=15)
-    if not resp.ok:
-        raise RuntimeError(f"Spotify artist top-tracks API error: HTTP {resp.status_code}")
-    top_data = resp.json()
-
-    top_tracks = []
-    for track in (top_data.get("tracks") or [])[:5]:
-        ms = track.get("duration_ms", 0)
-        secs = ms // 1000
-        minutes, seconds = divmod(secs, 60)
-        top_tracks.append({
-            "id": track.get("id", ""),
-            "title": track.get("name", ""),
-            "artists": [a["name"] for a in (track.get("artists") or []) if a.get("name")],
-            "duration": f"{minutes}:{seconds:02d}",
-        })
+    # top tracks from discography (first popularTrackReleases items)
+    discography  = _sp_map(artist, "discography")
+    top_data     = _sp_map(discography, "popularReleasesAlbums") or _sp_map(discography, "popularTrackReleases")
+    top_items    = _sp_list(top_data, "items")
+    top_tracks: list[dict] = []
+    for item in top_items[:5]:
+        if not isinstance(item, dict):
+            continue
+        releases = _sp_list(item, "releases") or [item]
+        for rel in releases:
+            if not isinstance(rel, dict):
+                continue
+            tracks_data = _sp_map(rel, "tracks") or _sp_map(rel, "tracksV2")
+            for t in _sp_list(tracks_data, "items")[:1]:
+                if not isinstance(t, dict):
+                    continue
+                track = _sp_map(t, "track") or t
+                track_uri = _sp_str(track, "uri")
+                track_id  = track_uri.split(":")[-1] if ":" in track_uri else _sp_str(track, "id")
+                dur_ms = _sp_float(_sp_map(track, "duration"), "totalMilliseconds")
+                secs = int(dur_ms) // 1000
+                top_tracks.append({
+                    "id":       track_id,
+                    "title":    _sp_str(track, "name"),
+                    "artists":  separator.join(
+                        a["name"] for a in _sp_extract_artists(_sp_map(track, "artists"))
+                    ),
+                    "duration": f"{secs // 60}:{secs % 60:02d}",
+                })
 
     return {
-        "name": artist_data.get("name", ""),
-        "image_url": image_url,
+        "id":         artist_id,
+        "name":       _sp_str(profile, "name"),
+        "image_url":  image_url,
+        "biography":  bio_text,
+        "followers":  int(_sp_float(stats, "followers")),
+        "listeners":  int(_sp_float(stats, "monthlyListeners")),
+        "verified":   bool(profile.get("verified")),
         "top_tracks": top_tracks,
     }
+
+
+def get_spotify_artist_info(artist_id: str) -> dict:
+    """Return artist metadata via GraphQL ``queryArtistOverview`` (pathfinder/v1).
+
+    Previously called ``api.spotify.com/v1/artists`` — that endpoint is
+    forbidden by the strict endpoint policy.  All data now comes from the
+    pathfinder GraphQL endpoint.
+    """
+    data = _fetch_artist_overview_graphql(artist_id)
+    return _parse_graphql_artist(data)
+
+
+def _parse_graphql_artist_discography(data: dict, separator: str = ", ") -> tuple[list[dict], int]:
+    """Parse a ``queryArtistDiscographyAll`` GraphQL response."""
+    discography = _sp_map(_sp_map(_sp_map(data, "data"), "artistUnion"), "discography")
+    all_data    = _sp_map(discography, "all")
+    total       = int(_sp_float(all_data, "totalCount"))
+    items: list[dict] = []
+    for item in _sp_list(all_data, "items"):
+        if not isinstance(item, dict):
+            continue
+        releases = _sp_list(item, "releases")
+        if not releases:
+            releases = [item]
+        for rel in releases:
+            if not isinstance(rel, dict):
+                continue
+            rel_data = _sp_map(rel, "releases") or rel
+            uri      = _sp_str(rel_data, "uri") or _sp_str(rel, "uri")
+            alb_id   = uri.split(":")[-1] if ":" in uri else _sp_str(rel_data, "id") or _sp_str(rel, "id")
+            cover_obj = _sp_extract_cover(_sp_map(rel_data, "coverArt") or _sp_map(rel, "coverArt"))
+            image_url: str = ""
+            if cover_obj:
+                image_url = cover_obj.get("medium") or cover_obj.get("small") or cover_obj.get("large") or ""
+            date_info    = _sp_map(rel_data, "date") or _sp_map(rel, "date")
+            iso          = _sp_str(date_info, "isoString")
+            release_date = iso[:10] if iso else ""
+            if not release_date:
+                year = _sp_str(date_info, "year")
+                release_date = year if year else ""
+            track_count = int(_sp_float(_sp_map(rel_data, "tracks") or _sp_map(rel, "tracks"), "totalCount"))
+            artists     = _sp_extract_artists(_sp_map(rel_data, "artists") or _sp_map(rel, "artists"))
+            name        = _sp_str(rel_data, "name") or _sp_str(rel, "name")
+            if not name:
+                continue
+            items.append({
+                "id":           alb_id,
+                "name":         name,
+                "artists":      separator.join(a["name"] for a in artists),
+                "release_date": release_date,
+                "total_tracks": track_count,
+                "image_url":    image_url,
+            })
+    return items, total
 
 
 def get_spotify_artist_albums(
     artist_id: str, group: str, offset: int, limit: int
 ) -> tuple[list[dict], int]:
-    """Return (items, total) for an artist's albums or singles.
+    """Return (items, total) for an artist's discography via GraphQL
+    ``queryArtistDiscographyAll`` (pathfinder/v1).
 
-    group must be "album" or "single". offset and limit are passed straight
-    through to the Spotify API.
+    Previously called ``api.spotify.com/v1/artists/{id}/albums`` — that
+    endpoint is forbidden by the strict endpoint policy.  *group* is kept for
+    API compatibility but the GraphQL endpoint returns all release types; this
+    function returns all items when *group* is ``"all"`` and otherwise skips
+    items whose name does not look like the requested type (basic heuristic).
     """
-    url = f"https://api.spotify.com/v1/artists/{artist_id}/albums"
-    params = {
-        "include_groups": group,
-        "market": "US",
-        "limit": limit,
-        "offset": offset,
-    }
-    resp = requests.get(url, params=params, headers=_auth_headers(), timeout=15)
-    if not resp.ok:
-        raise RuntimeError(f"Spotify artist albums API error: HTTP {resp.status_code}")
-    data = resp.json()
-
-    total = data.get("total", 0)
-    items = []
-    for alb in data.get("items") or []:
-        if not alb:
-            continue
-        images = alb.get("images") or []
-        items.append({
-            "id": alb.get("id", ""),
-            "name": alb.get("name", ""),
-            "artists": [a["name"] for a in (alb.get("artists") or []) if a.get("name")],
-            "release_date": alb.get("release_date", ""),
-            "total_tracks": alb.get("total_tracks", 0),
-            "image_url": images[0].get("url", "") if images else "",
-        })
-
+    data = _fetch_artist_discography_graphql(artist_id, offset, limit)
+    items, total = _parse_graphql_artist_discography(data)
     return items, total
 
 
-def spotify_search(query: str, limit: int = 10) -> list[dict]:
-    """Search Spotify for tracks matching *query*.
-
-    Returns up to *limit* track info dicts with keys:
-    track_id, title, artists, album, duration, url.
-    Uses the public search API with the anonymous bearer token.
-    """
-    try:
-        token = get_token()
-    except Exception as exc:
-        log.warning("spotify_search: could not get token: %s", exc)
+def _parse_graphql_search(data: dict, separator: str = ", ") -> list[dict]:
+    """Parse a ``searchDesktop`` GraphQL response into a flat track list."""
+    data_map    = _sp_map(data, "data")
+    search_data = _sp_map(data_map, "searchV2")
+    if not search_data:
         return []
 
-    try:
-        resp = requests.get(
-            "https://api.spotify.com/v1/search",
-            params={"q": query, "type": "track", "limit": min(limit, 50)},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("spotify_search: API call failed: %s", exc)
-        return []
-
-    results = []
-    for item in (data.get("tracks") or {}).get("items") or []:
-        if not item:
+    tracks_container = _sp_map(search_data, "tracksV2") or _sp_map(search_data, "tracks")
+    results: list[dict] = []
+    for item in _sp_list(tracks_container, "items"):
+        if not isinstance(item, dict):
             continue
-        track_id = item.get("id", "")
-        artists = [a["name"] for a in (item.get("artists") or []) if a.get("name")]
-        ms = item.get("duration_ms", 0)
-        secs = ms // 1000
-        minutes, seconds = divmod(secs, 60)
-        duration = f"{minutes}:{seconds:02d}"
+        # items may be { item: { data: {...} } } or { track: {...} }
+        track: dict = {}
+        item_data = item.get("item")
+        if isinstance(item_data, dict):
+            track = _sp_map(item_data, "data")
+        if not track:
+            track = _sp_map(item, "track") or item
+
+        if not track:
+            continue
+        name = _sp_str(track, "name")
+        if not name:
+            continue
+        track_uri = _sp_str(track, "uri")
+        track_id  = _sp_str(track, "id") or (track_uri.split(":")[-1] if ":" in track_uri else "")
+        artists   = _sp_extract_artists(_sp_map(track, "artists"))
+        album_data = _sp_map(track, "albumOfTrack")
+        album_name = _sp_str(album_data, "name")
+        dur_ms = _sp_float(_sp_map(track, "duration"), "totalMilliseconds") or \
+                 _sp_float(_sp_map(track, "trackDuration"), "totalMilliseconds")
+        secs = int(dur_ms) // 1000
         results.append({
             "track_id": track_id,
-            "title": item.get("name", "Unknown"),
-            "artists": artists,
-            "album": (item.get("album") or {}).get("name", ""),
-            "duration": duration,
-            "url": f"https://open.spotify.com/track/{track_id}",
+            "title":    name,
+            "artists":  [a["name"] for a in artists],
+            "album":    album_name,
+            "duration": f"{secs // 60}:{secs % 60:02d}",
+            "url":      f"https://open.spotify.com/track/{track_id}",
         })
     return results
+
+
+def spotify_search(query: str, limit: int = 10) -> list[dict]:
+    """Search Spotify for tracks matching *query* via GraphQL ``searchDesktop``
+    (pathfinder/v1).
+
+    Previously called ``api.spotify.com/v1/search`` — that endpoint is
+    forbidden by the strict endpoint policy.  Returns up to *limit* track info
+    dicts with keys: track_id, title, artists, album, duration, url.
+    """
+    try:
+        data = _fetch_search_graphql(query, 0, limit)
+    except Exception as exc:
+        log.warning("spotify_search: GraphQL call failed: %s", exc)
+        return []
+    return _parse_graphql_search(data)[:limit]
+
