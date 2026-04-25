@@ -338,7 +338,7 @@ class TestMusicdlDownload:
     @pytest.mark.asyncio
     async def test_download_returns_failure_when_no_file_written(self, tmp_path):
         """When musicdl writes nothing to disk and file_path is absent,
-        the result should have success=False and a meaningful error."""
+        the result should have success=False and an error listing scanned dirs."""
         from rubetunes.providers.musicdl import client as client_mod
         from rubetunes.providers.musicdl.client import MusicdlClient
         from rubetunes.providers.musicdl.models import MusicdlTrack
@@ -358,7 +358,112 @@ class TestMusicdlDownload:
             result = await c.download(track, dest_dir=tmp_path)
 
         assert result.success is False
-        assert result.error == "No file path in result"
+        assert result.error  # non-empty error message
+        assert "no audio file" in result.error.lower() or "no file" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_download_resolves_file_in_parent_musicdl_dir(self, tmp_path, monkeypatch):
+        """File written to MUSICDL_DOWNLOAD_DIR (the parent) is still resolved."""
+        import rubetunes.providers.musicdl.client as client_mod
+        from rubetunes.providers.musicdl.client import MusicdlClient
+        from rubetunes.providers.musicdl.models import MusicdlTrack
+
+        parent_dir = tmp_path / "musicdl"
+        parent_dir.mkdir()
+        effective_dir = parent_dir / "NeteaseMusicClient"
+        effective_dir.mkdir()
+
+        # Patch MUSICDL_DOWNLOAD_DIR to our controlled parent dir
+        monkeypatch.setattr(client_mod, "MUSICDL_DOWNLOAD_DIR", parent_dir)
+
+        raw = _make_song_info(file_path="", song_name="Parent Track", source="NeteaseMusicClient")
+        track = MusicdlTrack.from_song_info(raw)
+
+        downloaded_info = _make_song_info(file_path="", song_name="Parent Track", source="NeteaseMusicClient")
+        mock_instance = MagicMock()
+        mock_instance.download.return_value = [downloaded_info]
+        mock_class = MagicMock(return_value=mock_instance)
+
+        # Simulate musicdl writing to the parent (not the source sub-dir)
+        audio_file = parent_dir / "Parent Track.mp3"
+        audio_file.write_bytes(b"fake audio data")
+
+        with patch.object(client_mod, "_import_musicdl", return_value=mock_class):
+            c = MusicdlClient(sources=["NeteaseMusicClient"])
+            result = await c.download(track, dest_dir=effective_dir)
+
+        assert result.success is True
+        assert result.file_path == audio_file
+
+    @pytest.mark.asyncio
+    async def test_download_resolves_file_in_cwd(self, tmp_path, monkeypatch):
+        """File written to Path.cwd() (some musicdl sources ignore work_dir) is resolved."""
+        import rubetunes.providers.musicdl.client as client_mod
+        from rubetunes.providers.musicdl.client import MusicdlClient
+        from rubetunes.providers.musicdl.models import MusicdlTrack
+
+        # Use a separate dir as MUSICDL_DOWNLOAD_DIR so it doesn't overlap with cwd
+        dl_dir = tmp_path / "downloads"
+        dl_dir.mkdir()
+        monkeypatch.setattr(client_mod, "MUSICDL_DOWNLOAD_DIR", dl_dir)
+
+        # Change cwd to a different tmp subdir
+        cwd_dir = tmp_path / "cwd"
+        cwd_dir.mkdir()
+        monkeypatch.chdir(cwd_dir)
+
+        raw = _make_song_info(file_path="", song_name="CWD Track", source="NeteaseMusicClient")
+        track = MusicdlTrack.from_song_info(raw)
+
+        downloaded_info = _make_song_info(file_path="", song_name="CWD Track", source="NeteaseMusicClient")
+        mock_instance = MagicMock()
+        mock_instance.download.return_value = [downloaded_info]
+        mock_class = MagicMock(return_value=mock_instance)
+
+        # Simulate musicdl writing to CWD
+        audio_file = cwd_dir / "CWD Track.flac"
+        audio_file.write_bytes(b"fake audio data")
+
+        effective_dir = dl_dir / "NeteaseMusicClient"
+        with patch.object(client_mod, "_import_musicdl", return_value=mock_class):
+            c = MusicdlClient(sources=["NeteaseMusicClient"])
+            result = await c.download(track, dest_dir=effective_dir)
+
+        assert result.success is True
+        assert result.file_path == audio_file
+
+    @pytest.mark.asyncio
+    async def test_download_resolves_overwritten_file(self, tmp_path, monkeypatch):
+        """A file that existed before the download but was overwritten (recent mtime) is resolved."""
+        import rubetunes.providers.musicdl.client as client_mod
+        from rubetunes.providers.musicdl.client import MusicdlClient
+        from rubetunes.providers.musicdl.models import MusicdlTrack
+
+        raw = _make_song_info(file_path="", song_name="Rewritten Track", source="NeteaseMusicClient")
+        track = MusicdlTrack.from_song_info(raw)
+
+        downloaded_info = _make_song_info(file_path="", song_name="Rewritten Track", source="NeteaseMusicClient")
+        mock_instance = MagicMock()
+        mock_instance.download.return_value = [downloaded_info]
+        mock_class = MagicMock(return_value=mock_instance)
+
+        # File already exists BEFORE the download (simulating a re-download)
+        audio_file = tmp_path / "Rewritten Track.mp3"
+        audio_file.write_bytes(b"old audio data")
+
+        # Make the mock download overwrite the file with a fresh mtime
+        def _overwrite_on_download(*args, **kwargs):
+            audio_file.write_bytes(b"new audio data")
+            return [downloaded_info]
+
+        mock_instance.download.side_effect = _overwrite_on_download
+
+        with patch.object(client_mod, "_import_musicdl", return_value=mock_class):
+            c = MusicdlClient(sources=["NeteaseMusicClient"])
+            result = await c.download(track, dest_dir=tmp_path)
+
+        assert result.success is True
+        assert result.file_path == audio_file
 
 
 # ===========================================================================

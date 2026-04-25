@@ -9,6 +9,7 @@ missing or broken install only breaks the musicdl routes, not the whole app.
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,17 +36,63 @@ log = logging.getLogger(__name__)
 
 AUDIO_EXTS: frozenset[str] = frozenset({".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aac"})
 
+# Clock-skew tolerance: prefer files whose mtime is within this many seconds
+# of the download start timestamp (handles NFS/FAT clock drift and overwrites).
+_MTIME_TOLERANCE_SECONDS: float = 2.0
+
+# Maximum number of characters to include from a raw SongInfo repr in log messages.
+_MAX_RAW_REPR_LENGTH: int = 500
+
+
+def _build_candidate_dirs(effective_dir: Path, source: str | None) -> list[Path]:
+    """Return a deduplicated list of directories to scan for downloaded audio files.
+
+    Covers the common locations where musicdl may write files, regardless of
+    whether it honours the configured ``work_dir``.
+    """
+    seen: set[Path] = set()
+    result: list[Path] = []
+
+    def _add(d: Path) -> None:
+        key = d.resolve() if d.exists() else d.absolute()
+        if key not in seen:
+            seen.add(key)
+            result.append(d)
+
+    _add(effective_dir)
+    if source:
+        _add(effective_dir / source)
+    _add(MUSICDL_DOWNLOAD_DIR)
+    if source:
+        _add(MUSICDL_DOWNLOAD_DIR / source)
+    _add(Path.cwd())
+    return result
+
+
+def _snapshot_audio_files(dirs: list[Path]) -> frozenset[Path]:
+    """Return a frozenset of all audio files currently present in *dirs*."""
+    files: set[Path] = set()
+    for d in dirs:
+        if d.exists():
+            for p in d.rglob("*"):
+                if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+                    files.add(p)
+    return frozenset(files)
+
 
 def _find_downloaded_file(
     dirs: list[Path],
     song_name: str,
     existing: frozenset[Path],
+    since_ts: float | None = None,
 ) -> Path | None:
     """Return the most recently modified audio file under any of *dirs*.
 
-    Prefers files that were not present in *existing* (i.e. written during
-    the download).  Falls back to a name-based match, then to the newest
-    file overall.
+    Priority (highest first):
+    1. Files with ``mtime >= since_ts - 2`` (written during the download window).
+    2. Files not present in *existing* (newly created).
+    3. Files whose stem contains *song_name*.
+    4. The file with the newest mtime overall.
     """
     candidates: list[Path] = []
     for d in dirs:
@@ -56,6 +103,12 @@ def _find_downloaded_file(
                 candidates.append(p)
     if not candidates:
         return None
+
+    # Strongly prefer files written during (or just before) the download window
+    if since_ts is not None:
+        recent = [p for p in candidates if p.stat().st_mtime >= since_ts - _MTIME_TOLERANCE_SECONDS]
+        if recent:
+            candidates = recent
 
     # Prefer files that weren't there before the download
     new_candidates = [p for p in candidates if p not in existing]
@@ -241,34 +294,69 @@ class MusicdlClient:
         )
         effective_dir.mkdir(parents=True, exist_ok=True)
 
-        # Snapshot audio files present BEFORE the download so we can identify
-        # the file that musicdl writes (it doesn't populate file_path on SongInfo).
-        if effective_dir.exists():
-            existing_files: frozenset[Path] = frozenset(
-                p for p in effective_dir.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXTS
-            )
-        else:
-            existing_files = frozenset()
+        # Build the full set of candidate directories and snapshot existing
+        # audio files BEFORE the download so we can identify newly-written files.
+        candidate_dirs = _build_candidate_dirs(effective_dir, track.source)
+        existing_files: frozenset[Path] = _snapshot_audio_files(candidate_dirs)
+        since_ts = time.time()
 
         result_track: MusicdlTrack = await asyncio.to_thread(_blocking_download)
 
         # If musicdl didn't populate file_path (the common case), locate the
-        # newly written audio file by scanning effective_dir recursively.
+        # newly written audio file by scanning all candidate directories.
         if not result_track.file_path:
-            dirs_to_scan: list[Path] = [effective_dir]
-            if track.source:
-                source_subdir = effective_dir / track.source
-                if source_subdir != effective_dir:
-                    dirs_to_scan.append(source_subdir)
-            resolved = _find_downloaded_file(dirs_to_scan, track.song_name, existing_files)
+            dirs_to_scan: list[Path] = list(candidate_dirs)
+
+            # Best-effort: extract a path hint from the raw SongInfo if available.
+            # Different musicdl source implementations may store the written path
+            # under different attribute names (file_path is the documented field,
+            # filepath/savepath are seen in some third-party or older source modules).
+            if result_track._raw is not None:
+                for attr in ("file_path", "filepath", "savepath"):
+                    hint = getattr(result_track._raw, attr, None)
+                    if hint and isinstance(hint, str):
+                        hint_dir = Path(hint).parent
+                        hint_key = hint_dir.resolve() if hint_dir.exists() else hint_dir.absolute()
+                        if hint_dir.is_dir() and hint_key not in {
+                            (d.resolve() if d.exists() else d.absolute()) for d in dirs_to_scan
+                        }:
+                            dirs_to_scan.append(hint_dir)
+
+            resolved = _find_downloaded_file(dirs_to_scan, track.song_name, existing_files, since_ts)
             if resolved:
                 result_track.file_path = str(resolved)
                 log.debug("musicdl: resolved file_path via disk scan → %s", resolved)
+            else:
+                scanned_counts: dict[str, int] = {}
+                for d in dirs_to_scan:
+                    if d.exists():
+                        scanned_counts[str(d)] = sum(
+                            1
+                            for p in d.rglob("*")
+                            if p.is_file() and p.suffix.lower() in AUDIO_EXTS
+                        )
+                raw_repr = repr(result_track._raw)[:_MAX_RAW_REPR_LENGTH] if result_track._raw else "None"
+                log.warning(
+                    "musicdl: no audio file found after download | track=%r | dirs=%s | counts=%s | raw=%s",
+                    track.song_name,
+                    [str(d) for d in dirs_to_scan],
+                    scanned_counts,
+                    raw_repr,
+                )
 
         fp = Path(result_track.file_path) if result_track.file_path else effective_dir
+        if result_track.file_path:
+            error = ""
+        else:
+            dirs_str = ", ".join(str(d) for d in candidate_dirs)
+            error = (
+                f"musicdl reported success but no audio file was found under {dirs_str}. "
+                f"This usually means the source ignored work_dir; check {MUSICDL_DOWNLOAD_DIR} "
+                f"and the bot's CWD."
+            )
         return MusicdlDownloadResult(
             track=result_track,
             file_path=fp,
             success=bool(result_track.file_path),
-            error="" if result_track.file_path else "No file path in result",
+            error=error,
         )
