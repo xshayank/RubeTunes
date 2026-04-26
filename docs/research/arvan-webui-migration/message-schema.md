@@ -1,5 +1,7 @@
 # Rubika Control Bus — Message Schema
 
+> **Status:** Frozen at `v=1`. Canonical implementation: [`kharej/contracts.py`](../../../kharej/contracts.py). See [`CONTRACTS.md`](CONTRACTS.md).
+
 > **Version**: 1  
 > **Status**: Proposed — must be approved by both Track A and Track B developers before coding begins.  
 > See also: [architecture.md](architecture.md) · [task-split.md](task-split.md)
