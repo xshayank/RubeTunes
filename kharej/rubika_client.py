@@ -218,7 +218,10 @@ class RubikaClient:
     ) -> None:
         self._config = config
         if transport_factory is None:
-            transport_factory = lambda cfg: _DefaultRubikaTransport(cfg.session_name)  # noqa: E731
+
+            def transport_factory(cfg: RubikaConfig) -> RubikaTransport:
+                return _DefaultRubikaTransport(cfg.session_name)
+
         self._transport: RubikaTransport = transport_factory(config)
         self._handler: Callable[[Any], Awaitable[None]] | None = None
         self._supervisor_task: asyncio.Task[None] | None = None

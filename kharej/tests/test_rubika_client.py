@@ -617,9 +617,9 @@ async def test_send_raises_on_oversize_payload() -> None:
 
 @pytest.mark.asyncio
 async def test_no_secret_in_logs(caplog: pytest.LogCaptureFixture) -> None:
-    secret_session = "SECRET-TOKEN"
+    mock_secret_session = "SECRET-TOKEN"
     config = RubikaConfig(
-        session_name=secret_session,
+        session_name=mock_secret_session,
         iran_account_guid=_IRAN_GUID,
     )
     transport = FakeTransport()
@@ -631,4 +631,4 @@ async def test_no_secret_in_logs(caplog: pytest.LogCaptureFixture) -> None:
         await client.start()
         await client.stop()
 
-    assert secret_session not in caplog.text
+    assert mock_secret_session not in caplog.text
