@@ -130,6 +130,14 @@ class KharejSettings:
         """Return the value for *key*, or *default* if not set."""
         return self._merged.get(key, default)
 
+    def get_int(self, key: str, default: int = 0) -> int:
+        """Return the value for *key* as an integer, or *default* if not set or not convertible."""
+        value = self._merged.get(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     def set(self, key: str, value: Any) -> None:
         """Persist *key*/*value* to disk and update the in-memory view."""
         self._disk[key] = value

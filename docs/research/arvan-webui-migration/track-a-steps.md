@@ -210,6 +210,8 @@
 - Manual test: send a `job.create` for `platform: "stub"` from a Rubika REPL → receive `job.accepted` then `job.failed: not_implemented` within 1 s.
 - `Ctrl+C` cleanly shuts down.
 
+✅ **Done** — `kharej/dispatcher.py` and `kharej/worker.py` implemented with full lifecycle, access-control gate, Job dataclass, Downloader protocol, StubDownloader, graceful shutdown, and 23 new tests (16 dispatcher + 7 worker).
+
 ---
 
 ## Step 7 — Downloader Integration: YouTube & Spotify (single track)
