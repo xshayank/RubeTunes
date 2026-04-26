@@ -193,12 +193,13 @@ def _make_resolve_and_fetch(
     )
     playlist_json = json.dumps({"entries": entries})
 
-    calls = [0]
+    call_count = 0
 
     def _side_effect(args):
-        calls[0] += 1
+        nonlocal call_count
+        call_count += 1
         # First call → resolve; subsequent → playlist fetch.
-        if calls[0] == 1:
+        if call_count == 1:
             return (0, channel_json, "")
         return (0, playlist_json, "")
 

@@ -74,7 +74,7 @@ _CHANNEL_URL_RE = re.compile(
     r"https?://(?:www\.)?youtube\.com/"
     r"(?:"
     r"channel/(?P<uc_id>UC[\w-]{10,})"  # /channel/UC… (UC + at least 10 chars)
-    r"|@(?P<handle>[\w.-]+)"  # /@handle
+    r"|@(?P<handle>[\w-]+)"  # /@handle
     r"|c/(?P<c_name>[\w.-]+)"  # /c/legacyname
     r"|user/(?P<user_name>[\w.-]+)"  # /user/legacyname
     r")"
