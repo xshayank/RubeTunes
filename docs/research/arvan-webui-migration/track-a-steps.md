@@ -151,6 +151,8 @@
 - Sending a valid `job.create` from a fake transport invokes the registered handler exactly once.
 - Reconnect works after a forced disconnect in tests.
 
+> ✅ **Done** — `kharej/rubika_client.py` implemented with `RubikaConfig` (Pydantic v2, `from_env()`), `RubikaClient` with full inbound pipeline (sender filter, size filter, prefix filter, v=1 decode, handler dispatch via `asyncio.create_task`), exponential backoff reconnect supervisor (±20% jitter, reset on success), exception hierarchy (`RubikaError`, `RubikaSendError`, `RubikaNotConnectedError`), `RubikaTransport` Protocol seam, `InboundMessage` dataclass, and `_DefaultRubikaTransport` real adapter wrapping `rubpy`. `kharej/tests/test_rubika_client.py` covers all 18 required test cases using `FakeTransport` at ≥85% line coverage.
+
 ---
 
 ## Step 5 — Access Control, Settings, Progress Reporter
