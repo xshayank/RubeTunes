@@ -56,6 +56,7 @@ except ImportError:
     MusicdlNotInstalledError = None  # type: ignore[assignment,misc]
 
 import rubetunes.upload_retry as _upload_retry
+import rubetunes.yt_notify as _yt_notify
 
 load_dotenv()
 
@@ -3205,14 +3206,157 @@ async def uploads_handler(update):
     await app.send_message(object_guid, "\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# !ytsub / !ytunsub / !ytsubs — YouTube channel subscription notifier
+# ---------------------------------------------------------------------------
+
+
+@app.on_message_updates(filters.commands("ytsub", prefixes="!"))
+async def ytsub_handler(update):
+    """Subscribe to a YouTube channel.
+
+    Usage: !ytsub <channel_url>
+    """
+    log = logging.getLogger("ytsub")
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    if not args:
+        await app.send_message(
+            object_guid,
+            "❌ Please provide a YouTube channel URL.\n"
+            "Example: !ytsub https://www.youtube.com/@SomeChannel",
+        )
+        return
+
+    raw_url = args.strip()
+    log.info("!ytsub | guid=%s url=%r", object_guid, raw_url)
+    _append_log(object_guid, "ytsub", raw_url)
+
+    status_id = (
+        await app.send_message(object_guid, "🔍 Resolving channel, please wait…")
+    ).message_id
+
+    loop = asyncio.get_event_loop()
+    try:
+        ok, error_msg, record, seed_videos = await loop.run_in_executor(
+            None, _yt_notify.subscribe_sync, raw_url, object_guid
+        )
+    except Exception as exc:
+        log.error("ytsub: unexpected error: %s", exc)
+        await app.edit_message(object_guid, status_id, "❌ An unexpected error occurred.")
+        return
+
+    if not ok:
+        await app.edit_message(object_guid, status_id, error_msg)
+        return
+
+    channel_name = record["channel_name"]
+
+    if seed_videos:
+        # Brand-new channel: show welcome list.
+        lines = [f"✅ Subscribed to **{channel_name}**.", "📜 Latest uploads from this channel:"]
+        for i, v in enumerate(seed_videos, 1):
+            lines.append(f"  {i}. {v['title']} — {v['url']}")
+        lines.append("\nYou will be notified here when new videos are uploaded.")
+        await app.edit_message(object_guid, status_id, "\n".join(lines))
+    else:
+        await app.edit_message(
+            object_guid,
+            status_id,
+            f"✅ Subscribed to **{channel_name}**.\n"
+            "You will be notified here when new videos are uploaded.",
+        )
+
+
+@app.on_message_updates(filters.commands("ytunsub", prefixes="!"))
+async def ytunsub_handler(update):
+    """Unsubscribe from a YouTube channel.
+
+    Usage: !ytunsub <channel_url>
+    """
+    log = logging.getLogger("ytunsub")
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    args = " ".join(update.command[1:]) if update.command and len(update.command) > 1 else ""
+    if not args:
+        await app.send_message(
+            object_guid,
+            "❌ Please provide a YouTube channel URL.\n"
+            "Example: !ytunsub https://www.youtube.com/@SomeChannel",
+        )
+        return
+
+    raw_url = args.strip()
+    log.info("!ytunsub | guid=%s url=%r", object_guid, raw_url)
+    _append_log(object_guid, "ytunsub", raw_url)
+
+    status_id = (
+        await app.send_message(object_guid, "⏳ Processing…")
+    ).message_id
+
+    loop = asyncio.get_event_loop()
+    try:
+        ok, message = await loop.run_in_executor(
+            None, _yt_notify.unsubscribe_sync, raw_url, object_guid
+        )
+    except Exception as exc:
+        log.error("ytunsub: unexpected error: %s", exc)
+        await app.edit_message(object_guid, status_id, "❌ An unexpected error occurred.")
+        return
+
+    await app.edit_message(object_guid, status_id, message)
+
+
+@app.on_message_updates(filters.commands("ytsubs", prefixes="!"))
+async def ytsubs_handler(update):
+    """List your YouTube channel subscriptions.
+
+    Usage: !ytsubs
+    """
+    object_guid = update.object_guid
+
+    allowed, reason = _check_access(object_guid)
+    if not allowed:
+        await app.send_message(object_guid, reason)
+        return
+
+    subscriptions = _yt_notify.list_subscriptions_sync(object_guid)
+
+    if not subscriptions:
+        await app.send_message(
+            object_guid,
+            "ℹ️ You are not subscribed to any YouTube channels.\n"
+            "Use !ytsub <channel_url> to subscribe.",
+        )
+        return
+
+    lines = [f"📋 Your YouTube subscriptions ({len(subscriptions)}):"]
+    for ch in subscriptions:
+        lines.append(f"• {ch['channel_name']} — {ch['channel_url']}")
+    await app.send_message(object_guid, "\n".join(lines))
+
+
 if __name__ == "__main__":
     _upload_retry.load_on_startup()
+    _yt_notify.load_on_startup()
     _restore_queue_snapshot()
     print("[rub] Connecting to Rubika...")
 
     async def _main():
         await app.start(phone_number=PHONE_NUMBER)
         _upload_retry.start_retry_loop(app)
+        _yt_notify.start_poll_loop(app.send_message)
         await app.get_updates()
 
     try:
