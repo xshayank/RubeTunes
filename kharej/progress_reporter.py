@@ -1,16 +1,148 @@
 """Progress reporter for the Kharej VPS worker.
 
-This module will coalesce download progress callbacks from the individual
-downloader modules and emit structured ``job.progress`` events back to the
-Iran VPS via ``rubika_client``.  Key responsibilities:
-- Throttle progress updates (e.g. at most one update per second per job) to
-  avoid flooding the Rubika channel.
-- Include percentage, ETA, and current download speed in each event.
-- Emit a final ``job.done`` or ``job.error`` event upon completion.
-- Expose a Prometheus gauge for active-download count and a histogram for
-  end-to-end job latency.
+Coalesces download/upload progress callbacks and emits ``job.progress``
+messages back to the Iran VPS via a caller-supplied async send function.
 
-# TODO(step-5): implement
+Throttling rules (per job):
+
+- At most **1** ``job.progress`` message every ``throttle_sec`` seconds
+  (default 3 s).
+- Additionally, if *percent* is provided, only emit when the percent value
+  has changed by at least ``min_percent_delta`` points (default 1 %).
+
+Both conditions must be satisfied simultaneously for a progress message to be
+emitted.
+
+Terminal messages (``job.completed``, ``job.failed``) are **always** sent
+immediately, bypassing the throttle, and their per-job state is cleaned up.
+
+The reporter is safe to call from any coroutine: an ``asyncio.Lock`` guards
+all per-job state mutations.
 """
 
 from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+
+from pydantic import BaseModel
+
+from kharej.contracts import JobCompleted, JobFailed, JobProgress
+
+logger = logging.getLogger("kharej.progress_reporter")
+
+# ---------------------------------------------------------------------------
+# Per-job state
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _JobState:
+    last_sent_at: float = field(default=0.0)
+    last_percent: int | None = field(default=None)
+
+
+# ---------------------------------------------------------------------------
+# ProgressReporter
+# ---------------------------------------------------------------------------
+
+
+class ProgressReporter:
+    """Per-job throttled progress reporter.
+
+    Parameters
+    ----------
+    send:
+        Async callable that accepts a Pydantic ``BaseModel`` and delivers it
+        to the Iran VPS (typically ``RubikaClient.send``).
+    throttle_sec:
+        Minimum seconds between consecutive ``job.progress`` sends for the
+        same job (default 3 s).
+    min_percent_delta:
+        Minimum change in *percent* required to emit a progress message when
+        *percent* is provided (default 1 %).
+    """
+
+    def __init__(
+        self,
+        send: Callable[[BaseModel], Awaitable[None]],
+        *,
+        throttle_sec: float = 3.0,
+        min_percent_delta: int = 1,
+    ) -> None:
+        self._send = send
+        self._throttle_sec = throttle_sec
+        self._min_percent_delta = min_percent_delta
+        self._states: dict[str, _JobState] = {}
+        self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def report(self, msg: JobProgress) -> None:
+        """Conditionally emit *msg* subject to time and percent-delta throttle.
+
+        The message is dropped silently if:
+        - fewer than ``throttle_sec`` seconds have elapsed since the last
+          send for this job, **or**
+        - *percent* is set and has not changed by at least
+          ``min_percent_delta`` points since the last send.
+        """
+        job_id = msg.job_id or ""
+        now = time.monotonic()
+
+        should_send = False
+        async with self._lock:
+            state = self._states.setdefault(job_id, _JobState())
+            elapsed = now - state.last_sent_at
+
+            if elapsed >= self._throttle_sec:
+                # Time gate passed — check percent-delta gate.
+                if (
+                    msg.percent is None
+                    or state.last_percent is None
+                    or abs(msg.percent - state.last_percent) >= self._min_percent_delta
+                ):
+                    # Update state before releasing the lock so concurrent
+                    # callers see the updated timestamp immediately.
+                    state.last_sent_at = now
+                    if msg.percent is not None:
+                        state.last_percent = msg.percent
+                    should_send = True
+
+        if should_send:
+            logger.debug(
+                "Sending job.progress",
+                extra={"event": "progress.sent", "job_id": job_id, "percent": msg.percent},
+            )
+            await self._send(msg)
+
+    async def complete(self, msg: JobCompleted) -> None:
+        """Send *msg* immediately (bypasses throttle) and clean up job state."""
+        job_id = msg.job_id or ""
+        async with self._lock:
+            self._states.pop(job_id, None)
+        logger.info(
+            "Sending job.completed",
+            extra={"event": "progress.completed", "job_id": job_id},
+        )
+        await self._send(msg)
+
+    async def fail(self, msg: JobFailed) -> None:
+        """Send *msg* immediately (bypasses throttle) and clean up job state."""
+        job_id = msg.job_id or ""
+        async with self._lock:
+            self._states.pop(job_id, None)
+        logger.info(
+            "Sending job.failed",
+            extra={"event": "progress.failed", "job_id": job_id, "error_code": msg.error_code},
+        )
+        await self._send(msg)
+
+    def reset_job(self, job_id: str) -> None:
+        """Remove per-job throttle state (call on job cancel or cleanup)."""
+        self._states.pop(job_id, None)
