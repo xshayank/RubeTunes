@@ -1,5 +1,7 @@
 # Task Split — Two-Developer Parallel Work Plan
 
+> **Status:** Frozen at `v=1`. Canonical implementation: [`kharej/contracts.py`](../../../kharej/contracts.py). See [`CONTRACTS.md`](CONTRACTS.md).
+
 > See also: [architecture.md](architecture.md) · [message-schema.md](message-schema.md) · [webui-spec.md](webui-spec.md)
 
 Both developers **must agree on the contracts in section 3 (Shared Contracts) before writing any code**.  These contracts are the coupling surface between the two tracks.

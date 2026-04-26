@@ -77,6 +77,8 @@
 
 **Goal**: Freeze the coupling surface before any real code is written. **No further step in Track A starts until this is done.**
 
+✅ **Done** — contracts frozen at `v=1` and codified in [`kharej/contracts.py`](../../../kharej/contracts.py). See [`CONTRACTS.md`](CONTRACTS.md).
+
 **Substeps**
 1. Read [`task-split.md` §3 Shared Contracts](task-split.md) and [`message-schema.md`](message-schema.md) end-to-end.
 2. Joint review meeting with Track B; confirm:
