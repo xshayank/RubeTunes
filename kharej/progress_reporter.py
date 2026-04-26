@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel
 
-from kharej.contracts import JobCompleted, JobFailed, JobProgress
+from kharej.contracts import JobAccepted, JobCompleted, JobFailed, JobProgress
 
 logger = logging.getLogger("kharej.progress_reporter")
 
@@ -146,3 +146,91 @@ class ProgressReporter:
     def reset_job(self, job_id: str) -> None:
         """Remove per-job throttle state (call on job cancel or cleanup)."""
         self._states.pop(job_id, None)
+
+    # ------------------------------------------------------------------
+    # Convenience helpers (Step 6+)
+    # ------------------------------------------------------------------
+
+    async def report_progress(
+        self,
+        job_id: str,
+        percent: int,
+        *,
+        phase: str = "downloading",
+        speed: str | None = None,
+        eta_sec: int | None = None,
+    ) -> None:
+        """Convenience wrapper: create a ``JobProgress`` and call :meth:`report`."""
+        from datetime import datetime, timezone
+
+        await self.report(
+            JobProgress(
+                ts=datetime.now(tz=timezone.utc),
+                job_id=job_id,
+                phase=phase,  # type: ignore[arg-type]
+                percent=percent,
+                speed=speed,
+                eta_sec=eta_sec,
+            )
+        )
+
+    async def report_accepted(
+        self,
+        job_id: str,
+        *,
+        worker_version: str,
+        queue_position: int = 1,
+    ) -> None:
+        """Send a ``JobAccepted`` message immediately (bypasses throttle)."""
+        from datetime import datetime, timezone
+
+        logger.info(
+            "Sending job.accepted",
+            extra={"event": "progress.accepted", "job_id": job_id, "queue_position": queue_position},
+        )
+        await self._send(
+            JobAccepted(
+                ts=datetime.now(tz=timezone.utc),
+                job_id=job_id,
+                worker_version=worker_version,
+                queue_position=queue_position,
+            )
+        )
+
+    async def report_failed(
+        self,
+        job_id: str,
+        *,
+        error_code: str,
+        error_msg: str,
+        retryable: bool = False,
+    ) -> None:
+        """Convenience wrapper: create a ``JobFailed`` and call :meth:`fail`."""
+        from datetime import datetime, timezone
+
+        await self.fail(
+            JobFailed(
+                ts=datetime.now(tz=timezone.utc),
+                job_id=job_id,
+                error_code=error_code,  # type: ignore[arg-type]
+                message=error_msg,
+                retryable=retryable,
+            )
+        )
+
+    async def report_completed(
+        self,
+        job_id: str,
+        *,
+        s2_keys: list,
+    ) -> None:
+        """Convenience wrapper: create a ``JobCompleted`` and call :meth:`complete`."""
+        from datetime import datetime, timezone
+
+        await self.complete(
+            JobCompleted(
+                ts=datetime.now(tz=timezone.utc),
+                job_id=job_id,
+                parts=s2_keys,
+            )
+        )

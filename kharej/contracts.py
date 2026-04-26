@@ -253,6 +253,16 @@ class JobFailed(Envelope):
         "access_denied",
         "disk_space_error",
         "internal_error",
+        # Worker/dispatcher codes (Step 6+)
+        "blocked",
+        "not_whitelisted",
+        "unsupported_platform",
+        "duplicate_job",
+        "cancelled",
+        "timeout",
+        "not_implemented",
+        "error",
+        "shutdown",
     ] = Field(..., description="Machine-readable error code.")
     message: str = Field(..., description="Human-readable error description.")
     retryable: bool = Field(..., description="Whether the caller may retry the job.")
