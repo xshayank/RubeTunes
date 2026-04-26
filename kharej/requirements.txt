@@ -3,6 +3,7 @@ boto3>=1.34
 pydantic>=2.6
 tenacity>=8.2
 prometheus-client>=0.20
+rubpy>=7.3.4
 
 # Test dependencies
 pytest>=8.0
