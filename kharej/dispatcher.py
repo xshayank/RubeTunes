@@ -329,7 +329,7 @@ class Dispatcher:
             return
 
         tasks = list(self._tasks.values())
-        _, pending = await asyncio.wait(tasks, timeout=drain_timeout)
+        done, pending = await asyncio.wait(tasks, timeout=drain_timeout)
 
         for task in pending:
             task.cancel()

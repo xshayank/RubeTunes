@@ -8,8 +8,12 @@ MagicMock/AsyncMock for RubikaClient and S2Client.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
+import shutil
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -39,6 +43,26 @@ _ALLOWED_USER = "user-allowed-aaaa"
 _BLOCKED_USER = "user-blocked-bbbb"
 _NOT_WHITELISTED_USER = "user-nope-cccc"
 _URL = "https://music.example.com/track/abc123"
+
+# ---------------------------------------------------------------------------
+# Temp-dir pool: accumulated during the module lifetime, flushed at exit
+# ---------------------------------------------------------------------------
+
+_TEMP_DIRS: list[str] = []
+
+
+def _cleanup_temp_dirs() -> None:
+    for td in _TEMP_DIRS:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+atexit.register(_cleanup_temp_dirs)
+
+
+def _temp_dir() -> Path:
+    td = tempfile.mkdtemp()
+    _TEMP_DIRS.append(td)
+    return Path(td)
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +96,9 @@ def _make_dispatcher(
     s2 = MagicMock()
 
     if access is None:
-        import tempfile
-        from pathlib import Path
-
-        td = tempfile.mkdtemp()
-        access = AccessControl(state_path=Path(td) / "access_state.json")
-        # Default: single whitelisted user (empty whitelist = everyone allowed).
+        td = _temp_dir()
+        access = AccessControl(state_path=td / "access_state.json")
+        # Default: empty whitelist = everyone allowed.
 
     settings = KharejSettings()
     progress = ProgressReporter(send, throttle_sec=0.0)
@@ -538,11 +559,7 @@ async def test_progress_reporter_invoked_through_dispatcher_smoke() -> None:
     s2 = MagicMock()
     settings = KharejSettings()
 
-    import tempfile
-    from pathlib import Path
-
-    td = tempfile.mkdtemp()
-    access = AccessControl(state_path=Path(td) / "access_state.json")
+    access = AccessControl(state_path=_temp_dir() / "access_state.json")
     progress = ProgressReporter(send, throttle_sec=0.0)
 
     prog = _ProgressDownloader()
@@ -571,6 +588,7 @@ async def test_progress_reporter_invoked_through_dispatcher_smoke() -> None:
 @pytest.mark.asyncio
 async def test_url_is_redacted_in_logs(caplog) -> None:
     sensitive_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    expected_host = "www.youtube.com"
     dispatcher, send = _make_dispatcher(downloaders={})
 
     with caplog.at_level(logging.INFO, logger="kharej.dispatcher"):
@@ -579,10 +597,16 @@ async def test_url_is_redacted_in_logs(caplog) -> None:
         )
 
     # Full URL must not appear in any log record.
-    all_log_text = " ".join(
-        str(r.msg) for r in caplog.records if r.name == "kharej.dispatcher"
-    )
-    assert sensitive_url not in all_log_text
+    for record in caplog.records:
+        if record.name != "kharej.dispatcher":
+            continue
+        record_text = str(record.msg)
+        assert sensitive_url not in record_text
 
-    # But the host should appear.
-    assert "www.youtube.com" in all_log_text
+    # The host field must appear in at least one structured log record.
+    host_logged = any(
+        isinstance(r.msg, dict) and r.msg.get("host") == expected_host
+        for r in caplog.records
+        if r.name == "kharej.dispatcher"
+    )
+    assert host_logged, "Expected 'host' field with value in at least one log record"

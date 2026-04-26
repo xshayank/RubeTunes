@@ -79,6 +79,7 @@ def _setup_logging(*, debug: bool = False) -> None:
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(_JsonFormatter())
     root = logging.getLogger()
+    root.handlers.clear()
     root.setLevel(logging.DEBUG if debug else logging.INFO)
     root.addHandler(handler)
 
@@ -176,11 +177,14 @@ def _cmd_check_config() -> int:
 # ---------------------------------------------------------------------------
 
 
+_RUBIKA_CONNECT_GRACE_PERIOD_SEC = 0.1  # brief settle time after start()
+
+
 async def _probe_rubika(rubika: Any, *, timeout: float) -> bool:
     """Return ``True`` if Rubika connects within *timeout* seconds."""
     try:
         await asyncio.wait_for(rubika.start(), timeout=timeout)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(_RUBIKA_CONNECT_GRACE_PERIOD_SEC)
         connected = rubika.connected
         await rubika.stop()
         return connected
