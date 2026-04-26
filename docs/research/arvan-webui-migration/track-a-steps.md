@@ -119,6 +119,8 @@
 - 100% of public methods have unit tests.
 - Manual smoke test against a real Arvan bucket: upload a 10 MB and a 200 MB file, verify both via `aws s3 ls --endpoint-url=...`.
 
+> ✅ **Done in PR #36** — `kharej/s2_client.py` implemented with `S2Config` (Pydantic v2, `from_env()`), `S2Client` (path-style s3v4, single-pass SHA-256, multipart with abort-on-failure, tenacity retries, structured logging), full exception hierarchy (`S2Error`, `S2NotFound`, `S2AccessDenied`, `S2UploadFailed`), and `_should_retry` policy. `kharej/tests/test_s2_client.py` covers all 18 required test cases (moto + Stubber) at **90% line coverage** (≥85% requirement met).
+
 ---
 
 ## Step 4 — Rubika Control Client (`rubika_client.py`)
