@@ -284,7 +284,7 @@
 
 ---
 
-## Step 10 — Admin Control Messages
+## Step 10 — Admin Control Messages ✅
 
 **Goal**: Cover all admin-side control messages so Track B's admin panel works end-to-end.
 

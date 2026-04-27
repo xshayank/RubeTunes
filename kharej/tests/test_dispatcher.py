@@ -443,13 +443,13 @@ async def test_job_timeout() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 11. handle_message routes by type; HealthPing is ignored
+# 11. handle_message routes by type; HealthPing sends a HealthPong
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_handle_message_routes_by_type() -> None:
-    from kharej.contracts import HealthPing
+    from kharej.contracts import HealthPing, HealthPong
 
     ok = _OkDownloader()
     dispatcher, send = _make_dispatcher(downloaders={ok.platform: ok})
@@ -468,10 +468,13 @@ async def test_handle_message_routes_by_type() -> None:
     await dispatcher.handle_message(job_cancel)
     await asyncio.sleep(0.1)
 
-    # HealthPing must not trigger any send.
+    # HealthPing must trigger exactly one HealthPong send (Step 10).
     pre_count = send.call_count
     await dispatcher.handle_message(health_ping)
-    assert send.call_count == pre_count  # no new calls
+    assert send.call_count == pre_count + 1
+    pongs = _find_sent(send, HealthPong)
+    assert len(pongs) == 1
+    assert pongs[0].request_id == "req-1"
 
 
 # ---------------------------------------------------------------------------
