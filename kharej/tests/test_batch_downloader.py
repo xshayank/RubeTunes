@@ -62,7 +62,6 @@ def _make_job(
     _platform_map = {
         "spotify": Platform.spotify,
         "youtube": Platform.youtube,
-        "stub": Platform.spotify,  # fallback — value unused in batch tests
     }
     platform_enum = _platform_map.get(platform, Platform.spotify)
     msg = JobCreate.model_construct(
@@ -103,10 +102,12 @@ def _make_progress() -> MagicMock:
 
 
 def _make_s2(ref: S2ObjectRef | None = None) -> MagicMock:
+    def _upload(path: Path, key: str, **kw: Any) -> S2ObjectRef:
+        size = path.stat().st_size if path.exists() else 0
+        return _make_ref(key, size)
+
     s2 = MagicMock()
-    s2.upload_file = MagicMock(
-        side_effect=lambda path, key, **kw: _make_ref(key, path.stat().st_size if path.exists() else 0)
-    )
+    s2.upload_file = MagicMock(side_effect=_upload)
     return s2
 
 

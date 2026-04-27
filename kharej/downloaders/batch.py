@@ -209,6 +209,9 @@ class BatchDownloader:
                             # Write the s2 key as content (placeholder for zip).
                             # In a full implementation you would stream from S2
                             # or keep the temp file alive across the boundary.
+                            # TODO: replace with real audio content when per-track
+                            # downloaders can return a local file path alongside
+                            # the S2 ref.
                             local_path.write_text(ref.key)
                             downloaded_files.append(local_path)
                         done_count += 1
