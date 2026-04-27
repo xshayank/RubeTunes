@@ -263,6 +263,8 @@
 
 ## Step 9 — Remaining Downloaders
 
+✅ **Done** — `kharej/downloaders/tidal.py` (`TidalDownloader`), `kharej/downloaders/qobuz.py` (`QobuzDownloader`), `kharej/downloaders/amazon.py` (`AmazonDownloader`), `kharej/downloaders/soundcloud.py` (`SoundcloudDownloader`), `kharej/downloaders/bandcamp.py` (`BandcampDownloader`), and `kharej/downloaders/musicdl.py` (`MusicdlDownloader`) implemented. All 6 platforms registered in `Dispatcher.__init__` (alongside batch's per-track map). `kharej/tests/test_step9_downloaders.py` adds 31 new tests covering uploads, S2 key conventions, invalid-URL errors, progress emission, thumbnail resilience, fallback logic, and dispatcher `.has()` checks for every platform.
+
 **Goal**: Feature-parity with current RubeTunes.
 
 **Substeps**
