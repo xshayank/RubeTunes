@@ -46,13 +46,17 @@ from kharej.settings import KharejSettings
 
 logger = logging.getLogger("kharej.dispatcher")
 
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+_COOKIES_PATH = Path(__file__).parent / "state" / "cookies.txt"
+"""Default path to the ``cookies.txt`` file replaced by ``admin.cookies.update``."""
+
 
 # ---------------------------------------------------------------------------
 # Job dataclass
 # ---------------------------------------------------------------------------
-
-
-_COOKIES_PATH = Path(__file__).parent / "state" / "cookies.txt"
 
 
 @dataclass(frozen=True)
@@ -461,10 +465,7 @@ class Dispatcher:
         """Handle ``admin.cookies.update``: fetch from S2, replace local cookies.txt."""
         logger.info({"event": "dispatcher.admin_cookies_update", "s2_key": msg.s2_key})
         try:
-            response = self._s2._client.get_object(
-                Bucket=self._s2._bucket, Key=msg.s2_key
-            )
-            data: bytes = response["Body"].read()
+            data: bytes = self._s2.get_object_bytes(msg.s2_key)
 
             # Verify SHA-256.
             actual_sha256 = hashlib.sha256(data).hexdigest()

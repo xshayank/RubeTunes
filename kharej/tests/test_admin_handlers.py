@@ -284,7 +284,7 @@ async def test_settings_update_ack_contains_effective_config() -> None:
 
 
 @pytest.mark.asyncio
-async def test_settings_update_ignores_no_known_keys_restriction() -> None:
+async def test_settings_update_accepts_unknown_keys() -> None:
     """Unknown keys should be stored without crashing (no allow-list in contract)."""
     td = _temp_dir()
     settings = KharejSettings(state_path=td / "settings.json")
@@ -308,8 +308,13 @@ async def test_settings_update_ignores_no_known_keys_restriction() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["lru", "isrc", "all"])
 async def test_clearcache_sends_ok_ack(target: str) -> None:
+    from typing import Literal, cast
+
     dispatcher, send_mock = _make_dispatcher()
-    msg = AdminClearcache(ts=_NOW, target=target)  # type: ignore[arg-type]
+    msg = AdminClearcache(
+        ts=_NOW,
+        target=cast(Literal["lru", "isrc", "all"], target),
+    )
     await dispatcher.handle_message(msg)
 
     acks = [m for m in _sent_msgs(send_mock) if isinstance(m, AdminAck)]
@@ -332,10 +337,7 @@ async def test_cookies_update_replaces_file() -> None:
 
     # Set up a fake S2 client that returns our cookie bytes.
     s2 = MagicMock()
-    s2._bucket = "test-bucket"
-    body_mock = MagicMock()
-    body_mock.read.return_value = cookie_data
-    s2._client.get_object.return_value = {"Body": body_mock}
+    s2.get_object_bytes.return_value = cookie_data
 
     dispatcher, send_mock = _make_dispatcher(s2=s2, cookies_path=cookies_path)
 
@@ -358,10 +360,7 @@ async def test_cookies_update_sha256_mismatch_sends_error_ack() -> None:
     cookies_path = td / "cookies.txt"
 
     s2 = MagicMock()
-    s2._bucket = "test-bucket"
-    body_mock = MagicMock()
-    body_mock.read.return_value = b"real content"
-    s2._client.get_object.return_value = {"Body": body_mock}
+    s2.get_object_bytes.return_value = b"real content"
 
     dispatcher, send_mock = _make_dispatcher(s2=s2, cookies_path=cookies_path)
 
@@ -387,8 +386,7 @@ async def test_cookies_update_s2_error_sends_error_ack() -> None:
     cookies_path = td / "cookies.txt"
 
     s2 = MagicMock()
-    s2._bucket = "test-bucket"
-    s2._client.get_object.side_effect = Exception("S2 unavailable")
+    s2.get_object_bytes.side_effect = Exception("S2 unavailable")
 
     dispatcher, send_mock = _make_dispatcher(s2=s2, cookies_path=cookies_path)
 
