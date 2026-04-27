@@ -134,10 +134,18 @@ class Dispatcher:
         if downloaders is not None:
             self._downloaders: dict[str, Any] = dict(downloaders)
         else:
+            from kharej.downloaders.spotify import SpotifyDownloader
             from kharej.downloaders.stub import StubDownloader
+            from kharej.downloaders.youtube import YoutubeDownloader
 
             stub = StubDownloader()
-            self._downloaders = {stub.platform: stub}
+            yt = YoutubeDownloader()
+            sp = SpotifyDownloader()
+            self._downloaders = {
+                stub.platform: stub,
+                yt.platform: yt,
+                sp.platform: sp,
+            }
 
     # ------------------------------------------------------------------
     # Registry

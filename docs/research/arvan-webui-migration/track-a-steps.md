@@ -234,6 +234,8 @@
 
 **Acceptance**: For both platforms, a `job.create` produces a `job.completed` whose `s2_keys[0].key` is fetchable from the bucket and matches the SHA-256 reported.
 
+✅ **Done** — `kharej/downloaders/common.py` (safe_filename, get_downloads_dir, cleanup_path), `kharej/downloaders/youtube.py` (YoutubeDownloader using yt-dlp + asyncio.to_thread, progress hook, S2 upload), `kharej/downloaders/spotify.py` (SpotifyDownloader wrapping spotify_dl waterfall read-only, thumbnail upload to `thumbs/{job_id}.jpg`). Both registered in `Dispatcher.__init__` alongside the existing stub. `kharej/tests/test_downloaders.py` adds 55 new tests (safe_filename, parse_percent/speed/eta, format resolution, full downloader end-to-end with mocked yt-dlp / spotify_dl / S2Client, thumbnail failure resilience).
+
 ---
 
 ## Step 8 — Downloader Integration: Batch / Playlist + zip_split
