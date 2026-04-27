@@ -257,6 +257,8 @@
 - A 3-track playlist → 3 media keys + 1 zip part key in `s2_keys`.
 - A 200-track playlist → progress messages arrive at the throttled rate, zip parts are uploaded incrementally (not all at the end).
 
+✅ **Done** — `kharej/downloaders/batch.py` implemented with `BatchDownloader` (platform = "batch"), per-track concurrency via `asyncio.Semaphore` (bounded by `Settings.get_int("download_concurrency", 2)`), monotonic aggregate progress emission, ZIP creation via the top-level `zip_split.split_zip_from_files` with `Settings.get_bool("enable_zip_split", False)` / `zip_split_threshold_mb` control, single-part (`media_key`) and multi-part (`media_part_key`) S2 upload, and a `_NoopProgress` sink used for per-track sub-calls. Dispatcher wired to route `job_type == "batch"` jobs to `BatchDownloader` regardless of platform. `KharejSettings.get_bool()` helper added. `kharej/tests/test_batch_downloader.py` adds 33 new tests covering all required scenarios (track count, partial failure, progress monotonicity, zip creation, split path, concurrency, dispatcher wiring).
+
 ---
 
 ## Step 9 — Remaining Downloaders

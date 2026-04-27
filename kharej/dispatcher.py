@@ -134,6 +134,7 @@ class Dispatcher:
         if downloaders is not None:
             self._downloaders: dict[str, Any] = dict(downloaders)
         else:
+            from kharej.downloaders.batch import BatchDownloader
             from kharej.downloaders.spotify import SpotifyDownloader
             from kharej.downloaders.stub import StubDownloader
             from kharej.downloaders.youtube import YoutubeDownloader
@@ -141,11 +142,23 @@ class Dispatcher:
             stub = StubDownloader()
             yt = YoutubeDownloader()
             sp = SpotifyDownloader()
+            batch = BatchDownloader(
+                per_track_downloaders={
+                    yt.platform: yt,
+                    sp.platform: sp,
+                }
+            )
             self._downloaders = {
                 stub.platform: stub,
                 yt.platform: yt,
                 sp.platform: sp,
+                batch.platform: batch,
             }
+
+        # Separate storage for the batch downloader instance so that the
+        # dispatcher can route by job_type == "batch" regardless of which
+        # platform string is on the message.
+        self._batch_downloader: Any = self._downloaders.get("batch")
 
     # ------------------------------------------------------------------
     # Registry
@@ -154,6 +167,8 @@ class Dispatcher:
     def register(self, downloader: Any) -> None:
         """Register (or replace) a downloader for its declared platform."""
         self._downloaders[downloader.platform] = downloader
+        if downloader.platform == "batch":
+            self._batch_downloader = downloader
 
     def has(self, platform: str) -> bool:
         """Return ``True`` if a downloader is registered for *platform*."""
@@ -254,10 +269,16 @@ class Dispatcher:
         )
 
         # 3. Look up downloader.
-        downloader = self._downloaders.get(platform_str)
-        if downloader is None:
-            # Also try via direct key match (handles Platform enum lookup).
-            downloader = self._downloaders.get(msg.platform)
+        # Batch jobs are routed to the BatchDownloader regardless of which
+        # platform the tracks belong to — the BatchDownloader holds a reference
+        # to the per-platform single-track downloaders internally.
+        if msg.job_type == "batch" and self._batch_downloader is not None:
+            downloader = self._batch_downloader
+        else:
+            downloader = self._downloaders.get(platform_str)
+            if downloader is None:
+                # Also try via direct key match (handles Platform enum lookup).
+                downloader = self._downloaders.get(msg.platform)
 
         if downloader is None:
             logger.info(

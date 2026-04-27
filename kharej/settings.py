@@ -138,6 +138,21 @@ class KharejSettings:
         except (TypeError, ValueError):
             return default
 
+    def get_bool(self, key: str, default: bool = False) -> bool:
+        """Return the value for *key* as a boolean, or *default* if not set.
+
+        Recognises truthy string literals ``"1"``, ``"true"``, ``"yes"``, ``"on"``
+        (case-insensitive) as ``True``; all other strings are ``False``.
+        """
+        value = self._merged.get(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return default
+
     def set(self, key: str, value: Any) -> None:
         """Persist *key*/*value* to disk and update the in-memory view."""
         self._disk[key] = value
