@@ -519,7 +519,7 @@ for each part in parts:
 
 | Code | User-visible message (Persian) | Retryable | Notes |
 |------|-------------------------------|-----------|-------|
-| `no_source_available` | همه منابع دانلود امتحان شدند | `false` | Circuit breaker exhausted all providers. |
+| `no_source_available` | همه منابع دانلود آزمایش شدند | `false` | Circuit breaker exhausted all providers. |
 | `s2_upload_failed` | بارگذاری فایل ناموفق بود | `true` | S2 upload failed after 5 retries. |
 | `download_timeout` | دانلود در زمان مقرر انجام نشد | `true` | Provider timed out. |
 | `rate_limited` | محدودیت نرخ ارائه‌دهنده | `true` | Provider returned 429. |
@@ -1692,7 +1692,7 @@ if (res.status === 410) {
 | `disk_space_error` | فضای دیسک سرور پر است، با مدیر تماس بگیرید | ✗ |
 | `internal_error` | خطای داخلی سرور، لطفاً دوباره امتحان کنید | ✅ |
 | `blocked` | حساب کاربری شما مسدود شده است | ✗ |
-| `not_whitelisted` | حساب کاربری شما هنوز تأیید نشده است | ✗ |
+| `not_whitelisted` | حساب کاربری شما هنوز تایید نشده است | ✗ |
 | `cancelled` | دانلود لغو شد | ✅ |
 | `timeout` | زمان انجام کار تمام شد | ✅ |
 | `shutdown` | سرور در حال راه‌اندازی مجدد است | ✅ |
