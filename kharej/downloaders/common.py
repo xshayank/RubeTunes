@@ -48,7 +48,13 @@ def safe_filename(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 _SETTINGS_KEY = "download_dir"
-_DEFAULT_DOWNLOAD_DIR = Path("/tmp/kharej_downloads")
+
+
+def _default_download_dir() -> Path:
+    """Return the default download directory using the system temp directory."""
+    import tempfile  # noqa: PLC0415
+
+    return Path(tempfile.gettempdir()) / "kharej_downloads"
 
 
 def get_downloads_dir(settings: KharejSettings) -> Path:
@@ -60,7 +66,7 @@ def get_downloads_dir(settings: KharejSettings) -> Path:
     The directory is created (with parents) on first access.
     """
     raw = settings.get(_SETTINGS_KEY)
-    base: Path = Path(raw) if raw else _DEFAULT_DOWNLOAD_DIR
+    base: Path = Path(raw) if raw else _default_download_dir()
     base.mkdir(parents=True, exist_ok=True)
     return base
 

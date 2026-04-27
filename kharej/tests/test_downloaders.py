@@ -349,12 +349,11 @@ async def test_youtube_downloader_uploads_and_returns_ref(tmp_path: Path) -> Non
 
     assert len(refs) == 1
     assert refs[0] is _DUMMY_REF
-    # Confirm upload_file was called exactly once.
+    # Confirm upload_file was called with the correct positional key argument.
     s2.upload_file.assert_called_once()
-    call_args = s2.upload_file.call_args
-    key_arg = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("key", call_args[0][1])
-    assert key_arg.startswith(f"media/{_JOB_ID}/")
-    assert key_arg.endswith(".mp3")
+    _, uploaded_key = s2.upload_file.call_args.args
+    assert uploaded_key.startswith(f"media/{_JOB_ID}/")
+    assert uploaded_key.endswith(".mp3")
 
 
 @pytest.mark.asyncio
@@ -436,8 +435,7 @@ async def test_youtube_downloader_s2_key_uses_safe_filename() -> None:
         downloader = YoutubeDownloader()
         await downloader.run(job, s2=s2, progress=progress, settings=settings)
 
-    call_args = s2.upload_file.call_args
-    key = call_args[0][1]
+    _, key = s2.upload_file.call_args.args
     # Must not contain colon or question mark
     assert ":" not in key
     assert "?" not in key
@@ -491,10 +489,9 @@ async def test_spotify_downloader_uploads_and_returns_ref() -> None:
     assert len(refs) >= 1
     assert refs[0] is _DUMMY_REF
     s2.upload_file.assert_called()
-    call_args = s2.upload_file.call_args_list[0]
-    key = call_args[0][1]
-    assert key.startswith(f"media/{_JOB_ID}/")
-    assert key.endswith(".mp3")
+    _, first_key = s2.upload_file.call_args_list[0].args
+    assert first_key.startswith(f"media/{_JOB_ID}/")
+    assert first_key.endswith(".mp3")
 
 
 @pytest.mark.asyncio

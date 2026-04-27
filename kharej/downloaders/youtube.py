@@ -174,10 +174,19 @@ class YoutubeDownloader:
             # ------------------------------------------------------------------
             # Find the downloaded file
             # ------------------------------------------------------------------
-            files = list(tmp_dir.iterdir())
+            # yt-dlp may produce the final file plus transient fragments/parts.
+            # Prefer the most-recently-modified file with a recognised media
+            # extension; fall back to the largest file if nothing matches.
+            _MEDIA_EXTS = {
+                ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".webm",
+                ".mp4", ".mkv", ".avi", ".mov",
+            }
+            files = [p for p in tmp_dir.iterdir() if p.is_file()]
             if not files:
                 raise RuntimeError("yt-dlp produced no output file")
-            local_path = max(files, key=lambda p: p.stat().st_size)
+            media_files = [p for p in files if p.suffix.lower() in _MEDIA_EXTS]
+            candidates = media_files or files
+            local_path = max(candidates, key=lambda p: p.stat().st_mtime)
             ext = local_path.suffix.lstrip(".")
 
             # ------------------------------------------------------------------

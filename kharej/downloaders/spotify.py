@@ -82,7 +82,7 @@ class SpotifyDownloader:
 
         title: str = info.get("title") or "Unknown"
         artists: list[str] = info.get("artists") or []
-        cover_url: str | None = info.get("cover_url") or info.get("cover") or None
+        cover_url: str | None = info.get("cover_url") or info.get("cover")
 
         logger.info(
             {
