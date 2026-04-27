@@ -161,11 +161,11 @@ sequenceDiagram
     participant RubIran as Iran Rubika Client
     participant Worker as Kharej Worker
 
-    User->>API: POST /jobs { url: spotify:playlist:XYZ, quality: flac }
-    API->>API: Fetch playlist metadata (Spotify GraphQL, metadata only)
-    API->>API: Generate job_id, INSERT job (type=batch, total_tracks=50)
-    API->>RubIran: publish job.create (batch, track_ids=[...])
-    API-->>User: 202 { job_id, total_tracks: 50 }
+    User->>API: POST /jobs { url: https://open.spotify.com/playlist/XYZ, quality: flac }
+    API->>API: Validate URL format + domain allowlist
+    API->>API: Generate job_id, INSERT job (type=batch)
+    API->>RubIran: publish job.create (batch, url=...)
+    API-->>User: 202 { job_id }
 
     Worker->>RubIran: job.accepted
     loop per track (up to BATCH_CONCURRENCY=3 parallel)
@@ -277,18 +277,15 @@ Java receiving side: strip `RTUNES::` prefix, parse JSON, dispatch on `type`.
   "quality": "mp3",
   "job_type": "batch",
   "format_hint": "mp3",
-  "collection_name": "Today's Top Hits",
-  "track_ids": [
-    "4uLU6hMCjMI75M1A2tKUQC",
-    "7qiZfU4dY1lWllzX7mPBI3"
-  ],
-  "total_tracks": 50,
+  "collection_name": null,
+  "track_ids": null,
+  "total_tracks": null,
   "batch_seq": null,
   "batch_total": null
 }
 ```
 
-> ⚠️ **Size warning:** If `track_ids` would exceed 4 KB (roughly >200 IDs), omit `track_ids` and let the Kharej Worker fetch the playlist directly from the URL, OR send multiple `job.create` messages with the same `job_id` but different `batch_seq` / `batch_total` values.
+> **Note:** Iran sends only the URL. The Kharej worker resolves the playlist, fetches all track IDs from the platform, and determines `total_tracks` itself. Iran never calls Spotify, YouTube, or any media platform API.
 
 **Fields:**
 
@@ -301,11 +298,11 @@ Java receiving side: strip `RTUNES::` prefix, parse JSON, dispatch on `type`.
 | `quality` | string | ✅ | `"mp3"` \| `"flac"` \| `"hires"` \| `"1080p"` \| `"720p"` \| etc. |
 | `job_type` | `"single"` \| `"batch"` | ✅ | `"single"` for one track; `"batch"` for playlist/album. |
 | `format_hint` | string \| null | ✗ | Optional format override (`"mp3"`, `"flac"`, `"m4a"`). |
-| `collection_name` | string \| null | Batch only | Human-readable playlist/album name. |
-| `track_ids` | `string[]` \| null | Batch only | Platform track IDs (omit if >200 tracks). |
-| `total_tracks` | integer (≥1) \| null | Batch only | Total track count. |
-| `batch_seq` | integer (≥1) \| null | Batch split only | Sequence number for split batches. |
-| `batch_total` | integer (≥1) \| null | Batch split only | Total number of split messages for this batch. |
+| `collection_name` | string \| null | ✗ | Optional human-readable name the user entered. If null, Kharej derives it from the URL. |
+| `track_ids` | null | ✗ | Always `null` — Iran never fetches track IDs. Kharej resolves them from the URL. |
+| `total_tracks` | null | ✗ | Always `null` — Kharej determines the count after resolving the playlist/album. |
+| `batch_seq` | null | ✗ | Reserved for future split-batch protocol. Always `null` for now. |
+| `batch_total` | null | ✗ | Reserved for future split-batch protocol. Always `null` for now. |
 
 **Error handling:** If Kharej cannot process the job, it replies with `job.failed`. The Iran side must update the DB job status accordingly and surface the error to the user.
 
@@ -984,7 +981,6 @@ iran/
 │       │   │   ├── AuthController.java
 │       │   │   ├── JobController.java
 │       │   │   ├── LibraryController.java
-│       │   │   ├── SearchController.java
 │       │   │   ├── AdminController.java
 │       │   │   └── HealthController.java
 │       │   └── rubika/
@@ -1539,18 +1535,17 @@ public void handlePong(HealthPong pong) {
 
 ### D.2 Job Submission Form
 
-**Location:** `/search` result card → Quality picker drawer, or direct URL paste into search bar.
+**Location:** URL paste bar on the home/download page. The user pastes a platform URL; Iran detects the platform and `job_type` from the URL pattern without making any external calls.
 
 **Fields and mapping to `job.create`:**
 
 | UI Field | HTML/Zod type | Maps to `job.create` field | Validation |
 |----------|--------------|---------------------------|------------|
-| Platform URL (or Spotify/YT URL auto-detected) | `input[type=url]` | `url` | must match an allowed domain |
-| Platform badge (auto-detected) | readonly badge | `platform` | `Platform` enum |
+| Platform URL | `input[type=url]` | `url` | must match an allowed domain |
+| Platform badge (auto-detected from URL domain) | readonly badge | `platform` | `Platform` enum |
 | Quality picker | `select` / radio group | `quality` | `"mp3" \| "flac" \| "hires" \| "1080p" \| "720p"` |
 | Format hint | optional `select` | `format_hint` | `"mp3" \| "flac" \| "m4a"` or null |
-| Playlist / album mode | auto-detected from URL | `job_type` | `"single" \| "batch"` |
-| Collection name | auto-filled from metadata | `collection_name` | string, batch only |
+| Playlist / album mode (auto-detected from URL path) | readonly badge | `job_type` | `"single" \| "batch"` |
 
 **Zod schema example:**
 ```typescript
@@ -2148,20 +2143,19 @@ public void cleanupExpiredJobs() {
 
 ---
 
-### Milestone M4 — Search & Metadata (≈3 developer-days)
+### Milestone M4 — Library & Job History (≈1 developer-day)
 
-**Goal:** Search API and video/track info endpoint for the UI.
+**Goal:** Library/history API endpoint for the UI. Iran does **not** connect to any media platform (Spotify, YouTube, yt-dlp, etc.) — all metadata resolution happens on the Kharej side.
 
 **Checklist:**
 
-- [ ] **M4.1** `GET /search?q=...&platform=spotify`: call Spotify GraphQL pathfinder (`api-partner.spotify.com`) for metadata only; return track/album/playlist cards.
-- [ ] **M4.2** `GET /video/info?url=...`: run `yt-dlp -j` subprocess for YouTube metadata; return available qualities.
-- [ ] **M4.3** `GET /library`: paginated list of user's jobs (completed + in-progress + failed); filter by status/platform/date.
-- [ ] **M4.4** Cache search results in Redis (optional) or in-memory (caffeine) with 5-minute TTL.
+- [ ] **M4.1** `GET /library`: paginated list of user's jobs (completed + in-progress + failed); filter by status/platform/date.
+- [ ] **M4.2** Cache library results in-memory (Caffeine) with short TTL to reduce DB load.
 
 **Testing:**
-- [ ] Unit test for Spotify metadata client (mock HTTP).
 - [ ] Unit test for library pagination.
+
+> **Removed from scope:** `GET /search` (Spotify GraphQL) and `GET /video/info` (yt-dlp) are NOT implemented on the Iran side. The Iran VPS has no outbound connections to media platforms. Users paste URLs directly; Kharej resolves all metadata.
 
 ---
 
@@ -2173,7 +2167,7 @@ public void cleanupExpiredJobs() {
 
 - [ ] **M5.1** Vite + React + TypeScript + Tailwind + shadcn/ui project setup. RTL layout (`dir="rtl"`). Vazirmatn font. Dark mode.
 - [ ] **M5.2** Auth pages: Login, Register, Pending Approval.
-- [ ] **M5.3** Search page: URL paste + platform search + result cards + quality picker drawer.
+- [ ] **M5.3** Download page: URL paste input with platform auto-detection, quality picker, and submit button. No external metadata fetching.
 - [ ] **M5.4** Job progress page: SSE-driven status badge, progress bar, batch track grid, cancel button, download buttons.
 - [ ] **M5.5** Library page: paginated job history, active jobs tab, "Download again" button, expiry indicator.
 - [ ] **M5.6** Account settings page.
@@ -2184,7 +2178,7 @@ public void cleanupExpiredJobs() {
 
 **Testing:**
 - [ ] Vitest unit tests for Zod validation schemas.
-- [ ] Playwright E2E test: login → search → submit job → see progress → download.
+- [ ] Playwright E2E test: login → paste URL → submit job → see progress → download.
 
 **Observability:**
 - [ ] Frontend error reporting via `console.error` + optional Sentry DSN.
@@ -2249,11 +2243,11 @@ public void cleanupExpiredJobs() {
 | M1 | Foundation: Spring Boot, DB schema, JWT auth, Rubika bridge | ~6 d |
 | M2 | Job lifecycle: create → progress → completed, SSE | ~5 d |
 | M3 | Admin control plane: whitelist/block/settings/health | ~4 d |
-| M4 | Search & metadata API | ~3 d |
+| M4 | Library & job history API | ~1 d |
 | M5 | React frontend — public pages | ~8 d |
 | M6 | React frontend — admin panel | ~6 d |
 | M7 | Deployment, tests, hardening | ~4 d |
-| **Total** | | **~36 developer-days** |
+| **Total** | | **~34 developer-days** |
 
 ---
 
