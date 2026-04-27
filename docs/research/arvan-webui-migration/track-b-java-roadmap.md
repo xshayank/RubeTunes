@@ -168,7 +168,8 @@ sequenceDiagram
     API-->>User: 202 { job_id }
 
     Worker->>RubIran: job.accepted
-    loop per track (up to BATCH_CONCURRENCY=3 parallel)
+    Worker->>Worker: resolve track IDs from URL (Spotify GraphQL or yt-dlp extract_flat)
+    loop per track (up to download_concurrency=2 parallel, configurable)
         Worker->>RubIran: job.progress { done_tracks, total_tracks, current_track }
     end
     Worker->>Worker: zip_split → playlist-part1.zip, playlist-part2.zip
@@ -286,6 +287,8 @@ Java receiving side: strip `RTUNES::` prefix, parse JSON, dispatch on `type`.
 ```
 
 > **Note:** Iran sends only the URL. The Kharej worker resolves the playlist, fetches all track IDs from the platform, and determines `total_tracks` itself. Iran never calls Spotify, YouTube, or any media platform API.
+>
+> **Supported platforms for batch URL resolution:** `"spotify"` (playlist and album, via Spotify GraphQL pathfinder API) and `"youtube"` (playlist, via yt-dlp `extract_flat`). Sending `job_type="batch"` for any other platform (e.g. `"tidal"`, `"qobuz"`) will result in `job.failed` — those platforms do not yet support Kharej-side collection resolution.
 
 **Fields:**
 
@@ -752,7 +755,7 @@ for each part in parts:
   "status": "ok",
   "detail": null,
   "effective_config": {
-    "batch_concurrency": 4,
+    "download_concurrency": 4,
     "user_tracks_per_hour": 50,
     "circuit_fail_threshold": 5,
     "progress_throttle_seconds": 3
@@ -1726,7 +1729,7 @@ Form fields mapped to `admin.settings.update.settings` keys:
 
 | Form field | Settings key | Type | Default |
 |-----------|-------------|------|---------|
-| Max parallel downloads | `batch_concurrency` | integer | 3 |
+| Max parallel downloads | `download_concurrency` | integer | 2 |
 | Tracks per hour per user | `user_tracks_per_hour` | integer | 20 |
 | ZIP part size (MB) | `zip_part_size_mb` | integer | 1950 |
 | Presigned URL TTL (seconds) | `presigned_url_ttl_sec` | integer | 3600 |
