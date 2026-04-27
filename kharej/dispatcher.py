@@ -10,19 +10,34 @@ the Iran VPS via :class:`~kharej.progress_reporter.ProgressReporter`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import shutil
+import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, ClassVar, Mapping, Protocol, runtime_checkable
 
 from kharej import __version__
 from kharej.access_control import AccessControl
 from kharej.contracts import (
     AccessDecision,
+    AdminAck,
+    AdminClearcache,
+    AdminCookiesUpdate,
+    AdminSettingsUpdate,
     AnyMessage,
+    HealthPing,
+    HealthPong,
     JobCancel,
     JobCreate,
     S2ObjectRef,
+    UserBlockAdd,
+    UserBlockRemove,
+    UserWhitelistAdd,
+    UserWhitelistRemove,
 )
 from kharej.progress_reporter import ProgressReporter
 from kharej.rubika_client import RubikaClient
@@ -35,6 +50,9 @@ logger = logging.getLogger("kharej.dispatcher")
 # ---------------------------------------------------------------------------
 # Job dataclass
 # ---------------------------------------------------------------------------
+
+
+_COOKIES_PATH = Path(__file__).parent / "state" / "cookies.txt"
 
 
 @dataclass(frozen=True)
@@ -122,6 +140,7 @@ class Dispatcher:
         progress: ProgressReporter,
         downloaders: Mapping[str, Any] | None = None,
         job_timeout_seconds: float = 60 * 60,
+        cookies_path: Path | None = None,
     ) -> None:
         self._s2 = s2
         self._rubika = rubika
@@ -130,6 +149,8 @@ class Dispatcher:
         self._progress = progress
         self._job_timeout = job_timeout_seconds
         self._tasks: dict[str, asyncio.Task] = {}
+        self._started_at: float = time.monotonic()
+        self._cookies_path: Path = cookies_path or _COOKIES_PATH
 
         if downloaders is not None:
             self._downloaders: dict[str, Any] = dict(downloaders)
@@ -216,13 +237,34 @@ class Dispatcher:
         Routes by message type.  Unknown / unhandled types are logged and
         ignored — they never raise.
         """
-        if isinstance(msg, JobCreate):
-            await self.handle_job_create(msg)
-        elif isinstance(msg, JobCancel):
-            await self.handle_job_cancel(msg)
-        else:
-            logger.info(
-                {"event": "dispatcher.ignored", "type": getattr(msg, "type", "unknown")}
+        try:
+            if isinstance(msg, JobCreate):
+                await self.handle_job_create(msg)
+            elif isinstance(msg, JobCancel):
+                await self.handle_job_cancel(msg)
+            elif isinstance(msg, HealthPing):
+                await self.handle_health_ping(msg)
+            elif isinstance(msg, UserWhitelistAdd):
+                await self._access.handle_whitelist_add(msg, self._rubika.send)
+            elif isinstance(msg, UserWhitelistRemove):
+                await self._access.handle_whitelist_remove(msg, self._rubika.send)
+            elif isinstance(msg, UserBlockAdd):
+                await self._access.handle_block_add(msg, self._rubika.send)
+            elif isinstance(msg, UserBlockRemove):
+                await self._access.handle_block_remove(msg, self._rubika.send)
+            elif isinstance(msg, AdminSettingsUpdate):
+                await self._settings.handle_settings_update(msg, self._rubika.send)
+            elif isinstance(msg, AdminClearcache):
+                await self.handle_admin_clearcache(msg)
+            elif isinstance(msg, AdminCookiesUpdate):
+                await self.handle_admin_cookies_update(msg)
+            else:
+                logger.info(
+                    {"event": "dispatcher.ignored", "type": getattr(msg, "type", "unknown")}
+                )
+        except Exception:
+            logger.exception(
+                {"event": "dispatcher.handler_error", "type": getattr(msg, "type", "unknown")}
             )
 
     # ------------------------------------------------------------------
@@ -364,6 +406,103 @@ class Dispatcher:
             return
         logger.debug({"event": "dispatcher.cancelling", "job_id": job_id})
         task.cancel()
+
+    # ------------------------------------------------------------------
+    # Health ping/pong
+    # ------------------------------------------------------------------
+
+    async def handle_health_ping(self, msg: HealthPing) -> None:
+        """Handle ``health.ping``: respond with ``health.pong``."""
+        logger.info({"event": "dispatcher.health_ping", "request_id": msg.request_id})
+        try:
+            disk = shutil.disk_usage("/")
+            disk_free_gb = disk.free / (1024 ** 3)
+        except Exception:
+            disk_free_gb = 0.0
+
+        uptime_sec = int(time.monotonic() - self._started_at)
+
+        pong = HealthPong(
+            ts=datetime.now(tz=timezone.utc),
+            request_id=msg.request_id,
+            worker_version=__version__,
+            queue_depth=self.in_flight,
+            circuit_breakers=[],
+            providers=[],
+            disk_free_gb=round(disk_free_gb, 2),
+            uptime_sec=uptime_sec,
+        )
+        await self._rubika.send(pong)
+        logger.info({"event": "dispatcher.health_pong_sent", "request_id": msg.request_id})
+
+    # ------------------------------------------------------------------
+    # Admin: clearcache
+    # ------------------------------------------------------------------
+
+    async def handle_admin_clearcache(self, msg: AdminClearcache) -> None:
+        """Handle ``admin.clearcache``: flush caches and send ``admin.ack``."""
+        target = msg.target
+        logger.info({"event": "dispatcher.admin_clearcache", "target": target})
+        # The kharej worker does not maintain LRU or ISRC caches locally;
+        # the ack is sent immediately with a note.
+        ack = AdminAck(
+            ts=datetime.now(tz=timezone.utc),
+            acked_type="admin.clearcache",
+            status="ok",
+            detail=f"clearcache({target}): no local caches on kharej worker",
+        )
+        await self._rubika.send(ack)
+
+    # ------------------------------------------------------------------
+    # Admin: cookies update
+    # ------------------------------------------------------------------
+
+    async def handle_admin_cookies_update(self, msg: AdminCookiesUpdate) -> None:
+        """Handle ``admin.cookies.update``: fetch from S2, replace local cookies.txt."""
+        logger.info({"event": "dispatcher.admin_cookies_update", "s2_key": msg.s2_key})
+        try:
+            response = self._s2._client.get_object(
+                Bucket=self._s2._bucket, Key=msg.s2_key
+            )
+            data: bytes = response["Body"].read()
+
+            # Verify SHA-256.
+            actual_sha256 = hashlib.sha256(data).hexdigest()
+            if actual_sha256 != msg.sha256:
+                raise ValueError(
+                    f"SHA-256 mismatch: expected {msg.sha256!r}, got {actual_sha256!r}"
+                )
+
+            # Atomically replace cookies.txt.
+            self._cookies_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._cookies_path.with_suffix(".tmp")
+            tmp_path.write_bytes(data)
+            tmp_path.replace(self._cookies_path)
+
+            logger.info(
+                {
+                    "event": "dispatcher.admin_cookies_replaced",
+                    "path": str(self._cookies_path),
+                    "size": len(data),
+                }
+            )
+            ack = AdminAck(
+                ts=datetime.now(tz=timezone.utc),
+                acked_type="admin.cookies.update",
+                status="ok",
+                detail=f"cookies.txt replaced ({len(data)} bytes)",
+            )
+        except Exception as exc:
+            logger.exception(
+                {"event": "dispatcher.admin_cookies_error", "exc": repr(exc)}
+            )
+            ack = AdminAck(
+                ts=datetime.now(tz=timezone.utc),
+                acked_type="admin.cookies.update",
+                status="error",
+                detail=repr(exc),
+            )
+        await self._rubika.send(ack)
 
     # ------------------------------------------------------------------
     # Graceful shutdown
