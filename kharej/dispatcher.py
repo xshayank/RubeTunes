@@ -134,24 +134,47 @@ class Dispatcher:
         if downloaders is not None:
             self._downloaders: dict[str, Any] = dict(downloaders)
         else:
+            from kharej.downloaders.amazon import AmazonDownloader
+            from kharej.downloaders.bandcamp import BandcampDownloader
             from kharej.downloaders.batch import BatchDownloader
+            from kharej.downloaders.musicdl import MusicdlDownloader
+            from kharej.downloaders.qobuz import QobuzDownloader
+            from kharej.downloaders.soundcloud import SoundcloudDownloader
             from kharej.downloaders.spotify import SpotifyDownloader
             from kharej.downloaders.stub import StubDownloader
+            from kharej.downloaders.tidal import TidalDownloader
             from kharej.downloaders.youtube import YoutubeDownloader
 
             stub = StubDownloader()
             yt = YoutubeDownloader()
             sp = SpotifyDownloader()
+            tidal = TidalDownloader()
+            qobuz = QobuzDownloader()
+            amazon = AmazonDownloader()
+            sc = SoundcloudDownloader()
+            bc = BandcampDownloader()
+            mdl = MusicdlDownloader()
             batch = BatchDownloader(
                 per_track_downloaders={
                     yt.platform: yt,
                     sp.platform: sp,
+                    tidal.platform: tidal,
+                    qobuz.platform: qobuz,
+                    amazon.platform: amazon,
+                    sc.platform: sc,
+                    bc.platform: bc,
                 }
             )
             self._downloaders = {
                 stub.platform: stub,
                 yt.platform: yt,
                 sp.platform: sp,
+                tidal.platform: tidal,
+                qobuz.platform: qobuz,
+                amazon.platform: amazon,
+                sc.platform: sc,
+                bc.platform: bc,
+                mdl.platform: mdl,
                 batch.platform: batch,
             }
 
