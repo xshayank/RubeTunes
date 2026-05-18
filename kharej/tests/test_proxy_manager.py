@@ -4,7 +4,7 @@ import asyncio
 import time
 from pathlib import Path
 
-from kharej.proxy_manager import ProxyManager, _ProxyRecord
+from kharej.proxy_manager import ProxyManager, _BACKUP_PROXY_URL, _ProxyRecord
 
 
 class _RefillingProxyManager(ProxyManager):
@@ -65,6 +65,22 @@ def test_stale_proxy_remains_usable_as_fallback(tmp_path: Path) -> None:
     assert mgr.fresh_working_count() == 0
     assert mgr.working_count() == 1
     assert mgr.get_proxy() == "http://127.0.0.1:8080"
+
+
+def test_empty_pool_returns_backup_proxy_when_refresh_finds_nothing(tmp_path: Path) -> None:
+    mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
+
+    proxy = asyncio.run(mgr.scan_and_get_proxy())
+
+    assert proxy == _BACKUP_PROXY_URL
+
+
+def test_backup_proxy_is_protected_from_eviction(tmp_path: Path) -> None:
+    mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
+
+    mgr.mark_proxy_failed(_BACKUP_PROXY_URL)
+
+    assert asyncio.run(mgr.scan_and_get_proxy()) == _BACKUP_PROXY_URL
 
 
 def test_freeproxy_source_list_includes_recent_http_sources(tmp_path: Path) -> None:

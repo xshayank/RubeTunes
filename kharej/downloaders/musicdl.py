@@ -85,97 +85,109 @@ class MusicdlDownloader:
         )
         await progress.report_progress(job.job_id, 0, phase="downloading")
 
-        try:
-            proxy: str | None = await proxy_manager.scan_and_get_proxy() if MUSICDL_USE_PROXY else None
-            client = MusicdlClient(sources=sources, proxy=proxy)
-        except MusicdlNotInstalledError as exc:
-            raise RuntimeError(
-                "musicdl Python package is not installed; install musicdl to use this platform"
-            ) from exc
-
-        result = await client.search(query, sources=sources, limit=_MAX_CANDIDATES)
-
-        if not result.tracks:
-            raise RuntimeError(
-                f"musicdl returned no results for query: {query!r}"
-            )
-
-        logger.info(
-            {
-                "event": "musicdl.search_done",
-                "job_id": job.job_id,
-                "total": result.total,
-            }
-        )
+        proxy: str | None = await proxy_manager.scan_and_get_proxy() if MUSICDL_USE_PROXY else None
+        backup_proxy = proxy_manager.get_backup_proxy() if MUSICDL_USE_PROXY else None
+        proxy_attempts = [proxy]
+        if backup_proxy and backup_proxy != proxy:
+            proxy_attempts.append(backup_proxy)
 
         with tempfile.TemporaryDirectory(prefix=f"kharej_mdl_{job.job_id}_") as tmp_str:
             tmp_dir = Path(tmp_str)
             last_error: Exception | None = None
 
-            for idx, track in enumerate(result.tracks[:_MAX_CANDIDATES]):
+            for proxy_idx, attempt_proxy in enumerate(proxy_attempts, start=1):
+                try:
+                    client = MusicdlClient(sources=sources, proxy=attempt_proxy)
+                except MusicdlNotInstalledError as exc:
+                    raise RuntimeError(
+                        "musicdl Python package is not installed; install musicdl to use this platform"
+                    ) from exc
+
+                result = await client.search(query, sources=sources, limit=_MAX_CANDIDATES)
+
+                if not result.tracks:
+                    raise RuntimeError(
+                        f"musicdl returned no results for query: {query!r}"
+                    )
+
                 logger.info(
                     {
-                        "event": "musicdl.download_attempt",
+                        "event": "musicdl.search_done",
                         "job_id": job.job_id,
-                        "attempt": idx + 1,
-                        "track": track.display_title,
-                        "source": track.source,
+                        "total": result.total,
+                        "proxy": attempt_proxy,
+                        "proxy_attempt": proxy_idx,
                     }
                 )
-                try:
-                    dl_result = await client.download(track, dest_dir=tmp_dir)
-                    if not dl_result.success or not dl_result.file_path:
-                        raise RuntimeError(
-                            dl_result.error or "musicdl download returned no file"
-                        )
 
-                    audio_path = Path(dl_result.file_path)
-                    if not audio_path.exists() or audio_path.stat().st_size == 0:
-                        raise RuntimeError(
-                            f"musicdl file not found or empty: {audio_path}"
-                        )
-
-                    await progress.report_progress(job.job_id, 90, phase="uploading")
-
-                    ext = audio_path.suffix.lstrip(".")
-                    stem = safe_filename(track.song_name or audio_path.stem)
-                    s2_filename = f"{stem}.{ext}" if ext else stem
-                    s2_key = make_media_key(job.job_id, s2_filename)
-
+                for idx, track in enumerate(result.tracks[:_MAX_CANDIDATES]):
                     logger.info(
                         {
-                            "event": "musicdl.upload_start",
-                            "job_id": job.job_id,
-                            "key": s2_key,
-                            "size": audio_path.stat().st_size,
-                        }
-                    )
-                    ref: S2ObjectRef = await asyncio.to_thread(
-                        s2.upload_file, audio_path, s2_key
-                    )
-                    if proxy:
-                        proxy_manager.mark_proxy_succeeded(proxy)
-                    logger.info(
-                        {
-                            "event": "musicdl.upload_done",
-                            "job_id": job.job_id,
-                            "key": s2_key,
-                            "sha256": ref.sha256,
-                        }
-                    )
-                    await progress.report_progress(job.job_id, 100, phase="uploading")
-                    return [ref]
-
-                except Exception as exc:
-                    logger.warning(
-                        {
-                            "event": "musicdl.download_failed",
+                            "event": "musicdl.download_attempt",
                             "job_id": job.job_id,
                             "attempt": idx + 1,
-                            "error": repr(exc),
+                            "track": track.display_title,
+                            "source": track.source,
+                            "proxy": attempt_proxy,
+                            "proxy_attempt": proxy_idx,
                         }
                     )
-                    last_error = exc
+                    try:
+                        dl_result = await client.download(track, dest_dir=tmp_dir)
+                        if not dl_result.success or not dl_result.file_path:
+                            raise RuntimeError(
+                                dl_result.error or "musicdl download returned no file"
+                            )
+
+                        audio_path = Path(dl_result.file_path)
+                        if not audio_path.exists() or audio_path.stat().st_size == 0:
+                            raise RuntimeError(
+                                f"musicdl file not found or empty: {audio_path}"
+                            )
+
+                        await progress.report_progress(job.job_id, 90, phase="uploading")
+
+                        ext = audio_path.suffix.lstrip(".")
+                        stem = safe_filename(track.song_name or audio_path.stem)
+                        s2_filename = f"{stem}.{ext}" if ext else stem
+                        s2_key = make_media_key(job.job_id, s2_filename)
+
+                        logger.info(
+                            {
+                                "event": "musicdl.upload_start",
+                                "job_id": job.job_id,
+                                "key": s2_key,
+                                "size": audio_path.stat().st_size,
+                            }
+                        )
+                        ref: S2ObjectRef = await asyncio.to_thread(
+                            s2.upload_file, audio_path, s2_key
+                        )
+                        if attempt_proxy:
+                            proxy_manager.mark_proxy_succeeded(attempt_proxy)
+                        logger.info(
+                            {
+                                "event": "musicdl.upload_done",
+                                "job_id": job.job_id,
+                                "key": s2_key,
+                                "sha256": ref.sha256,
+                            }
+                        )
+                        await progress.report_progress(job.job_id, 100, phase="uploading")
+                        return [ref]
+
+                    except Exception as exc:
+                        logger.warning(
+                            {
+                                "event": "musicdl.download_failed",
+                                "job_id": job.job_id,
+                                "attempt": idx + 1,
+                                "proxy": attempt_proxy,
+                                "proxy_attempt": proxy_idx,
+                                "error": repr(exc),
+                            }
+                        )
+                        last_error = exc
 
             raise RuntimeError(
                 f"musicdl: all {min(len(result.tracks), _MAX_CANDIDATES)} download "

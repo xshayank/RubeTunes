@@ -209,6 +209,10 @@ _PROXY_MAX_AGE_SECONDS: float = 3600.0
 #: Trigger an on-demand refresh when the usable pool falls below this size.
 _MIN_HEALTHY_POOL_SIZE: int = 8
 
+#: Local fallback proxy used as a last-resort retry path when public proxies
+#: fail. It is deliberately protected from pool eviction.
+_BACKUP_PROXY_URL: str = os.getenv("KHAREJ_BACKUP_PROXY", "socks5://127.0.0.1:5914")
+
 #: Path to the disk cache that persists validated proxies across restarts.
 _PROXY_CACHE_FILE: Path = Path(__file__).parent / "state" / "proxies.json"
 
@@ -543,6 +547,15 @@ def _fetch_proxies_from_source(source: str) -> list[str]:
 
 def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
     """Scrape and deduplicate HTTP proxies from all pyfreeproxy *sources* in parallel."""
+    if not sources:
+        logger.warning(
+            {
+                "event": "proxy_manager.no_sources",
+                "msg": "No proxy sources configured; using backup proxy fallback",
+            }
+        )
+        return []
+
     seen: set[str] = set()
     combined: list[str] = []
     lock = threading.Lock()
@@ -766,6 +779,15 @@ class ProxyManager:
         """
         if proxy_url is None:
             return
+        if proxy_url == _BACKUP_PROXY_URL:
+            logger.warning(
+                {
+                    "event": "proxy_manager.backup_proxy_failure",
+                    "proxy": proxy_url,
+                    "msg": "Backup proxy failed but is protected from eviction",
+                }
+            )
+            return
         with self._lock:
             try:
                 self._working.remove(proxy_url)
@@ -844,7 +866,11 @@ class ProxyManager:
             }
         )
         await asyncio.to_thread(self._refresh_locked, "pool_empty")
-        return self.get_proxy()
+        return self.get_proxy() or self.get_backup_proxy()
+
+    def get_backup_proxy(self) -> str:
+        """Return the protected local SOCKS5 backup proxy URL."""
+        return _BACKUP_PROXY_URL
 
     # ------------------------------------------------------------------
     # Internal helpers
