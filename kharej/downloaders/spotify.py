@@ -88,46 +88,53 @@ async def _download_spotify_track_locally(
 
     async def _try_musicdl_source(source_name: str) -> Path | None:
         """Download via a specific musicdl source client (no login cookies). Returns Path or None."""
-        _proxy: str | None = None
-        try:
-            from rubetunes.providers.musicdl.client import MusicdlClient  # noqa: PLC0415
+        primary_proxy = await proxy_manager.scan_and_get_proxy()
+        backup_proxy = proxy_manager.get_backup_proxy()
+        proxy_attempts = [primary_proxy]
+        if backup_proxy != primary_proxy:
+            proxy_attempts.append(backup_proxy)
 
-            _proxy = await proxy_manager.scan_and_get_proxy()
-            client = MusicdlClient(sources=[source_name], proxy=_proxy)
-            musicdl_query = f"{artist} - {title}" if artist else title
-            search_result = await client.search(musicdl_query, sources=[source_name], limit=3)
-            for track in search_result.tracks[:3]:
-                dl_result = await client.download(track, dest_dir=tmp_dir)
-                if dl_result.success and dl_result.file_path:
-                    audio_path = Path(dl_result.file_path)
-                    if audio_path.exists():
-                        # Credit the proxy for a successful download.
-                        if _proxy:
-                            proxy_manager.mark_proxy_succeeded(_proxy)
-                        try:
-                            from rubetunes.tagging import embed_metadata  # noqa: PLC0415
+        for proxy_idx, _proxy in enumerate(proxy_attempts, start=1):
+            try:
+                from rubetunes.providers.musicdl.client import MusicdlClient  # noqa: PLC0415
 
-                            embed_metadata(audio_path, info)
-                        except Exception as exc:
-                            logger.warning({"event": "spotify.tag_failed", "error": repr(exc)})
-                        return audio_path
-            logger.warning(
-                {
-                    "event": "spotify.musicdl_source_no_file",
-                    "source": source_name,
-                    "query": musicdl_query,
-                }
-            )
-        except Exception as exc:
-            if _proxy:
-                proxy_manager.mark_proxy_failed(_proxy)
-            logger.warning(
-                {
-                    "event": "spotify.musicdl_source_failed",
-                    "source": source_name,
-                    "error": repr(exc),
-                }
-            )
+                client = MusicdlClient(sources=[source_name], proxy=_proxy)
+                musicdl_query = f"{artist} - {title}" if artist else title
+                search_result = await client.search(musicdl_query, sources=[source_name], limit=3)
+                for track in search_result.tracks[:3]:
+                    dl_result = await client.download(track, dest_dir=tmp_dir)
+                    if dl_result.success and dl_result.file_path:
+                        audio_path = Path(dl_result.file_path)
+                        if audio_path.exists():
+                            # Credit the proxy for a successful download.
+                            if _proxy:
+                                proxy_manager.mark_proxy_succeeded(_proxy)
+                            try:
+                                from rubetunes.tagging import embed_metadata  # noqa: PLC0415
+
+                                embed_metadata(audio_path, info)
+                            except Exception as exc:
+                                logger.warning({"event": "spotify.tag_failed", "error": repr(exc)})
+                            return audio_path
+                logger.warning(
+                    {
+                        "event": "spotify.musicdl_source_no_file",
+                        "source": source_name,
+                        "query": musicdl_query,
+                        "proxy": _proxy,
+                        "proxy_attempt": proxy_idx,
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    {
+                        "event": "spotify.musicdl_source_failed",
+                        "source": source_name,
+                        "proxy": _proxy,
+                        "proxy_attempt": proxy_idx,
+                        "error": repr(exc),
+                    }
+                )
         return None
 
     _PROXY_ERROR_KEYWORDS: tuple[str, ...] = (
@@ -147,7 +154,11 @@ async def _download_spotify_track_locally(
         ext_glob = "*.flac" if _prefer_lossless else "*.mp3"
 
         for attempt in range(1, _YTDLP_MAX_PROXY_RETRIES + 1):
-            _proxy = await proxy_manager.scan_and_get_proxy()
+            _proxy = (
+                proxy_manager.get_backup_proxy()
+                if attempt == _YTDLP_MAX_PROXY_RETRIES
+                else await proxy_manager.scan_and_get_proxy()
+            )
             ydl_opts: dict = {
                 "format": "bestaudio/best",
                 "postprocessors": [
