@@ -413,18 +413,20 @@
   </main>
   <script>
     (function () {
-      var accessToken = null;
+      var accessToken = sessionStorage.getItem('rt_access_token') || null;
       localStorage.removeItem('rt_access_token');
-      sessionStorage.removeItem('rt_access_token');
 
       function getToken() {
-        return accessToken;
+        return accessToken || sessionStorage.getItem('rt_access_token');
       }
       function setToken(t) {
         accessToken = t || null;
+        if (accessToken) sessionStorage.setItem('rt_access_token', accessToken);
+        else sessionStorage.removeItem('rt_access_token');
       }
       function clearToken() {
         accessToken = null;
+        sessionStorage.removeItem('rt_access_token');
       }
 
       async function refreshToken() {
@@ -488,11 +490,13 @@
         options.headers = options.headers || {};
         var token = getToken();
         if (token) options.headers['Authorization'] = 'Bearer ' + token;
+        if (options.credentials === undefined) options.credentials = 'include';
         var resp = await fetch(url, options);
         if (resp.status === 401) {
           var newToken = await refreshToken();
           if (newToken) {
             options.headers['Authorization'] = 'Bearer ' + newToken;
+            if (options.credentials === undefined) options.credentials = 'include';
             resp = await fetch(url, options);
           } else {
             clearToken();

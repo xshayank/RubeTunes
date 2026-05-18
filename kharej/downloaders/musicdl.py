@@ -153,6 +153,8 @@ class MusicdlDownloader:
                     ref: S2ObjectRef = await asyncio.to_thread(
                         s2.upload_file, audio_path, s2_key
                     )
+                    if proxy:
+                        proxy_manager.mark_proxy_succeeded(proxy)
                     logger.info(
                         {
                             "event": "musicdl.upload_done",
@@ -175,6 +177,8 @@ class MusicdlDownloader:
                     )
                     last_error = exc
 
+            if proxy:
+                proxy_manager.mark_proxy_failed(proxy)
             raise RuntimeError(
                 f"musicdl: all {min(len(result.tracks), _MAX_CANDIDATES)} download "
                 f"attempts failed for query {query!r}. Last error: {last_error!r}"

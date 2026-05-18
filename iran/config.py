@@ -54,6 +54,7 @@ class IranSettings(BaseSettings):
     SECRET_KEY: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 180
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    COOKIE_SECURE: bool = True
 
     # ------------------------------------------------------------------
     # Database (filled in Step 3)

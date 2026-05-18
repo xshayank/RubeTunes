@@ -40,19 +40,28 @@ document.getElementById('login-form').addEventListener('submit', async function(
     email: document.getElementById('email').value,
     password: document.getElementById('password').value
   };
-  var resp = await fetch('/auth/login', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-    credentials: 'include'
-  });
-  if (resp.ok) {
-    var data = await resp.json();
-    window.setToken(data.access_token);
-    window.location.href = '/';
-  } else {
-    var err = await resp.json();
-    msg.innerHTML = '<div class="alert alert-error">' + (err.detail || 'خطا در ورود') + '</div>';
+  try {
+    var resp = await fetch('/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+      credentials: 'include'
+    });
+    if (resp.ok) {
+      var data = await resp.json();
+      window.setToken(data.access_token);
+      window.location.href = '/';
+      return;
+    }
+    var detail = 'خطا در ورود';
+    try {
+      var err = await resp.json();
+      if (err.detail) detail = err.detail;
+    } catch (_) {}
+    window.setAlert(msg, 'alert-error', detail);
+  } catch (_) {
+    window.setAlert(msg, 'alert-error', 'ارتباط با سرور برقرار نشد. دوباره تلاش کنید.');
+  } finally {
     btn.disabled = false;
     btn.textContent = 'ورود';
   }

@@ -208,6 +208,19 @@ def _utcnow() -> datetime:
     return datetime.now(tz=timezone.utc).replace(tzinfo=None)
 
 
+def _get_client_ip(request: Request) -> str:
+    """Return the best-effort real client IP, respecting reverse-proxy headers."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",", 1)[0].strip()
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
 async def _check_rate_limit(session: AsyncSession, ip_addr: str) -> None:
     """Raise 429 if *ip_addr* has exceeded the login failure limit."""
     window_start = _utcnow() - timedelta(minutes=RATE_LIMIT_WINDOW_MINUTES)
@@ -327,9 +340,13 @@ async def register(
     Inserts a matching ``registrations`` row and writes an ``audit_log`` entry.
     Returns 409 if the e-mail address is already registered.
     """
+    ip_addr = _get_client_ip(request)
+    await _check_registration_rate_limit(session, ip_addr)
+    email = body.email.lower()
+
     # Check for duplicate e-mail
     existing = await session.execute(
-        select(User).where(User.email == body.email)
+        select(User).where(User.email == email)
     )
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(
@@ -340,7 +357,7 @@ async def register(
     user_id = str(uuid.uuid4())
     user = User(
         id=user_id,
-        email=body.email,
+        email=email,
         display_name=body.display_name,
         password_hash=hash_password(body.password),
         role="user",
@@ -363,7 +380,7 @@ async def register(
         actor_id=user_id,
         action="auth.register",
         target_id=user_id,
-        payload={"email": body.email, "display_name": body.display_name},
+        payload={"email": email, "display_name": body.display_name},
         ip_addr=ip_addr,
     )
     session.add(audit)
@@ -396,20 +413,21 @@ async def login(
     """
     from iran.config import get_settings
 
-    ip_addr = request.client.host if request.client else "unknown"
+    ip_addr = _get_client_ip(request)
+    email = body.email.lower()
 
     # Rate-limit check first
     await _check_rate_limit(session, ip_addr)
 
     # Look up the user
     result = await session.execute(
-        select(User).where(User.email == body.email)
+        select(User).where(User.email == email)
     )
     user: User | None = result.scalar_one_or_none()
 
     if user is None or not verify_password(body.password, user.password_hash):
         # Record failure for rate-limiting; don't reveal which field is wrong
-        await _record_login_failure(session, ip_addr, body.email)
+        await _record_login_failure(session, ip_addr, email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password",

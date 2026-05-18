@@ -444,7 +444,9 @@ def create_app(settings: IranSettings | None = None) -> FastAPI:
     """
     if settings is None:
         settings = get_settings()
-    if settings.ENVIRONMENT != "test" and not settings.SECRET_KEY:
+    app_environment = getattr(settings, "ENVIRONMENT", "production")
+    enable_api_docs = getattr(settings, "ENABLE_API_DOCS", False)
+    if app_environment != "test" and not settings.SECRET_KEY:
         raise RuntimeError("IRAN_SECRET_KEY must be set before starting the Iran service")
 
     app = FastAPI(
@@ -455,9 +457,9 @@ def create_app(settings: IranSettings | None = None) -> FastAPI:
         ),
         version="0.1.0",
         lifespan=_lifespan,
-        docs_url="/docs" if settings.ENABLE_API_DOCS else None,
-        redoc_url="/redoc" if settings.ENABLE_API_DOCS else None,
-        openapi_url="/openapi.json" if settings.ENABLE_API_DOCS else None,
+        docs_url="/docs" if enable_api_docs else None,
+        redoc_url="/redoc" if enable_api_docs else None,
+        openapi_url="/openapi.json" if enable_api_docs else None,
     )
 
     @app.middleware("http")
