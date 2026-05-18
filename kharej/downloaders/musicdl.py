@@ -177,8 +177,6 @@ class MusicdlDownloader:
                     )
                     last_error = exc
 
-            if proxy:
-                proxy_manager.mark_proxy_failed(proxy)
             raise RuntimeError(
                 f"musicdl: all {min(len(result.tracks), _MAX_CANDIDATES)} download "
                 f"attempts failed for query {query!r}. Last error: {last_error!r}"

@@ -283,9 +283,10 @@ def _load_proxy_cache(path: Path) -> dict[str, _ProxyRecord]:
         records: dict[str, _ProxyRecord] = {}
         for item in data:
             if isinstance(item, str):
-                # Legacy format: plain URL string. Treat as stale so startup
-                # refresh must revalidate it before long-running use.
-                records[item] = _ProxyRecord(speed_bps=_MIN_SPEED_BPS, last_validated_at=0.0)
+                # Legacy format: plain URL string. Older caches did not store
+                # validation timestamps, so treat entries as usable fallback
+                # proxies until the next successful refresh replaces them.
+                records[item] = _ProxyRecord(speed_bps=_MIN_SPEED_BPS)
             elif isinstance(item, dict):
                 url = item.get("url")
                 if not isinstance(url, str) or not url:
@@ -301,7 +302,7 @@ def _load_proxy_cache(path: Path) -> dict[str, _ProxyRecord]:
                     raw_scan_passes = max(1, int(item.get("scan_passes") or 0))
                     raw_last_validated = float(item.get("last_validated_at") or 0.0)
                     if not math.isfinite(raw_last_validated) or raw_last_validated <= 0:
-                        raw_last_validated = 0.0
+                        raw_last_validated = time.time()
                 except (ValueError, TypeError):
                     # Malformed numeric field — skip this entry rather than
                     # dropping the entire cache.
@@ -690,9 +691,16 @@ class ProxyManager:
         more often while every working proxy retains some chance of selection.
         """
         with self._lock:
-            self._prune_stale_locked()
             if not self._working:
                 return None
+            fresh_working = [
+                url
+                for url in self._working
+                if _is_proxy_record_fresh(
+                    self._proxy_records.get(url, _ProxyRecord(speed_bps=_MIN_SPEED_BPS))
+                )
+            ]
+            selection_source = fresh_working or self._working
             # Re-rank by current composite weight so that success-counter changes
             # made between refreshes are reflected in the top-N selection, rather
             # than relying on the ordering established at the last refresh.
@@ -702,7 +710,13 @@ class ProxyManager:
                 ),
                 reverse=True,
             )
-            pool = self._working[:_TOP_PROXY_COUNT]
+            selection_source.sort(
+                key=lambda u: _compute_proxy_weight(
+                    self._proxy_records.get(u, _ProxyRecord(speed_bps=_MIN_SPEED_BPS))
+                ),
+                reverse=True,
+            )
+            pool = selection_source[:_TOP_PROXY_COUNT]
             weights = [
                 # Every proxy in _working always has a corresponding record.
                 # The .get() fallback is a defensive guard against any transient
@@ -779,8 +793,18 @@ class ProxyManager:
     def working_count(self) -> int:
         """Return the number of currently validated working proxies."""
         with self._lock:
-            self._prune_stale_locked()
             return len(self._working)
+
+    def fresh_working_count(self) -> int:
+        """Return the number of proxies with recent validation timestamps."""
+        with self._lock:
+            return sum(
+                1
+                for url in self._working
+                if _is_proxy_record_fresh(
+                    self._proxy_records.get(url, _ProxyRecord(speed_bps=_MIN_SPEED_BPS))
+                )
+            )
 
     async def scan_and_get_proxy(self) -> str | None:
         """Return a working proxy URL, scanning for new ones if the pool is empty.
@@ -796,7 +820,7 @@ class ProxyManager:
         the pool has been exhausted.
         """
         proxy = self.get_proxy()
-        current_count = self.working_count()
+        current_count = self.fresh_working_count()
         if proxy is not None and current_count >= _MIN_HEALTHY_POOL_SIZE:
             return proxy
 
@@ -909,7 +933,7 @@ class ProxyManager:
                     }
                 )
                 return
-            if reason == "low_pool" and self.working_count() >= _MIN_HEALTHY_POOL_SIZE:
+            if reason == "low_pool" and self.fresh_working_count() >= _MIN_HEALTHY_POOL_SIZE:
                 logger.debug(
                     {
                         "event": "proxy_manager.refresh_skip",
@@ -919,40 +943,6 @@ class ProxyManager:
                 )
                 return
             self._refresh()
-
-    def _prune_stale_locked(self) -> None:
-        """Remove proxies whose validation result is too old.
-
-        Caller must hold ``self._lock``.
-        """
-        now = time.time()
-        stale = [
-            url
-            for url in self._working
-            if not _is_proxy_record_fresh(
-                self._proxy_records.get(
-                    url,
-                    _ProxyRecord(speed_bps=_MIN_SPEED_BPS, last_validated_at=0.0),
-                ),
-                now=now,
-            )
-        ]
-        if not stale:
-            return
-
-        stale_set = set(stale)
-        self._working = [url for url in self._working if url not in stale_set]
-        for url in stale:
-            self._proxy_records.pop(url, None)
-
-        logger.warning(
-            {
-                "event": "proxy_manager.stale_pruned",
-                "count": len(stale),
-                "remaining": len(self._working),
-                "max_age_sec": _PROXY_MAX_AGE_SECONDS,
-            }
-        )
 
     async def _refresh_loop(self) -> None:
         """Background task: replace the proxy pool every 15 minutes."""

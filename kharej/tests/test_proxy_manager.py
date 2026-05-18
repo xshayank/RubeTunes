@@ -51,6 +51,22 @@ def test_concurrent_empty_pool_requests_share_one_refill(tmp_path: Path) -> None
     assert mgr.refresh_calls == 1
 
 
+def test_stale_proxy_remains_usable_as_fallback(tmp_path: Path) -> None:
+    mgr = ProxyManager(cache_file=tmp_path / "proxies.json")
+    with mgr._lock:
+        mgr._proxy_records = {
+            "http://127.0.0.1:8080": _ProxyRecord(
+                speed_bps=100_000,
+                last_validated_at=time.time() - 7200,
+            )
+        }
+        mgr._working = ["http://127.0.0.1:8080"]
+
+    assert mgr.fresh_working_count() == 0
+    assert mgr.working_count() == 1
+    assert mgr.get_proxy() == "http://127.0.0.1:8080"
+
+
 def test_freeproxy_source_list_includes_recent_http_sources(tmp_path: Path) -> None:
     mgr = ProxyManager(cache_file=tmp_path / "proxies.json")
 

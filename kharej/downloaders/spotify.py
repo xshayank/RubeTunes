@@ -88,7 +88,6 @@ async def _download_spotify_track_locally(
 
     async def _try_musicdl_source(source_name: str) -> Path | None:
         """Download via a specific musicdl source client (no login cookies). Returns Path or None."""
-        _proxy: str | None = None
         try:
             from rubetunes.providers.musicdl.client import MusicdlClient  # noqa: PLC0415
 
@@ -119,8 +118,6 @@ async def _download_spotify_track_locally(
                 }
             )
         except Exception as exc:
-            if _proxy:
-                proxy_manager.mark_proxy_failed(_proxy)
             logger.warning(
                 {
                     "event": "spotify.musicdl_source_failed",
