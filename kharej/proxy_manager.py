@@ -187,6 +187,11 @@ _VALIDATE_TIMEOUT: float = 12.0
 #: How many proxies to validate concurrently.
 _VALIDATE_WORKERS: int = 60
 
+#: Maximum candidates to validate per refresh. Raw public lists can contain
+#: tens of thousands of mostly-dead proxies; capping keeps each refill bounded
+#: and lets the next periodic/background refresh sample another batch.
+_MAX_VALIDATE_CANDIDATES: int = 750
+
 #: URL used to verify that the proxy can reach YouTube's HTTPS endpoints.
 #: A 204 response proves that the proxy supports HTTPS CONNECT tunnelling to
 #: Google/YouTube servers.
@@ -524,6 +529,60 @@ def _validate_single_proxy(proxy_url: str) -> float:
     return speed
 
 
+def _socks_support_available() -> bool:
+    """Return True when requests can use socks4/socks5 proxies via PySocks."""
+    try:
+        import socks  # noqa: F401, PLC0415
+    except ImportError:
+        return False
+    return True
+
+
+def _prepare_validation_candidates(proxy_urls: Sequence[str]) -> list[str]:
+    """Deduplicate, filter, and order proxy candidates for bounded validation."""
+    seen: set[str] = set()
+    http_candidates: list[str] = []
+    socks_candidates: list[str] = []
+    socks_available = _socks_support_available()
+
+    for url in proxy_urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        if url.startswith("http://"):
+            http_candidates.append(url)
+        elif url.startswith(("socks4://", "socks5://")):
+            if socks_available:
+                socks_candidates.append(url)
+        else:
+            logger.debug({"event": "proxy_manager.unsupported_proxy_scheme", "proxy": url})
+
+    if not socks_available:
+        skipped = sum(1 for url in seen if url.startswith(("socks4://", "socks5://")))
+        if skipped:
+            logger.warning(
+                {
+                    "event": "proxy_manager.socks_validation_skipped",
+                    "count": skipped,
+                    "msg": "PySocks is not installed; skipping SOCKS candidates for validation",
+                }
+            )
+
+    candidates = http_candidates + socks_candidates
+    if len(candidates) > _MAX_VALIDATE_CANDIDATES:
+        logger.info(
+            {
+                "event": "proxy_manager.validation_candidates_capped",
+                "total": len(candidates),
+                "cap": _MAX_VALIDATE_CANDIDATES,
+                "http": len(http_candidates),
+                "socks": len(socks_candidates),
+            }
+        )
+        candidates = candidates[:_MAX_VALIDATE_CANDIDATES]
+    return candidates
+
+
 def _fetch_proxies_from_source(source: str) -> list[str]:
     """Scrape proxy candidates from a single pyfreeproxy *source*.
 
@@ -731,7 +790,8 @@ def _validate_proxies(proxy_urls: Sequence[str]) -> list[tuple[str, float]]:
     fastest-first so that :meth:`ProxyManager._refresh` can rank and score
     them correctly.
     """
-    if not proxy_urls:
+    candidates = _prepare_validation_candidates(proxy_urls)
+    if not candidates:
         return []
 
     results: list[tuple[str, float]] = []
@@ -743,8 +803,8 @@ def _validate_proxies(proxy_urls: Sequence[str]) -> list[tuple[str, float]]:
             with lock:
                 results.append((proxy_url, speed))
 
-    with ThreadPoolExecutor(max_workers=_VALIDATE_WORKERS) as executor:
-        list(executor.map(_check, proxy_urls))
+    with ThreadPoolExecutor(max_workers=min(len(candidates), _VALIDATE_WORKERS)) as executor:
+        list(executor.map(_check, candidates))
 
     # Sort fastest-first so that _refresh() can rank proxies correctly.
     results.sort(key=lambda t: t[1], reverse=True)
@@ -753,6 +813,7 @@ def _validate_proxies(proxy_urls: Sequence[str]) -> list[tuple[str, float]]:
         {
             "event": "proxy_manager.validation_done",
             "total": len(proxy_urls),
+            "validated_candidates": len(candidates),
             "working": len(results),
         }
     )
