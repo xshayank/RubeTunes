@@ -5,6 +5,7 @@ python-dotenv==1.2.2
 # pyfreeproxy — multi-source free proxy scraper (CharlesPikachu/freeproxy)
 pyfreeproxy>=0.4.6
 requests>=2.30.0
+PySocks>=1.7.1
 mutagen==1.47.0
 python-json-logger>=2.0
 prometheus-client>=0.20

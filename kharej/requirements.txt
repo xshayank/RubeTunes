@@ -5,6 +5,7 @@ tenacity>=8.2
 prometheus-client>=0.20
 rubpy>=7.3.4
 requests>=2.31
+PySocks>=1.7.1
 pyfreeproxy>=0.4.6
 
 # Test dependencies
