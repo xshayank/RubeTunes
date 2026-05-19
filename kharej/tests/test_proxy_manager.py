@@ -40,7 +40,7 @@ def test_scan_and_get_proxy_refills_after_all_proxies_evicted(tmp_path: Path) ->
     proxy = asyncio.run(mgr.scan_and_get_proxy())
 
     assert proxy == _BACKUP_PROXY_URL
-    assert mgr.working_count() == 0
+    assert mgr.working_count() == 1
     assert mgr.refresh_calls == 0
 
 
@@ -78,6 +78,7 @@ def test_empty_pool_returns_backup_proxy_without_refreshing(tmp_path: Path) -> N
     proxy = asyncio.run(mgr.scan_and_get_proxy())
 
     assert proxy == _BACKUP_PROXY_URL
+    assert mgr.working_count() == 1
 
 
 def test_backup_proxy_is_protected_from_eviction(tmp_path: Path) -> None:
@@ -86,6 +87,16 @@ def test_backup_proxy_is_protected_from_eviction(tmp_path: Path) -> None:
     mgr.mark_proxy_failed(_BACKUP_PROXY_URL)
 
     assert asyncio.run(mgr.scan_and_get_proxy()) == _BACKUP_PROXY_URL
+    assert mgr.working_count() == 1
+
+
+def test_refresh_updates_empty_pool_with_backup_proxy(tmp_path: Path) -> None:
+    mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
+
+    mgr._refresh()
+
+    assert mgr.working_count() == 1
+    assert mgr.get_proxy() == _BACKUP_PROXY_URL
 
 
 def test_fetcher_keeps_socks_proxy_schemes(monkeypatch) -> None:

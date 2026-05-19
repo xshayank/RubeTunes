@@ -843,6 +843,8 @@ class ProxyManager:
         the pool has been exhausted.
         """
         proxy = self.get_proxy()
+        if proxy == self.get_backup_proxy():
+            return proxy
         current_count = self.fresh_working_count()
         if proxy is not None and current_count >= _MIN_HEALTHY_POOL_SIZE:
             return proxy
@@ -867,11 +869,25 @@ class ProxyManager:
                 "msg": "Proxy pool is empty; using local SOCKS5 backup immediately",
             }
         )
+        with self._lock:
+            self._ensure_backup_proxy_locked()
         return self.get_backup_proxy()
 
     def get_backup_proxy(self) -> str:
         """Return the protected local SOCKS5 backup proxy URL."""
         return _BACKUP_PROXY_URL
+
+    def _ensure_backup_proxy_locked(self) -> None:
+        """Ensure the protected backup proxy is present in the live pool.
+
+        Caller must hold ``self._lock``.
+        """
+        if _BACKUP_PROXY_URL not in self._proxy_records:
+            self._proxy_records[_BACKUP_PROXY_URL] = _ProxyRecord(
+                speed_bps=_MIN_SPEED_BPS * _INSTANT_RESPONSE_SPEED_MULTIPLIER,
+            )
+        if _BACKUP_PROXY_URL not in self._working:
+            self._working.append(_BACKUP_PROXY_URL)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -885,18 +901,26 @@ class ProxyManager:
             logger.warning(
                 {
                     "event": "proxy_manager.empty_list",
-                    "msg": "All proxy lists are empty; keeping existing pool",
+                    "msg": "All proxy lists are empty; using backup proxy if pool is empty",
                 }
             )
+            with self._lock:
+                if not self._working:
+                    self._ensure_backup_proxy_locked()
+                    _save_proxy_cache(self._proxy_records, self._cache_file)
             return
         working_with_speeds = _validate_proxies(candidates)
         if not working_with_speeds:
             logger.warning(
                 {
                     "event": "proxy_manager.no_valid_proxies",
-                    "msg": "Validation found no working proxies; keeping existing pool",
+                    "msg": "Validation found no working proxies; using backup proxy if pool is empty",
                 }
             )
+            with self._lock:
+                if not self._working:
+                    self._ensure_backup_proxy_locked()
+                    _save_proxy_cache(self._proxy_records, self._cache_file)
             return
         with self._lock:
             old_records = self._proxy_records
@@ -923,6 +947,7 @@ class ProxyManager:
             )
             self._working = working
             self._proxy_records = new_records
+            self._ensure_backup_proxy_locked()
         # Persist to disk so the pool (including score records) survives a
         # process restart.
         try:
