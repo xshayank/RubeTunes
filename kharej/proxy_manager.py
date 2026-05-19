@@ -106,49 +106,21 @@ logger = logging.getLogger("kharej.proxy_manager")
 # Constants
 # ---------------------------------------------------------------------------
 
-#: pyfreeproxy source names used to scrape proxy candidates.
-#: All lists are merged before validation so the pool is as large as possible.
+#: Best pyfreeproxy source names used to scrape proxy candidates.
+#: Keep this list intentionally small so refresh starts validation quickly
+#: instead of waiting for dozens of slow/broken provider scrapers.
 #: HTTP, HTTPS, SOCKS4, and SOCKS5 results are accepted and validated.
 _FREEPROXY_SOURCES: list[str] = [
-    "ADVFPProxiedSession",
-    "DatabayProxiedSession",
-    "DpangestuwProxiedSession",
-    "FineProxyProxiedSession",
     "FloppyDataProxiedSession",
     "FreeProxyDBProxiedSession",
     "ProxiflyProxiedSession",
-    "FreeVPNNodeProxiedSession",
     "GeonixProxiedSession",
     "GeonodeProxiedSession",
-    "GoodIPSProxiedSession",
-    "IPLocateProxiedSession",
-    "IP3366ProxiedSession",
-    "IP89ProxiedSession",
-    "IPRoyalProxiedSession",
-    "JiliuipProxiedSession",
-    "KuaidailiProxiedSession",
-    "KxdailiProxiedSession",
     "OpenProxyListProxiedSession",
-    "ProxydbProxiedSession",
-    "ProxyEliteProxiedSession",
-    "ProxyFreeOnlyProxiedSession",
-    "ProxyhubProxiedSession",
-    "FreeproxylistProxiedSession",
-    "ProxyNovaProxiedSession",
-    "ProxydailyProxiedSession",
     "ProxyScrapeProxiedSession",
     "ProxyShareProxiedSession",
     "ProxyVerityProxiedSession",
-    "ProxiwareProxiedSession",
-    "ProxylistProxiedSession",
     "PubProxyProxiedSession",
-    "QiyunipProxiedSession",
-    "RoundProxiesProxiedSession",
-    "SCDNProxiedSession",
-    "SixSixDailiProxiedSession",
-    "SpysoneProxiedSession",
-    "TheSpeedXProxiedSession",
-    "TrustyTechProxiedSession",
 ]
 
 #: Raw public proxy-list endpoints used in addition to pyfreeproxy. These keep
