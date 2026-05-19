@@ -100,7 +100,11 @@ class SoundcloudDownloader:
         last_exc: Exception | None = None
 
         for attempt in range(1, _MAX_PROXY_RETRIES + 1):
-            proxy: str | None = await proxy_manager.scan_and_get_proxy()
+            proxy: str | None = (
+                proxy_manager.get_backup_proxy()
+                if attempt == _MAX_PROXY_RETRIES
+                else await proxy_manager.scan_and_get_proxy()
+            )
 
             with tempfile.TemporaryDirectory(prefix=f"kharej_sc_{job.job_id}_") as tmp_str:
                 tmp_dir = Path(tmp_str)
@@ -116,7 +120,7 @@ class SoundcloudDownloader:
                     )
                 except Exception as exc:
                     last_exc = exc
-                    if proxy and _is_proxy_error(str(exc)):
+                    if proxy:
                         logger.warning({
                             "event": "soundcloud.proxy_failure",
                             "job_id": job.job_id,
@@ -130,6 +134,7 @@ class SoundcloudDownloader:
                                 "event": "soundcloud.proxy_retry",
                                 "job_id": job.job_id,
                                 "attempt": attempt,
+                                "next_proxy": "backup" if attempt + 1 == _MAX_PROXY_RETRIES else "pool",
                             })
                             continue
                     raise

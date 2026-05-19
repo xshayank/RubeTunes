@@ -367,7 +367,11 @@ class YoutubeDownloader:
         last_exc: Exception | None = None
 
         for attempt in range(1, _MAX_PROXY_RETRIES + 1):
-            proxy = await proxy_manager.scan_and_get_proxy()
+            proxy = (
+                proxy_manager.get_backup_proxy()
+                if attempt == _MAX_PROXY_RETRIES
+                else await proxy_manager.scan_and_get_proxy()
+            )
 
             with tempfile.TemporaryDirectory(prefix=f"kharej_yt_{job.job_id}_") as tmp_str:
                 tmp_dir = Path(tmp_str)
@@ -399,7 +403,8 @@ class YoutubeDownloader:
                     )
                 except RuntimeError as exc:
                     last_exc = exc
-                    if _is_proxy_error(str(exc)):
+                    failed_with_proxy = proxy is not None
+                    if failed_with_proxy:
                         logger.warning({
                             "event": "youtube.proxy_failure",
                             "job_id": job.job_id,
@@ -413,6 +418,7 @@ class YoutubeDownloader:
                                 "event": "youtube.proxy_retry",
                                 "job_id": job.job_id,
                                 "attempt": attempt,
+                                "next_proxy": "backup" if attempt + 1 == _MAX_PROXY_RETRIES else "pool",
                             })
                             continue
                     raise
