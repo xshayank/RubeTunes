@@ -95,7 +95,7 @@ import re
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -783,7 +783,11 @@ def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
     return combined
 
 
-def _validate_proxies(proxy_urls: Sequence[str]) -> list[tuple[str, float]]:
+def _validate_proxies(
+    proxy_urls: Sequence[str],
+    *,
+    on_valid: Callable[[str, float], None] | None = None,
+) -> list[tuple[str, float]]:
     """Return valid ``(url, speed_bps)`` pairs from *proxy_urls*, sorted fastest-first.
 
     Proxies are validated concurrently and the resulting list is ordered
@@ -802,6 +806,8 @@ def _validate_proxies(proxy_urls: Sequence[str]) -> list[tuple[str, float]]:
         if speed > 0.0:
             with lock:
                 results.append((proxy_url, speed))
+            if on_valid is not None:
+                on_valid(proxy_url, speed)
 
     with ThreadPoolExecutor(max_workers=min(len(candidates), _VALIDATE_WORKERS)) as executor:
         list(executor.map(_check, candidates))
@@ -1178,6 +1184,11 @@ class ProxyManager:
     def _refresh(self) -> None:
         """Synchronously fetch and validate the proxy list, then replace the pool."""
         logger.info({"event": "proxy_manager.refresh_start", "sources": self._sources})
+        with self._lock:
+            if not self._working:
+                self._ensure_backup_proxy_locked()
+            _save_proxy_cache(self._proxy_records, self._cache_file)
+
         candidates = _fetch_all_proxy_lists(self._sources)
         before_total = self.working_count()
         before_public = self.public_working_count()
@@ -1195,7 +1206,33 @@ class ProxyManager:
                     self._ensure_backup_proxy_locked()
                     _save_proxy_cache(self._proxy_records, self._cache_file)
             return
-        working_with_speeds = _validate_proxies(candidates)
+        incremental_validated: dict[str, float] = {}
+        incremental_lock = threading.Lock()
+
+        def _record_valid_proxy(url: str, speed: float) -> None:
+            with incremental_lock:
+                incremental_validated[url] = speed
+            with self._lock:
+                old = self._proxy_records.get(url)
+                if old is not None:
+                    old.speed_bps = speed
+                    old.scan_passes += 1
+                    old.last_validated_at = time.time()
+                    old.failures = 0
+                else:
+                    self._proxy_records[url] = _ProxyRecord(speed_bps=speed)
+                if url not in self._working:
+                    self._working.append(url)
+                self._working.sort(
+                    key=lambda u: _compute_proxy_weight(
+                        self._proxy_records.get(u, _ProxyRecord(speed_bps=_MIN_SPEED_BPS))
+                    ),
+                    reverse=True,
+                )
+                self._ensure_backup_proxy_locked()
+                _save_proxy_cache(self._proxy_records, self._cache_file)
+
+        working_with_speeds = _validate_proxies(candidates, on_valid=_record_valid_proxy)
         if not working_with_speeds:
             logger.warning(
                 {
@@ -1220,10 +1257,10 @@ class ProxyManager:
             for url, speed in working_with_speeds:
                 if url in old_records:
                     # Proxy survived re-validation: preserve download history,
-                    # update the measured speed, and credit an extra scan pass.
+                    # update the measured speed. The scan-pass credit was
+                    # already applied by the incremental cache writer.
                     rec = old_records[url]
                     rec.speed_bps = speed
-                    rec.scan_passes += 1
                     rec.last_validated_at = now
                     new_records[url] = rec
                     updated += 1
