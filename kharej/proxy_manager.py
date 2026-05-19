@@ -24,8 +24,9 @@ Proxy sourcing
 --------------
 Candidates are scraped from several well-maintained free-proxy sources using
 the :func:`freeproxy.modules.BuildProxiedSession` API from ``pyfreeproxy``.
-Only HTTP/HTTPS proxies are collected so that yt-dlp can use them directly
-(SOCKS proxies require extra yt-dlp flags not currently applied).
+HTTP, HTTPS, SOCKS4, and SOCKS5 proxies are collected. SOCKS proxies are kept
+with their native scheme (for example ``socks5://host:port``) so requests and
+yt-dlp can route through them correctly.
 
 If ``pyfreeproxy`` is not installed the manager falls back gracefully to an
 empty candidate list and logs a warning.
@@ -104,10 +105,9 @@ logger = logging.getLogger("kharej.proxy_manager")
 # Constants
 # ---------------------------------------------------------------------------
 
-#: pyfreeproxy source names (HTTP/HTTPS only) used to scrape proxy candidates.
+#: pyfreeproxy source names used to scrape proxy candidates.
 #: All lists are merged before validation so the pool is as large as possible.
-#: Sources that only provide SOCKS proxies are excluded because yt-dlp is
-#: invoked with a plain ``--proxy http://...`` argument.
+#: HTTP, HTTPS, SOCKS4, and SOCKS5 results are accepted and validated.
 _FREEPROXY_SOURCES: list[str] = [
     "ADVFPProxiedSession",
     "DatabayProxiedSession",
@@ -484,12 +484,12 @@ def _validate_single_proxy(proxy_url: str) -> float:
 
 
 def _fetch_proxies_from_source(source: str) -> list[str]:
-    """Scrape HTTP/HTTPS proxy candidates from a single pyfreeproxy *source*.
+    """Scrape proxy candidates from a single pyfreeproxy *source*.
 
     Uses :func:`freeproxy.modules.BuildProxiedSession` to scrape the source
-    and returns a deduplicated list of ``http://ip:port`` URLs.  Only HTTP and
-    HTTPS proxy entries are included so that yt-dlp can use them without extra
-    SOCKS flags.
+    and returns a deduplicated list of proxy URLs. HTTP and HTTPS entries are
+    normalized to ``http://ip:port``. SOCKS4 and SOCKS5 entries keep their
+    native scheme so downstream clients can use them correctly.
 
     Returns an empty list if pyfreeproxy is not installed or the source fails.
     """
@@ -527,10 +527,12 @@ def _fetch_proxies_from_source(source: str) -> list[str]:
     seen: set[str] = set()
     for info in proxy_infos:
         protocol = (info.protocol or "").lower()
-        # Only HTTP/HTTPS proxies; SOCKS requires additional yt-dlp flags.
-        if protocol not in ("http", "https"):
+        if protocol in ("http", "https"):
+            proxy_url = f"http://{info.ip}:{info.port}"
+        elif protocol in ("socks4", "socks5"):
+            proxy_url = f"{protocol}://{info.ip}:{info.port}"
+        else:
             continue
-        proxy_url = f"http://{info.ip}:{info.port}"
         if proxy_url not in seen:
             seen.add(proxy_url)
             results.append(proxy_url)
@@ -546,7 +548,7 @@ def _fetch_proxies_from_source(source: str) -> list[str]:
 
 
 def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
-    """Scrape and deduplicate HTTP proxies from all pyfreeproxy *sources* in parallel."""
+    """Scrape and deduplicate proxies from all pyfreeproxy *sources* in parallel."""
     if not sources:
         logger.warning(
             {
@@ -829,19 +831,20 @@ class ProxyManager:
             )
 
     async def scan_and_get_proxy(self) -> str | None:
-        """Return a working proxy URL, scanning for new ones if the pool is empty.
+        """Return a working proxy URL, using backup immediately if the pool is empty.
 
         If the pool already has valid proxies, one is returned immediately (no
-        scan overhead).  If the pool is empty, an immediate proxy refresh scan
-        is triggered in a background thread; a proxy from the newly populated
-        pool is returned, or ``None`` when the scan also finds no working
-        proxies.
+        scan overhead). If the pool is empty, the protected local SOCKS5 backup
+        proxy is returned immediately. Empty-pool calls intentionally do not
+        block on a refresh because source scraping can hang and delay downloads.
 
         This method is intended for use in downloaders that should trigger a
         fresh proxy scan rather than silently proceeding without a proxy when
         the pool has been exhausted.
         """
         proxy = self.get_proxy()
+        if proxy == self.get_backup_proxy():
+            return proxy
         current_count = self.fresh_working_count()
         if proxy is not None and current_count >= _MIN_HEALTHY_POOL_SIZE:
             return proxy
@@ -860,17 +863,31 @@ class ProxyManager:
 
         logger.info(
             {
-                "event": "proxy_manager.scan_triggered",
+                "event": "proxy_manager.backup_proxy_selected",
                 "reason": "pool_empty",
-                "msg": "Proxy pool is empty; running immediate scan before download",
+                "proxy": self.get_backup_proxy(),
+                "msg": "Proxy pool is empty; using local SOCKS5 backup immediately",
             }
         )
-        await asyncio.to_thread(self._refresh_locked, "pool_empty")
-        return self.get_proxy() or self.get_backup_proxy()
+        with self._lock:
+            self._ensure_backup_proxy_locked()
+        return self.get_backup_proxy()
 
     def get_backup_proxy(self) -> str:
         """Return the protected local SOCKS5 backup proxy URL."""
         return _BACKUP_PROXY_URL
+
+    def _ensure_backup_proxy_locked(self) -> None:
+        """Ensure the protected backup proxy is present in the live pool.
+
+        Caller must hold ``self._lock``.
+        """
+        if _BACKUP_PROXY_URL not in self._proxy_records:
+            self._proxy_records[_BACKUP_PROXY_URL] = _ProxyRecord(
+                speed_bps=_MIN_SPEED_BPS * _INSTANT_RESPONSE_SPEED_MULTIPLIER,
+            )
+        if _BACKUP_PROXY_URL not in self._working:
+            self._working.append(_BACKUP_PROXY_URL)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -884,18 +901,26 @@ class ProxyManager:
             logger.warning(
                 {
                     "event": "proxy_manager.empty_list",
-                    "msg": "All proxy lists are empty; keeping existing pool",
+                    "msg": "All proxy lists are empty; using backup proxy if pool is empty",
                 }
             )
+            with self._lock:
+                if not self._working:
+                    self._ensure_backup_proxy_locked()
+                    _save_proxy_cache(self._proxy_records, self._cache_file)
             return
         working_with_speeds = _validate_proxies(candidates)
         if not working_with_speeds:
             logger.warning(
                 {
                     "event": "proxy_manager.no_valid_proxies",
-                    "msg": "Validation found no working proxies; keeping existing pool",
+                    "msg": "Validation found no working proxies; using backup proxy if pool is empty",
                 }
             )
+            with self._lock:
+                if not self._working:
+                    self._ensure_backup_proxy_locked()
+                    _save_proxy_cache(self._proxy_records, self._cache_file)
             return
         with self._lock:
             old_records = self._proxy_records
@@ -922,6 +947,7 @@ class ProxyManager:
             )
             self._working = working
             self._proxy_records = new_records
+            self._ensure_backup_proxy_locked()
         # Persist to disk so the pool (including score records) survives a
         # process restart.
         try:
