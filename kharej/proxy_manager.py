@@ -677,6 +677,11 @@ class ProxyManager:
                 }
             )
         self._task: asyncio.Task | None = None
+        self._background_refresh_task: asyncio.Task | None = None
+        self._last_refresh_started_at: float | None = None
+        self._last_refresh_finished_at: float | None = None
+        self._last_refresh_reason: str | None = None
+        self._refresh_count: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -684,10 +689,14 @@ class ProxyManager:
 
     async def start(self) -> None:
         """Fetch and validate the proxy list immediately, then schedule periodic refresh."""
+        if self._task is not None and not self._task.done():
+            logger.info({"event": "proxy_manager.start_skip", "msg": "Already started"})
+            return
         # Initial fetch in a background thread so we don't block the event loop.
         await asyncio.to_thread(self._refresh_locked, "startup")
         # Schedule recurring refresh
         self._task = asyncio.create_task(self._refresh_loop())
+        self._task.add_done_callback(self._on_refresh_loop_done)
         logger.info({"event": "proxy_manager.started", "interval_sec": _REFRESH_INTERVAL})
 
     async def stop(self) -> None:
@@ -700,6 +709,19 @@ class ProxyManager:
                 pass
             self._task = None
         logger.info({"event": "proxy_manager.stopped"})
+
+    def _on_refresh_loop_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(
+                {
+                    "event": "proxy_manager.refresh_loop_crashed",
+                    "error": repr(exc),
+                    "msg": "Periodic proxy refresh loop exited unexpectedly",
+                }
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -858,6 +880,11 @@ class ProxyManager:
         with self._lock:
             return len(self._working)
 
+    def public_working_count(self) -> int:
+        """Return active proxies excluding the protected local backup."""
+        with self._lock:
+            return sum(1 for url in self._working if url != _BACKUP_PROXY_URL)
+
     def fresh_working_count(self) -> int:
         """Return the number of proxies with recent validation timestamps."""
         with self._lock:
@@ -883,6 +910,8 @@ class ProxyManager:
         """
         proxy = self.get_proxy()
         if proxy == self.get_backup_proxy():
+            if self.public_working_count() == 0:
+                self._trigger_background_refresh("backup_only_pool")
             return proxy
         current_count = self.fresh_working_count()
         if proxy is not None and current_count >= _MIN_HEALTHY_POOL_SIZE:
@@ -923,7 +952,18 @@ class ProxyManager:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(asyncio.to_thread(self._refresh_locked, reason))
+        if self._background_refresh_task is not None and not self._background_refresh_task.done():
+            logger.debug(
+                {
+                    "event": "proxy_manager.background_refresh_skip",
+                    "reason": reason,
+                    "msg": "Background refresh already running",
+                }
+            )
+            return
+        self._background_refresh_task = loop.create_task(
+            asyncio.to_thread(self._refresh_locked, reason)
+        )
 
     def _ensure_backup_proxy_locked(self) -> None:
         """Ensure the protected backup proxy is present in the live pool.
@@ -1024,7 +1064,7 @@ class ProxyManager:
         the pool while this caller was waiting for the lock.
         """
         with self._refresh_lock:
-            if reason == "pool_empty" and self.working_count() > 0:
+            if reason == "pool_empty" and self.public_working_count() > 0:
                 logger.debug(
                     {
                         "event": "proxy_manager.refresh_skip",
@@ -1042,7 +1082,34 @@ class ProxyManager:
                     }
                 )
                 return
-            self._refresh()
+            self._last_refresh_reason = reason
+            self._last_refresh_started_at = time.time()
+            logger.info(
+                {
+                    "event": "proxy_manager.refresh_locked_start",
+                    "reason": reason,
+                    "working": self.working_count(),
+                    "public_working": self.public_working_count(),
+                }
+            )
+            try:
+                self._refresh()
+            finally:
+                self._last_refresh_finished_at = time.time()
+                self._refresh_count += 1
+                logger.info(
+                    {
+                        "event": "proxy_manager.refresh_locked_done",
+                        "reason": reason,
+                        "working": self.working_count(),
+                        "public_working": self.public_working_count(),
+                        "refresh_count": self._refresh_count,
+                        "duration_sec": round(
+                            self._last_refresh_finished_at - self._last_refresh_started_at,
+                            3,
+                        ) if self._last_refresh_started_at else None,
+                    }
+                )
 
     async def _refresh_loop(self) -> None:
         """Background task: replace the proxy pool every 15 minutes."""

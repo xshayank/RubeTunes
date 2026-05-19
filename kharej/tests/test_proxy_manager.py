@@ -43,7 +43,7 @@ def test_scan_and_get_proxy_refills_after_all_proxies_evicted(tmp_path: Path) ->
 
     assert proxy == _BACKUP_PROXY_URL
     assert mgr.working_count() == 1
-    assert mgr.refresh_calls == 0
+    assert mgr.refresh_calls == 1
 
 
 def test_concurrent_empty_pool_requests_share_one_refill(tmp_path: Path) -> None:
@@ -134,6 +134,22 @@ def test_refresh_updates_empty_pool_with_backup_proxy(tmp_path: Path) -> None:
 
     assert mgr.working_count() == 1
     assert mgr.get_proxy() == _BACKUP_PROXY_URL
+
+
+def test_backup_only_pool_triggers_background_refill(tmp_path: Path) -> None:
+    mgr = _RefillingProxyManager(tmp_path / "proxies.json", delay=0.01)
+    with mgr._lock:
+        mgr._proxy_records = {_BACKUP_PROXY_URL: _ProxyRecord(speed_bps=100_000)}
+        mgr._working = [_BACKUP_PROXY_URL]
+
+    async def _run() -> str | None:
+        proxy = await mgr.scan_and_get_proxy()
+        await asyncio.sleep(0.05)
+        return proxy
+
+    assert asyncio.run(_run()) == _BACKUP_PROXY_URL
+    assert mgr.refresh_calls == 1
+    assert mgr.public_working_count() == 1
 
 
 def test_fetcher_keeps_socks_proxy_schemes(monkeypatch) -> None:
