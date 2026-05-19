@@ -10,6 +10,8 @@ from kharej.proxy_manager import (
     _MAX_CONSECUTIVE_PROXY_FAILURES,
     _ProxyRecord,
     _fetch_proxies_from_source,
+    _normalize_raw_proxy_line,
+    _validate_single_proxy,
 )
 
 
@@ -74,7 +76,8 @@ def test_stale_proxy_remains_usable_as_fallback(tmp_path: Path) -> None:
     assert mgr.get_proxy() == "http://127.0.0.1:8080"
 
 
-def test_empty_pool_returns_backup_proxy_without_refreshing(tmp_path: Path) -> None:
+def test_empty_pool_returns_backup_proxy_without_refreshing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda: [])
     mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
 
     proxy = asyncio.run(mgr.scan_and_get_proxy())
@@ -83,7 +86,8 @@ def test_empty_pool_returns_backup_proxy_without_refreshing(tmp_path: Path) -> N
     assert mgr.working_count() == 1
 
 
-def test_backup_proxy_is_protected_from_eviction(tmp_path: Path) -> None:
+def test_backup_proxy_is_protected_from_eviction(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda: [])
     mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
 
     mgr.mark_proxy_failed(_BACKUP_PROXY_URL)
@@ -127,7 +131,8 @@ def test_proxy_success_resets_failure_count(tmp_path: Path) -> None:
     assert mgr.get_proxy() == proxy
 
 
-def test_refresh_updates_empty_pool_with_backup_proxy(tmp_path: Path) -> None:
+def test_refresh_updates_empty_pool_with_backup_proxy(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda: [])
     mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
 
     mgr._refresh()
@@ -184,6 +189,50 @@ def test_fetcher_keeps_socks_proxy_schemes(monkeypatch) -> None:
         "socks4://10.0.0.3:1080",
         "socks5://10.0.0.4:1081",
     ]
+
+
+def test_raw_proxy_line_normalizer_keeps_socks_schemes() -> None:
+    assert _normalize_raw_proxy_line("socks5", "1.2.3.4:1080") == "socks5://1.2.3.4:1080"
+    assert _normalize_raw_proxy_line("http", "https://1.2.3.4:8443") == "http://1.2.3.4:8443"
+    assert _normalize_raw_proxy_line("http", "bad-line") is None
+
+
+def test_validation_accepts_fast_proxy_even_when_youtube_check_fails(monkeypatch) -> None:
+    monkeypatch.setattr("kharej.proxy_manager._http_speed_check", lambda _proxy: 123_456.0)
+    monkeypatch.setattr("kharej.proxy_manager._http_youtube_check", lambda _proxy: False)
+
+    assert _validate_single_proxy("http://127.0.0.1:8080") == 123_456.0
+
+
+def test_refresh_uses_raw_sources_when_pyfreeproxy_sources_empty(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "kharej.proxy_manager._fetch_raw_proxy_lists",
+        lambda: ["socks5://10.0.0.4:1081", "http://10.0.0.5:8080"],
+    )
+    monkeypatch.setattr(
+        "kharej.proxy_manager._validate_proxies",
+        lambda candidates: [(url, 100_000.0) for url in candidates],
+    )
+    mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
+
+    mgr._refresh()
+
+    assert mgr.public_working_count() == 2
+    assert "socks5://10.0.0.4:1081" in mgr._working
+    assert "http://10.0.0.5:8080" in mgr._working
+
+
+def test_backup_proxy_is_last_resort_when_public_proxies_exist(tmp_path: Path) -> None:
+    public_proxy = "http://10.0.0.5:8080"
+    mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
+    with mgr._lock:
+        mgr._proxy_records = {
+            _BACKUP_PROXY_URL: _ProxyRecord(speed_bps=10_000_000),
+            public_proxy: _ProxyRecord(speed_bps=100_000),
+        }
+        mgr._working = [_BACKUP_PROXY_URL, public_proxy]
+
+    assert mgr.get_proxy() == public_proxy
 
 
 def test_freeproxy_source_list_includes_recent_http_sources(tmp_path: Path) -> None:

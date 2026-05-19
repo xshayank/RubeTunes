@@ -91,6 +91,7 @@ import logging
 import math
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -149,6 +150,24 @@ _FREEPROXY_SOURCES: list[str] = [
     "TheSpeedXProxiedSession",
     "TrustyTechProxiedSession",
 ]
+
+#: Raw public proxy-list endpoints used in addition to pyfreeproxy. These keep
+#: refills working when pyfreeproxy is missing, outdated, or a specific scraper
+#: breaks. Endpoints generally return one ``host:port`` per line.
+_RAW_PROXY_SOURCES: tuple[tuple[str, str], ...] = (
+    ("http", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
+    ("socks4", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt"),
+    ("socks5", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
+    ("http", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
+    ("socks4", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt"),
+    ("socks5", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
+    ("http", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt"),
+    ("socks4", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks4/data.txt"),
+    ("socks5", "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/socks5/data.txt"),
+)
+
+_RAW_PROXY_FETCH_TIMEOUT: float = 12.0
+_HOST_PORT_RE = re.compile(r"(?P<host>(?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9.-]+):(?P<port>\d{2,5})")
 
 #: Public HTTP speed-test server used for proxy validation.  Using a numeric
 #: IPv4 address avoids any DNS lookup through the proxy under test.
@@ -478,18 +497,31 @@ def _http_youtube_check(proxy_url: str) -> bool:
 def _validate_single_proxy(proxy_url: str) -> float:
     """Return the measured speed (bytes/sec) for *proxy_url*, or 0.0 if it fails.
 
-    Both checks must succeed:
+    The speed check must succeed:
 
     * :func:`_http_speed_check` — adequate download throughput via plain HTTP.
       Returns the measured speed so callers can rank proxies.
-    * :func:`_http_youtube_check` — can reach YouTube and fetch video content.
+
+    YouTube reachability is intentionally not a hard validation gate. Many
+    public proxies can download generic content but are geo-blocked or flagged
+    by YouTube. Rejecting them all makes refreshes look successful at fetch
+    time while the validated pool never changes. Downloader retry/failure
+    scoring handles YouTube-specific bad proxies at runtime.
 
     Returning 0.0 indicates the proxy should be discarded.
     """
     speed = _http_speed_check(proxy_url)
     if speed <= 0.0:
         return 0.0
-    return speed if _http_youtube_check(proxy_url) else 0.0
+    if not _http_youtube_check(proxy_url):
+        logger.debug(
+            {
+                "event": "proxy_manager.youtube_check_failed_nonfatal",
+                "proxy": proxy_url,
+                "speed_bps": speed,
+            }
+        )
+    return speed
 
 
 def _fetch_proxies_from_source(source: str) -> list[str]:
@@ -556,16 +588,111 @@ def _fetch_proxies_from_source(source: str) -> list[str]:
     return results
 
 
+def _normalize_raw_proxy_line(protocol: str, line: str) -> str | None:
+    """Normalize a raw proxy-list line into a proxy URL."""
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None
+    if "://" in text:
+        scheme, rest = text.split("://", 1)
+        scheme = scheme.lower()
+        if scheme not in {"http", "https", "socks4", "socks5"}:
+            return None
+        match = _HOST_PORT_RE.search(rest)
+        if not match:
+            return None
+        protocol = "http" if scheme in {"http", "https"} else scheme
+    else:
+        match = _HOST_PORT_RE.search(text)
+        if not match:
+            return None
+        protocol = "http" if protocol in {"http", "https"} else protocol
+
+    port = int(match.group("port"))
+    if not 1 <= port <= 65535:
+        return None
+    return f"{protocol}://{match.group('host')}:{port}"
+
+
+def _fetch_raw_proxy_source(protocol: str, url: str) -> list[str]:
+    """Fetch one raw proxy-list URL."""
+    try:
+        import requests  # noqa: PLC0415
+    except ImportError:
+        logger.warning({"event": "proxy_manager.requests_missing_raw_fetch"})
+        return []
+
+    try:
+        resp = requests.get(url, timeout=_RAW_PROXY_FETCH_TIMEOUT)
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.warning(
+            {
+                "event": "proxy_manager.raw_source_fetch_failed",
+                "url": url,
+                "protocol": protocol,
+                "error": repr(exc),
+            }
+        )
+        return []
+
+    results: list[str] = []
+    seen: set[str] = set()
+    for line in resp.text.splitlines():
+        proxy_url = _normalize_raw_proxy_line(protocol, line)
+        if proxy_url and proxy_url not in seen:
+            seen.add(proxy_url)
+            results.append(proxy_url)
+
+    logger.info(
+        {
+            "event": "proxy_manager.raw_source_fetch_done",
+            "url": url,
+            "protocol": protocol,
+            "candidates": len(results),
+        }
+    )
+    return results
+
+
+def _fetch_raw_proxy_lists() -> list[str]:
+    """Fetch and deduplicate raw proxy-list endpoints."""
+    seen: set[str] = set()
+    combined: list[str] = []
+    lock = threading.Lock()
+
+    def _fetch_and_collect(item: tuple[str, str]) -> None:
+        protocol, url = item
+        proxies = _fetch_raw_proxy_source(protocol, url)
+        with lock:
+            for proxy in proxies:
+                if proxy not in seen:
+                    seen.add(proxy)
+                    combined.append(proxy)
+
+    with ThreadPoolExecutor(max_workers=min(len(_RAW_PROXY_SOURCES), _FETCH_WORKERS)) as executor:
+        list(executor.map(_fetch_and_collect, _RAW_PROXY_SOURCES))
+
+    logger.info(
+        {
+            "event": "proxy_manager.raw_fetch_all_done",
+            "sources": len(_RAW_PROXY_SOURCES),
+            "total_candidates": len(combined),
+        }
+    )
+    return combined
+
+
 def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
     """Scrape and deduplicate proxies from all pyfreeproxy *sources* in parallel."""
     if not sources:
         logger.warning(
             {
                 "event": "proxy_manager.no_sources",
-                "msg": "No proxy sources configured; using backup proxy fallback",
+                "msg": "No pyfreeproxy sources configured; using raw proxy sources only",
             }
         )
-        return []
+        return _fetch_raw_proxy_lists()
 
     seen: set[str] = set()
     combined: list[str] = []
@@ -581,6 +708,11 @@ def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
 
     with ThreadPoolExecutor(max_workers=min(len(sources), _FETCH_WORKERS)) as executor:
         list(executor.map(_fetch_and_collect, sources))
+
+    for proxy in _fetch_raw_proxy_lists():
+        if proxy not in seen:
+            seen.add(proxy)
+            combined.append(proxy)
 
     logger.info(
         {
@@ -739,14 +871,15 @@ class ProxyManager:
         with self._lock:
             if not self._working:
                 return None
+            public_working = [url for url in self._working if url != _BACKUP_PROXY_URL]
             fresh_working = [
                 url
-                for url in self._working
+                for url in public_working
                 if _is_proxy_record_fresh(
                     self._proxy_records.get(url, _ProxyRecord(speed_bps=_MIN_SPEED_BPS))
                 )
             ]
-            selection_source = fresh_working or self._working
+            selection_source = fresh_working or public_working or self._working
             # Re-rank by current composite weight so that success-counter changes
             # made between refreshes are reflected in the top-N selection, rather
             # than relying on the ordering established at the last refresh.
@@ -985,10 +1118,14 @@ class ProxyManager:
         """Synchronously fetch and validate the proxy list, then replace the pool."""
         logger.info({"event": "proxy_manager.refresh_start", "sources": self._sources})
         candidates = _fetch_all_proxy_lists(self._sources)
+        before_total = self.working_count()
+        before_public = self.public_working_count()
         if not candidates:
             logger.warning(
                 {
                     "event": "proxy_manager.empty_list",
+                    "before": before_total,
+                    "before_public": before_public,
                     "msg": "All proxy lists are empty; using backup proxy if pool is empty",
                 }
             )
@@ -1002,6 +1139,9 @@ class ProxyManager:
             logger.warning(
                 {
                     "event": "proxy_manager.no_valid_proxies",
+                    "fetched": len(candidates),
+                    "before": before_total,
+                    "before_public": before_public,
                     "msg": "Validation found no working proxies; using backup proxy if pool is empty",
                 }
             )
@@ -1013,6 +1153,8 @@ class ProxyManager:
         with self._lock:
             old_records = self._proxy_records
             new_records: dict[str, _ProxyRecord] = {}
+            added = 0
+            updated = 0
             now = time.time()
             for url, speed in working_with_speeds:
                 if url in old_records:
@@ -1023,8 +1165,10 @@ class ProxyManager:
                     rec.scan_passes += 1
                     rec.last_validated_at = now
                     new_records[url] = rec
+                    updated += 1
                 else:
                     new_records[url] = _ProxyRecord(speed_bps=speed, last_validated_at=now)
+                    added += 1
 
             # Sort by descending composite weight so the best proxies sit at
             # the front of _working and get_proxy()'s top-N slice is correct.
@@ -1036,6 +1180,8 @@ class ProxyManager:
             self._working = working
             self._proxy_records = new_records
             self._ensure_backup_proxy_locked()
+            after_total = len(self._working)
+            after_public = sum(1 for url in self._working if url != _BACKUP_PROXY_URL)
         # Persist to disk so the pool (including score records) survives a
         # process restart.
         try:
@@ -1050,7 +1196,14 @@ class ProxyManager:
         logger.info(
             {
                 "event": "proxy_manager.refresh_done",
-                "working": len(working),
+                "fetched": len(candidates),
+                "validated": len(working_with_speeds),
+                "added": added,
+                "updated": updated,
+                "before": before_total,
+                "before_public": before_public,
+                "working": after_total,
+                "public_working": after_public,
             }
         )
 
