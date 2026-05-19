@@ -234,9 +234,16 @@ def test_refresh_uses_raw_sources_when_pyfreeproxy_sources_empty(tmp_path: Path,
         "kharej.proxy_manager._fetch_raw_proxy_lists",
         lambda: ["socks5://10.0.0.4:1081", "http://10.0.0.5:8080"],
     )
+    def _fake_validate_raw_sources(candidates, *, on_valid=None):
+        results = [(url, 100_000.0) for url in candidates]
+        if on_valid is not None:
+            for url, speed in results:
+                on_valid(url, speed)
+        return results
+
     monkeypatch.setattr(
         "kharej.proxy_manager._validate_proxies",
-        lambda candidates: [(url, 100_000.0) for url in candidates],
+        _fake_validate_raw_sources,
     )
     mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
 
@@ -245,6 +252,29 @@ def test_refresh_uses_raw_sources_when_pyfreeproxy_sources_empty(tmp_path: Path,
     assert mgr.public_working_count() == 2
     assert "socks5://10.0.0.4:1081" in mgr._working
     assert "http://10.0.0.5:8080" in mgr._working
+
+
+def test_refresh_writes_cache_before_and_during_validation(tmp_path: Path, monkeypatch) -> None:
+    cache = tmp_path / "proxies.json"
+    observed_cache_states: list[str] = []
+
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda: ["http://10.0.0.5:8080"])
+
+    def _fake_validate(candidates, *, on_valid=None):
+        observed_cache_states.append(cache.read_text())
+        if on_valid is not None:
+            on_valid("http://10.0.0.5:8080", 100_000.0)
+            observed_cache_states.append(cache.read_text())
+        return [("http://10.0.0.5:8080", 100_000.0)]
+
+    monkeypatch.setattr("kharej.proxy_manager._validate_proxies", _fake_validate)
+    mgr = ProxyManager(sources=[], cache_file=cache)
+
+    mgr._refresh()
+
+    assert cache.exists()
+    assert _BACKUP_PROXY_URL in observed_cache_states[0]
+    assert "http://10.0.0.5:8080" in observed_cache_states[1]
 
 
 def test_backup_proxy_is_last_resort_when_public_proxies_exist(tmp_path: Path) -> None:
