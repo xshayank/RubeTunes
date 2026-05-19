@@ -505,6 +505,37 @@ async def test_youtube_downloader_no_video_formats_retries_without_proxy() -> No
 
 
 @pytest.mark.asyncio
+async def test_youtube_downloader_forces_backup_when_proxy_manager_returns_none() -> None:
+    """An empty proxy pool must still pass the local SOCKS backup to yt-dlp."""
+    job = _make_job(quality="mp3")
+    s2 = _make_s2(_DUMMY_REF)
+    progress = _make_progress()
+    settings = _make_settings()
+    backup_proxy = "socks5://127.0.0.1:5914"
+    seen_cmds: list[list[str]] = []
+
+    def _fake_subprocess(cmd, job_id, loop, progress_coro_factory):
+        seen_cmds.append(cmd)
+        idx = cmd.index("--output")
+        out_dir = Path(cmd[idx + 1]).parent
+        (out_dir / "track.mp3").write_bytes(b"\x00" * 64)
+
+    with patch("kharej.downloaders.youtube._find_ytdlp", return_value="/usr/bin/yt-dlp"), \
+         patch("kharej.downloaders.youtube.proxy_manager") as mock_pm, \
+         patch("kharej.downloaders.youtube._run_ytdlp_subprocess", side_effect=_fake_subprocess):
+        mock_pm.scan_and_get_proxy = AsyncMock(return_value=None)
+        mock_pm.get_backup_proxy.return_value = backup_proxy
+        downloader = YoutubeDownloader()
+        refs = await downloader.run(job, s2=s2, progress=progress, settings=settings)
+
+    assert len(refs) == 1
+    assert seen_cmds
+    cmd = seen_cmds[0]
+    assert "--proxy" in cmd
+    assert cmd[cmd.index("--proxy") + 1] == backup_proxy
+
+
+@pytest.mark.asyncio
 async def test_youtube_downloader_no_video_formats_marks_proxy_failed() -> None:
     """'No video formats found' must mark the active proxy as failed and retry."""
     job = _make_job(quality="mp3")
