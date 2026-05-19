@@ -209,6 +209,11 @@ _PROXY_MAX_AGE_SECONDS: float = 3600.0
 #: Trigger an on-demand refresh when the usable pool falls below this size.
 _MIN_HEALTHY_POOL_SIZE: int = 8
 
+#: Consecutive proxy-related failures before evicting a public proxy. A single
+#: media failure is often caused by the source or remote platform, so immediate
+#: eviction drains the pool during normal runtime.
+_MAX_CONSECUTIVE_PROXY_FAILURES: int = 3
+
 #: Local fallback proxy used as a last-resort retry path when public proxies
 #: fail. It is deliberately protected from pool eviction.
 _BACKUP_PROXY_URL: str = os.getenv("KHAREJ_BACKUP_PROXY", "socks5://127.0.0.1:5914")
@@ -237,6 +242,7 @@ class _ProxyRecord:
 
     speed_bps: float
     successes: int = field(default=0)
+    failures: int = field(default=0)
     scan_passes: int = field(default=1)
     last_validated_at: float = field(default_factory=time.time)
 
@@ -301,6 +307,7 @@ def _load_proxy_cache(path: Path) -> dict[str, _ProxyRecord]:
                     if not math.isfinite(raw_speed) or raw_speed < _MIN_SPEED_BPS:
                         raw_speed = _MIN_SPEED_BPS
                     raw_successes = max(0, int(item.get("successes") or 0))
+                    raw_failures = max(0, int(item.get("failures") or 0))
                     # max(1, ...) guards against 0 or negative values that could
                     # appear in manually edited or corrupted cache files.
                     raw_scan_passes = max(1, int(item.get("scan_passes") or 0))
@@ -317,6 +324,7 @@ def _load_proxy_cache(path: Path) -> dict[str, _ProxyRecord]:
                 records[url] = _ProxyRecord(
                     speed_bps=raw_speed,
                     successes=raw_successes,
+                    failures=raw_failures,
                     scan_passes=raw_scan_passes,
                     last_validated_at=raw_last_validated,
                 )
@@ -333,6 +341,7 @@ def _save_proxy_cache(records: dict[str, _ProxyRecord], path: Path) -> None:
             "url": url,
             "speed_bps": rec.speed_bps,
             "successes": rec.successes,
+            "failures": rec.failures,
             "scan_passes": rec.scan_passes,
             "last_validated_at": rec.last_validated_at,
         }
@@ -758,6 +767,7 @@ class ProxyManager:
             if rec is None:
                 return
             rec.successes += 1
+            rec.failures = 0
             # Capture while holding the lock so the logged value is consistent
             # with the state change even if another thread modifies the record.
             successes = rec.successes
@@ -771,10 +781,12 @@ class ProxyManager:
         )
 
     def mark_proxy_failed(self, proxy_url: str | None) -> None:
-        """Evict *proxy_url* from the working pool immediately.
+        """Record a proxy failure and evict only after repeated failures.
 
-        Call this when a download fails with a proxy-related error so that
-        subsequent requests from other jobs do not reuse the broken proxy.
+        Call this when a download fails with a proxy-related error. Free proxies
+        are noisy, and source/platform failures can look like proxy failures, so
+        the manager uses a small consecutive-failure threshold instead of
+        draining the whole pool on first failure.
         If *proxy_url* is ``None`` the call is a no-op.
         When the pool becomes empty after the eviction, the next call to
         :meth:`scan_and_get_proxy` will trigger a fresh on-demand refresh.
@@ -791,17 +803,44 @@ class ProxyManager:
             )
             return
         with self._lock:
-            try:
-                self._working.remove(proxy_url)
-            except ValueError:
-                return  # already removed, nothing to do
-            self._proxy_records.pop(proxy_url, None)
-            remaining = len(self._working)
+            rec = self._proxy_records.get(proxy_url)
+            if rec is None or proxy_url not in self._working:
+                return
+            rec.failures += 1
+            failures = rec.failures
+            if failures < _MAX_CONSECUTIVE_PROXY_FAILURES:
+                remaining = len(self._working)
+                evicted = False
+            else:
+                try:
+                    self._working.remove(proxy_url)
+                except ValueError:
+                    return
+                self._proxy_records.pop(proxy_url, None)
+                remaining = len(self._working)
+                evicted = True
+
+            if remaining == 0:
+                self._ensure_backup_proxy_locked()
+                remaining = len(self._working)
+
+        if not evicted:
+            logger.warning(
+                {
+                    "event": "proxy_manager.proxy_failure_recorded",
+                    "proxy": proxy_url,
+                    "failures": failures,
+                    "evict_after": _MAX_CONSECUTIVE_PROXY_FAILURES,
+                    "remaining": remaining,
+                }
+            )
+            return
 
         logger.warning(
             {
                 "event": "proxy_manager.proxy_evicted",
                 "proxy": proxy_url,
+                "failures": failures,
                 "remaining": remaining,
             }
         )
@@ -871,11 +910,20 @@ class ProxyManager:
         )
         with self._lock:
             self._ensure_backup_proxy_locked()
+        self._trigger_background_refresh("pool_empty_backup")
         return self.get_backup_proxy()
 
     def get_backup_proxy(self) -> str:
         """Return the protected local SOCKS5 backup proxy URL."""
         return _BACKUP_PROXY_URL
+
+    def _trigger_background_refresh(self, reason: str) -> None:
+        """Start a best-effort refresh without blocking the current download."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(asyncio.to_thread(self._refresh_locked, reason))
 
     def _ensure_backup_proxy_locked(self) -> None:
         """Ensure the protected backup proxy is present in the live pool.

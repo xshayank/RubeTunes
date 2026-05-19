@@ -7,6 +7,7 @@ from pathlib import Path
 from kharej.proxy_manager import (
     ProxyManager,
     _BACKUP_PROXY_URL,
+    _MAX_CONSECUTIVE_PROXY_FAILURES,
     _ProxyRecord,
     _fetch_proxies_from_source,
 )
@@ -35,7 +36,8 @@ def test_scan_and_get_proxy_refills_after_all_proxies_evicted(tmp_path: Path) ->
         mgr._proxy_records = {"http://127.0.0.1:8080": _ProxyRecord(speed_bps=100_000)}
         mgr._working = ["http://127.0.0.1:8080"]
 
-    mgr.mark_proxy_failed("http://127.0.0.1:8080")
+    for _ in range(_MAX_CONSECUTIVE_PROXY_FAILURES):
+        mgr.mark_proxy_failed("http://127.0.0.1:8080")
 
     proxy = asyncio.run(mgr.scan_and_get_proxy())
 
@@ -53,7 +55,7 @@ def test_concurrent_empty_pool_requests_share_one_refill(tmp_path: Path) -> None
     proxies = asyncio.run(_run())
 
     assert proxies == [_BACKUP_PROXY_URL] * 5
-    assert mgr.refresh_calls == 0
+    assert mgr.refresh_calls == 1
 
 
 def test_stale_proxy_remains_usable_as_fallback(tmp_path: Path) -> None:
@@ -88,6 +90,41 @@ def test_backup_proxy_is_protected_from_eviction(tmp_path: Path) -> None:
 
     assert asyncio.run(mgr.scan_and_get_proxy()) == _BACKUP_PROXY_URL
     assert mgr.working_count() == 1
+
+
+def test_proxy_failure_does_not_evict_until_threshold(tmp_path: Path) -> None:
+    proxy = "http://127.0.0.1:8080"
+    mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
+    with mgr._lock:
+        mgr._proxy_records = {proxy: _ProxyRecord(speed_bps=100_000)}
+        mgr._working = [proxy]
+
+    for _ in range(_MAX_CONSECUTIVE_PROXY_FAILURES - 1):
+        mgr.mark_proxy_failed(proxy)
+
+    assert mgr.working_count() == 1
+    assert mgr.get_proxy() == proxy
+
+    mgr.mark_proxy_failed(proxy)
+
+    assert mgr.working_count() == 1
+    assert mgr.get_proxy() == _BACKUP_PROXY_URL
+
+
+def test_proxy_success_resets_failure_count(tmp_path: Path) -> None:
+    proxy = "http://127.0.0.1:8080"
+    mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
+    with mgr._lock:
+        mgr._proxy_records = {proxy: _ProxyRecord(speed_bps=100_000)}
+        mgr._working = [proxy]
+
+    for _ in range(_MAX_CONSECUTIVE_PROXY_FAILURES - 1):
+        mgr.mark_proxy_failed(proxy)
+    mgr.mark_proxy_succeeded(proxy)
+    mgr.mark_proxy_failed(proxy)
+
+    assert mgr.working_count() == 1
+    assert mgr.get_proxy() == proxy
 
 
 def test_refresh_updates_empty_pool_with_backup_proxy(tmp_path: Path) -> None:
