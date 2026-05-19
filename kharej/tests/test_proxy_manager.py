@@ -11,6 +11,7 @@ from kharej.proxy_manager import (
     _ProxyRecord,
     _fetch_proxies_from_source,
     _normalize_raw_proxy_line,
+    _prepare_validation_candidates,
     _validate_single_proxy,
 )
 
@@ -202,6 +203,30 @@ def test_validation_accepts_fast_proxy_even_when_youtube_check_fails(monkeypatch
     monkeypatch.setattr("kharej.proxy_manager._http_youtube_check", lambda _proxy: False)
 
     assert _validate_single_proxy("http://127.0.0.1:8080") == 123_456.0
+
+
+def test_validation_candidates_skip_socks_without_pysocks(monkeypatch) -> None:
+    monkeypatch.setattr("kharej.proxy_manager._socks_support_available", lambda: False)
+
+    assert _prepare_validation_candidates(
+        [
+            "socks5://1.2.3.4:1080",
+            "http://5.6.7.8:8080",
+            "socks4://9.9.9.9:1080",
+        ]
+    ) == ["http://5.6.7.8:8080"]
+
+
+def test_validation_candidates_include_socks_when_pysocks_available(monkeypatch) -> None:
+    monkeypatch.setattr("kharej.proxy_manager._socks_support_available", lambda: True)
+
+    assert _prepare_validation_candidates(
+        [
+            "socks5://1.2.3.4:1080",
+            "http://5.6.7.8:8080",
+            "socks4://9.9.9.9:1080",
+        ]
+    ) == ["http://5.6.7.8:8080", "socks5://1.2.3.4:1080", "socks4://9.9.9.9:1080"]
 
 
 def test_refresh_uses_raw_sources_when_pyfreeproxy_sources_empty(tmp_path: Path, monkeypatch) -> None:
