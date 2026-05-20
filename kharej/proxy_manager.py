@@ -691,7 +691,10 @@ def _fetch_raw_proxy_source(protocol: str, url: str) -> list[str]:
     return results
 
 
-def _fetch_raw_proxy_lists() -> list[str]:
+def _fetch_raw_proxy_lists(
+    *,
+    on_batch: Callable[[list[str]], None] | None = None,
+) -> list[str]:
     """Fetch and deduplicate raw proxy-list endpoints."""
     seen: set[str] = set()
     combined: list[str] = []
@@ -700,6 +703,8 @@ def _fetch_raw_proxy_lists() -> list[str]:
     def _fetch_and_collect(item: tuple[str, str]) -> None:
         protocol, url = item
         proxies = _fetch_raw_proxy_source(protocol, url)
+        if proxies and on_batch is not None:
+            on_batch(proxies)
         with lock:
             for proxy in proxies:
                 if proxy not in seen:
@@ -736,7 +741,11 @@ def _fetch_raw_proxy_lists() -> list[str]:
     return combined
 
 
-def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
+def _fetch_all_proxy_lists(
+    sources: list[str],
+    *,
+    on_batch: Callable[[list[str]], None] | None = None,
+) -> list[str]:
     """Scrape and deduplicate proxies from all pyfreeproxy *sources* in parallel."""
     if not sources:
         logger.warning(
@@ -745,7 +754,7 @@ def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
                 "msg": "No pyfreeproxy sources configured; using raw proxy sources only",
             }
         )
-        return _fetch_raw_proxy_lists()
+        return _fetch_raw_proxy_lists(on_batch=on_batch)
 
     seen: set[str] = set()
     combined: list[str] = []
@@ -753,6 +762,8 @@ def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
 
     def _fetch_and_collect(source: str) -> None:
         proxies = _fetch_proxies_from_source(source)
+        if proxies and on_batch is not None:
+            on_batch(proxies)
         with lock:
             for proxy in proxies:
                 if proxy not in seen:
@@ -779,7 +790,7 @@ def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
             fut.cancel()
     executor.shutdown(wait=False, cancel_futures=True)
 
-    for proxy in _fetch_raw_proxy_lists():
+    for proxy in _fetch_raw_proxy_lists(on_batch=on_batch):
         if proxy not in seen:
             seen.add(proxy)
             combined.append(proxy)
@@ -1228,25 +1239,9 @@ class ProxyManager:
                 self._ensure_backup_proxy_locked()
             _save_proxy_cache(self._proxy_records, self._cache_file)
 
-        candidates = _fetch_all_proxy_lists(self._sources)
-        before_total = self.working_count()
-        before_public = self.public_working_count()
-        if not candidates:
-            logger.warning(
-                {
-                    "event": "proxy_manager.empty_list",
-                    "before": before_total,
-                    "before_public": before_public,
-                    "msg": "All proxy lists are empty; using backup proxy if pool is empty",
-                }
-            )
-            with self._lock:
-                if not self._working:
-                    self._ensure_backup_proxy_locked()
-                    _save_proxy_cache(self._proxy_records, self._cache_file)
-            return
         incremental_validated: dict[str, float] = {}
         incremental_lock = threading.Lock()
+        validated_candidate_seen: set[str] = set()
 
         def _record_valid_proxy(url: str, speed: float) -> None:
             with incremental_lock:
@@ -1271,7 +1266,47 @@ class ProxyManager:
                 self._ensure_backup_proxy_locked()
                 _save_proxy_cache(self._proxy_records, self._cache_file)
 
-        working_with_speeds = _validate_proxies(candidates, on_valid=_record_valid_proxy)
+        def _validate_fetched_batch(batch: list[str]) -> None:
+            new_batch: list[str] = []
+            with incremental_lock:
+                for url in batch:
+                    if url not in validated_candidate_seen:
+                        validated_candidate_seen.add(url)
+                        new_batch.append(url)
+            if not new_batch:
+                return
+            logger.info(
+                {
+                    "event": "proxy_manager.validate_fetched_batch_start",
+                    "candidates": len(new_batch),
+                }
+            )
+            _validate_proxies(new_batch, on_valid=_record_valid_proxy)
+
+        candidates = _fetch_all_proxy_lists(self._sources, on_batch=_validate_fetched_batch)
+        before_total = self.working_count()
+        before_public = self.public_working_count()
+        if not candidates:
+            logger.warning(
+                {
+                    "event": "proxy_manager.empty_list",
+                    "before": before_total,
+                    "before_public": before_public,
+                    "msg": "All proxy lists are empty; using backup proxy if pool is empty",
+                }
+            )
+            with self._lock:
+                if not self._working:
+                    self._ensure_backup_proxy_locked()
+                    _save_proxy_cache(self._proxy_records, self._cache_file)
+            return
+
+        remaining_candidates = [url for url in candidates if url not in validated_candidate_seen]
+        if remaining_candidates:
+            _validate_proxies(remaining_candidates, on_valid=_record_valid_proxy)
+
+        with incremental_lock:
+            working_with_speeds = list(incremental_validated.items())
         if not working_with_speeds:
             logger.warning(
                 {

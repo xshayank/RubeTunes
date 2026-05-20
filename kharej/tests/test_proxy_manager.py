@@ -107,7 +107,7 @@ def test_stale_proxy_remains_usable_as_fallback(tmp_path: Path) -> None:
 
 
 def test_empty_pool_returns_backup_proxy_without_refreshing(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda: [])
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda *, on_batch=None: [])
     mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
 
     proxy = asyncio.run(mgr.scan_and_get_proxy())
@@ -117,7 +117,7 @@ def test_empty_pool_returns_backup_proxy_without_refreshing(tmp_path: Path, monk
 
 
 def test_backup_proxy_is_protected_from_eviction(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda: [])
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda *, on_batch=None: [])
     mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
 
     mgr.mark_proxy_failed(_BACKUP_PROXY_URL)
@@ -162,7 +162,7 @@ def test_proxy_success_resets_failure_count(tmp_path: Path) -> None:
 
 
 def test_refresh_updates_empty_pool_with_backup_proxy(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda: [])
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda *, on_batch=None: [])
     mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
 
     mgr._refresh()
@@ -259,9 +259,15 @@ def test_validation_candidates_include_socks_when_pysocks_available(monkeypatch)
 
 
 def test_refresh_uses_raw_sources_when_pyfreeproxy_sources_empty(tmp_path: Path, monkeypatch) -> None:
+    def _fake_fetch_raw_sources(*, on_batch=None):
+        proxies = ["socks5://10.0.0.4:1081", "http://10.0.0.5:8080"]
+        if on_batch is not None:
+            on_batch(proxies)
+        return proxies
+
     monkeypatch.setattr(
         "kharej.proxy_manager._fetch_raw_proxy_lists",
-        lambda: ["socks5://10.0.0.4:1081", "http://10.0.0.5:8080"],
+        _fake_fetch_raw_sources,
     )
     def _fake_validate_raw_sources(candidates, *, on_valid=None):
         results = [(url, 100_000.0) for url in candidates]
@@ -287,7 +293,13 @@ def test_refresh_writes_cache_before_and_during_validation(tmp_path: Path, monke
     cache = tmp_path / "proxies.json"
     observed_cache_states: list[str] = []
 
-    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", lambda: ["http://10.0.0.5:8080"])
+    def _fake_fetch_raw_for_cache(*, on_batch=None):
+        proxies = ["http://10.0.0.5:8080"]
+        if on_batch is not None:
+            on_batch(proxies)
+        return proxies
+
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", _fake_fetch_raw_for_cache)
 
     def _fake_validate(candidates, *, on_valid=None):
         observed_cache_states.append(cache.read_text())
