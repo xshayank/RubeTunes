@@ -96,7 +96,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -189,6 +189,11 @@ _TOP_PROXY_COUNT: int = 50
 #: Caps the number of concurrent HTTP scrapers to avoid excessive thread
 #: creation when the sources list grows.
 _FETCH_WORKERS: int = 10
+
+#: Maximum seconds to wait for provider scraper futures as a group. Some
+#: pyfreeproxy providers can hang indefinitely, and startup/refill must never
+#: wait hours for a broken scraper.
+_FETCH_ALL_TIMEOUT: float = 35.0
 
 #: Speed multiplier applied when a proxy responds almost instantly (< 10 ms).
 #: In this case, elapsed time is too small to compute a reliable bps value so
@@ -686,7 +691,10 @@ def _fetch_raw_proxy_source(protocol: str, url: str) -> list[str]:
     return results
 
 
-def _fetch_raw_proxy_lists() -> list[str]:
+def _fetch_raw_proxy_lists(
+    *,
+    on_batch: Callable[[list[str]], None] | None = None,
+) -> list[str]:
     """Fetch and deduplicate raw proxy-list endpoints."""
     seen: set[str] = set()
     combined: list[str] = []
@@ -695,14 +703,33 @@ def _fetch_raw_proxy_lists() -> list[str]:
     def _fetch_and_collect(item: tuple[str, str]) -> None:
         protocol, url = item
         proxies = _fetch_raw_proxy_source(protocol, url)
+        if proxies and on_batch is not None:
+            on_batch(proxies)
         with lock:
             for proxy in proxies:
                 if proxy not in seen:
                     seen.add(proxy)
                     combined.append(proxy)
 
-    with ThreadPoolExecutor(max_workers=min(len(_RAW_PROXY_SOURCES), _FETCH_WORKERS)) as executor:
-        list(executor.map(_fetch_and_collect, _RAW_PROXY_SOURCES))
+    executor = ThreadPoolExecutor(max_workers=min(len(_RAW_PROXY_SOURCES), _FETCH_WORKERS))
+    futures = [executor.submit(_fetch_and_collect, item) for item in _RAW_PROXY_SOURCES]
+    done, pending = wait(futures, timeout=_FETCH_ALL_TIMEOUT)
+    for fut in done:
+        try:
+            fut.result()
+        except Exception as exc:
+            logger.warning({"event": "proxy_manager.raw_fetch_future_error", "error": repr(exc)})
+    if pending:
+        logger.warning(
+            {
+                "event": "proxy_manager.raw_fetch_timeout",
+                "pending": len(pending),
+                "timeout_sec": _FETCH_ALL_TIMEOUT,
+            }
+        )
+        for fut in pending:
+            fut.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
 
     logger.info(
         {
@@ -714,7 +741,11 @@ def _fetch_raw_proxy_lists() -> list[str]:
     return combined
 
 
-def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
+def _fetch_all_proxy_lists(
+    sources: list[str],
+    *,
+    on_batch: Callable[[list[str]], None] | None = None,
+) -> list[str]:
     """Scrape and deduplicate proxies from all pyfreeproxy *sources* in parallel."""
     if not sources:
         logger.warning(
@@ -723,7 +754,7 @@ def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
                 "msg": "No pyfreeproxy sources configured; using raw proxy sources only",
             }
         )
-        return _fetch_raw_proxy_lists()
+        return _fetch_raw_proxy_lists(on_batch=on_batch)
 
     seen: set[str] = set()
     combined: list[str] = []
@@ -731,16 +762,35 @@ def _fetch_all_proxy_lists(sources: list[str]) -> list[str]:
 
     def _fetch_and_collect(source: str) -> None:
         proxies = _fetch_proxies_from_source(source)
+        if proxies and on_batch is not None:
+            on_batch(proxies)
         with lock:
             for proxy in proxies:
                 if proxy not in seen:
                     seen.add(proxy)
                     combined.append(proxy)
 
-    with ThreadPoolExecutor(max_workers=min(len(sources), _FETCH_WORKERS)) as executor:
-        list(executor.map(_fetch_and_collect, sources))
+    executor = ThreadPoolExecutor(max_workers=min(len(sources), _FETCH_WORKERS))
+    futures = [executor.submit(_fetch_and_collect, source) for source in sources]
+    done, pending = wait(futures, timeout=_FETCH_ALL_TIMEOUT)
+    for fut in done:
+        try:
+            fut.result()
+        except Exception as exc:
+            logger.warning({"event": "proxy_manager.fetch_future_error", "error": repr(exc)})
+    if pending:
+        logger.warning(
+            {
+                "event": "proxy_manager.fetch_timeout",
+                "pending": len(pending),
+                "timeout_sec": _FETCH_ALL_TIMEOUT,
+            }
+        )
+        for fut in pending:
+            fut.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
 
-    for proxy in _fetch_raw_proxy_lists():
+    for proxy in _fetch_raw_proxy_lists(on_batch=on_batch):
         if proxy not in seen:
             seen.add(proxy)
             combined.append(proxy)
@@ -853,21 +903,21 @@ class ProxyManager:
         self._last_refresh_finished_at: float | None = None
         self._last_refresh_reason: str | None = None
         self._refresh_count: int = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Fetch and validate the proxy list immediately, then schedule periodic refresh."""
+        """Schedule startup and periodic refresh without blocking worker startup."""
         if self._task is not None and not self._task.done():
             logger.info({"event": "proxy_manager.start_skip", "msg": "Already started"})
             return
-        # Initial fetch in a background thread so we don't block the event loop.
-        await asyncio.to_thread(self._refresh_locked, "startup")
-        # Schedule recurring refresh
+        self._loop = asyncio.get_running_loop()
         self._task = asyncio.create_task(self._refresh_loop())
         self._task.add_done_callback(self._on_refresh_loop_done)
+        self._trigger_background_refresh("startup")
         logger.info({"event": "proxy_manager.started", "interval_sec": _REFRESH_INTERVAL})
 
     async def stop(self) -> None:
@@ -879,6 +929,14 @@ class ProxyManager:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._background_refresh_task is not None:
+            self._background_refresh_task.cancel()
+            try:
+                await self._background_refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._background_refresh_task = None
+        self._loop = None
         logger.info({"event": "proxy_manager.stopped"})
 
     def _on_refresh_loop_done(self, task: asyncio.Task) -> None:
@@ -1080,6 +1138,7 @@ class ProxyManager:
         fresh proxy scan rather than silently proceeding without a proxy when
         the pool has been exhausted.
         """
+        self._ensure_refresh_loop_running()
         proxy = self.get_proxy()
         if proxy == self.get_backup_proxy():
             if self.public_working_count() == 0:
@@ -1123,6 +1182,8 @@ class ProxyManager:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            loop = self._loop
+        if loop is None or loop.is_closed():
             return
         if self._background_refresh_task is not None and not self._background_refresh_task.done():
             logger.debug(
@@ -1136,6 +1197,23 @@ class ProxyManager:
         self._background_refresh_task = loop.create_task(
             asyncio.to_thread(self._refresh_locked, reason)
         )
+
+    def _ensure_refresh_loop_running(self) -> None:
+        """Self-heal the periodic refresh loop when downloaders use the manager directly."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._loop = loop
+        if self._task is None or self._task.done():
+            self._task = loop.create_task(self._refresh_loop())
+            self._task.add_done_callback(self._on_refresh_loop_done)
+            logger.warning(
+                {
+                    "event": "proxy_manager.refresh_loop_restarted",
+                    "msg": "Periodic proxy refresh loop was not running; restarted from scan_and_get_proxy",
+                }
+            )
 
     def _ensure_backup_proxy_locked(self) -> None:
         """Ensure the protected backup proxy is present in the live pool.
@@ -1161,25 +1239,9 @@ class ProxyManager:
                 self._ensure_backup_proxy_locked()
             _save_proxy_cache(self._proxy_records, self._cache_file)
 
-        candidates = _fetch_all_proxy_lists(self._sources)
-        before_total = self.working_count()
-        before_public = self.public_working_count()
-        if not candidates:
-            logger.warning(
-                {
-                    "event": "proxy_manager.empty_list",
-                    "before": before_total,
-                    "before_public": before_public,
-                    "msg": "All proxy lists are empty; using backup proxy if pool is empty",
-                }
-            )
-            with self._lock:
-                if not self._working:
-                    self._ensure_backup_proxy_locked()
-                    _save_proxy_cache(self._proxy_records, self._cache_file)
-            return
         incremental_validated: dict[str, float] = {}
         incremental_lock = threading.Lock()
+        validated_candidate_seen: set[str] = set()
 
         def _record_valid_proxy(url: str, speed: float) -> None:
             with incremental_lock:
@@ -1204,7 +1266,47 @@ class ProxyManager:
                 self._ensure_backup_proxy_locked()
                 _save_proxy_cache(self._proxy_records, self._cache_file)
 
-        working_with_speeds = _validate_proxies(candidates, on_valid=_record_valid_proxy)
+        def _validate_fetched_batch(batch: list[str]) -> None:
+            new_batch: list[str] = []
+            with incremental_lock:
+                for url in batch:
+                    if url not in validated_candidate_seen:
+                        validated_candidate_seen.add(url)
+                        new_batch.append(url)
+            if not new_batch:
+                return
+            logger.info(
+                {
+                    "event": "proxy_manager.validate_fetched_batch_start",
+                    "candidates": len(new_batch),
+                }
+            )
+            _validate_proxies(new_batch, on_valid=_record_valid_proxy)
+
+        candidates = _fetch_all_proxy_lists(self._sources, on_batch=_validate_fetched_batch)
+        before_total = self.working_count()
+        before_public = self.public_working_count()
+        if not candidates:
+            logger.warning(
+                {
+                    "event": "proxy_manager.empty_list",
+                    "before": before_total,
+                    "before_public": before_public,
+                    "msg": "All proxy lists are empty; using backup proxy if pool is empty",
+                }
+            )
+            with self._lock:
+                if not self._working:
+                    self._ensure_backup_proxy_locked()
+                    _save_proxy_cache(self._proxy_records, self._cache_file)
+            return
+
+        remaining_candidates = [url for url in candidates if url not in validated_candidate_seen]
+        if remaining_candidates:
+            _validate_proxies(remaining_candidates, on_valid=_record_valid_proxy)
+
+        with incremental_lock:
+            working_with_speeds = list(incremental_validated.items())
         if not working_with_speeds:
             logger.warning(
                 {
