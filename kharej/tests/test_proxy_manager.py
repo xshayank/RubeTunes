@@ -61,6 +61,35 @@ def test_concurrent_empty_pool_requests_share_one_refill(tmp_path: Path) -> None
     assert mgr.refresh_calls == 1
 
 
+def test_start_schedules_refresh_without_blocking(tmp_path: Path) -> None:
+    mgr = _RefillingProxyManager(tmp_path / "proxies.json", delay=0.1)
+
+    async def _run() -> None:
+        started = time.perf_counter()
+        await mgr.start()
+        elapsed = time.perf_counter() - started
+        assert elapsed < 0.05
+        assert mgr._task is not None and not mgr._task.done()
+        assert mgr._background_refresh_task is not None
+        await mgr.stop()
+
+    asyncio.run(_run())
+
+
+def test_scan_self_starts_refresh_loop_when_not_started(tmp_path: Path) -> None:
+    mgr = _RefillingProxyManager(tmp_path / "proxies.json", delay=0.01)
+
+    async def _run() -> str | None:
+        proxy = await mgr.scan_and_get_proxy()
+        await asyncio.sleep(0.05)
+        assert mgr._task is not None and not mgr._task.done()
+        await mgr.stop()
+        return proxy
+
+    assert asyncio.run(_run()) == _BACKUP_PROXY_URL
+    assert mgr.refresh_calls == 1
+
+
 def test_stale_proxy_remains_usable_as_fallback(tmp_path: Path) -> None:
     mgr = ProxyManager(cache_file=tmp_path / "proxies.json")
     with mgr._lock:
