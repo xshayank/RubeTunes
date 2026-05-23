@@ -156,13 +156,20 @@ _MIN_SPEED_BPS: float = 30 * 1024  # 30 KB/s
 #: Seconds before a validation attempt is considered failed.
 _VALIDATE_TIMEOUT: float = 12.0
 
-#: How many proxies to validate concurrently.
-_VALIDATE_WORKERS: int = 60
+#: How many proxies to validate concurrently. Keep this conservative because
+#: each validation performs network I/O through requests and can otherwise
+#: create enough runnable threads to saturate small VPS CPUs.
+_VALIDATE_WORKERS: int = 16
 
 #: Maximum candidates to validate per refresh. Raw public lists can contain
 #: tens of thousands of mostly-dead proxies; capping keeps each refill bounded
 #: and lets the next periodic/background refresh sample another batch.
 _MAX_VALIDATE_CANDIDATES: int = 750
+
+#: Persist incremental validation progress every N accepted proxies instead of
+#: on every single proxy. This avoids heavy JSON write/sort churn during large
+#: refreshes while still making progress visible before the final write.
+_CACHE_WRITE_EVERY_VALID_PROXY: int = 25
 
 #: URL used to verify that the proxy can reach YouTube's HTTPS endpoints.
 #: A 204 response proves that the proxy supports HTTPS CONNECT tunnelling to
@@ -703,13 +710,15 @@ def _fetch_raw_proxy_lists(
     def _fetch_and_collect(item: tuple[str, str]) -> None:
         protocol, url = item
         proxies = _fetch_raw_proxy_source(protocol, url)
-        if proxies and on_batch is not None:
-            on_batch(proxies)
         with lock:
+            batch: list[str] = []
             for proxy in proxies:
                 if proxy not in seen:
                     seen.add(proxy)
                     combined.append(proxy)
+                    batch.append(proxy)
+        if batch and on_batch is not None:
+            on_batch(batch)
 
     executor = ThreadPoolExecutor(max_workers=min(len(_RAW_PROXY_SOURCES), _FETCH_WORKERS))
     futures = [executor.submit(_fetch_and_collect, item) for item in _RAW_PROXY_SOURCES]
@@ -762,13 +771,15 @@ def _fetch_all_proxy_lists(
 
     def _fetch_and_collect(source: str) -> None:
         proxies = _fetch_proxies_from_source(source)
-        if proxies and on_batch is not None:
-            on_batch(proxies)
         with lock:
+            batch: list[str] = []
             for proxy in proxies:
                 if proxy not in seen:
                     seen.add(proxy)
                     combined.append(proxy)
+                    batch.append(proxy)
+        if batch and on_batch is not None:
+            on_batch(batch)
 
     executor = ThreadPoolExecutor(max_workers=min(len(sources), _FETCH_WORKERS))
     futures = [executor.submit(_fetch_and_collect, source) for source in sources]
@@ -1241,9 +1252,20 @@ class ProxyManager:
 
         incremental_validated: dict[str, float] = {}
         incremental_lock = threading.Lock()
-        validated_candidate_seen: set[str] = set()
+        pending_cache_writes = 0
+
+        def _flush_incremental_cache_locked() -> None:
+            self._working.sort(
+                key=lambda u: _compute_proxy_weight(
+                    self._proxy_records.get(u, _ProxyRecord(speed_bps=_MIN_SPEED_BPS))
+                ),
+                reverse=True,
+            )
+            self._ensure_backup_proxy_locked()
+            _save_proxy_cache(self._proxy_records, self._cache_file)
 
         def _record_valid_proxy(url: str, speed: float) -> None:
+            nonlocal pending_cache_writes
             with incremental_lock:
                 incremental_validated[url] = speed
             with self._lock:
@@ -1257,33 +1279,21 @@ class ProxyManager:
                     self._proxy_records[url] = _ProxyRecord(speed_bps=speed)
                 if url not in self._working:
                     self._working.append(url)
-                self._working.sort(
-                    key=lambda u: _compute_proxy_weight(
-                        self._proxy_records.get(u, _ProxyRecord(speed_bps=_MIN_SPEED_BPS))
-                    ),
-                    reverse=True,
-                )
-                self._ensure_backup_proxy_locked()
-                _save_proxy_cache(self._proxy_records, self._cache_file)
+                pending_cache_writes += 1
+                if pending_cache_writes >= _CACHE_WRITE_EVERY_VALID_PROXY:
+                    _flush_incremental_cache_locked()
+                    pending_cache_writes = 0
 
-        def _validate_fetched_batch(batch: list[str]) -> None:
-            new_batch: list[str] = []
-            with incremental_lock:
-                for url in batch:
-                    if url not in validated_candidate_seen:
-                        validated_candidate_seen.add(url)
-                        new_batch.append(url)
-            if not new_batch:
-                return
+        def _on_fetched_batch(batch: list[str]) -> None:
             logger.info(
                 {
-                    "event": "proxy_manager.validate_fetched_batch_start",
-                    "candidates": len(new_batch),
+                    "event": "proxy_manager.fetched_batch_ready",
+                    "candidates": len(batch),
+                    "msg": "Batch fetched and queued for the single bounded validation pool",
                 }
             )
-            _validate_proxies(new_batch, on_valid=_record_valid_proxy)
 
-        candidates = _fetch_all_proxy_lists(self._sources, on_batch=_validate_fetched_batch)
+        candidates = _fetch_all_proxy_lists(self._sources, on_batch=_on_fetched_batch)
         before_total = self.working_count()
         before_public = self.public_working_count()
         if not candidates:
@@ -1301,9 +1311,10 @@ class ProxyManager:
                     _save_proxy_cache(self._proxy_records, self._cache_file)
             return
 
-        remaining_candidates = [url for url in candidates if url not in validated_candidate_seen]
-        if remaining_candidates:
-            _validate_proxies(remaining_candidates, on_valid=_record_valid_proxy)
+        _validate_proxies(candidates, on_valid=_record_valid_proxy)
+        with self._lock:
+            if pending_cache_writes:
+                _flush_incremental_cache_locked()
 
         with incremental_lock:
             working_with_speeds = list(incremental_validated.items())
