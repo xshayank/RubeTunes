@@ -315,7 +315,35 @@ def test_refresh_writes_cache_before_and_during_validation(tmp_path: Path, monke
 
     assert cache.exists()
     assert _BACKUP_PROXY_URL in observed_cache_states[0]
-    assert "http://10.0.0.5:8080" in observed_cache_states[1]
+    assert "http://10.0.0.5:8080" in cache.read_text()
+
+
+def test_refresh_uses_single_validation_pass_for_fetched_batches(tmp_path: Path, monkeypatch) -> None:
+    validate_calls = 0
+
+    def _fake_fetch_raw_for_cache(*, on_batch=None):
+        if on_batch is not None:
+            on_batch(["http://10.0.0.5:8080"])
+            on_batch(["http://10.0.0.6:8080"])
+        return ["http://10.0.0.5:8080", "http://10.0.0.6:8080"]
+
+    def _fake_validate(candidates, *, on_valid=None):
+        nonlocal validate_calls
+        validate_calls += 1
+        results = [(url, 100_000.0) for url in candidates]
+        if on_valid is not None:
+            for url, speed in results:
+                on_valid(url, speed)
+        return results
+
+    monkeypatch.setattr("kharej.proxy_manager._fetch_raw_proxy_lists", _fake_fetch_raw_for_cache)
+    monkeypatch.setattr("kharej.proxy_manager._validate_proxies", _fake_validate)
+    mgr = ProxyManager(sources=[], cache_file=tmp_path / "proxies.json")
+
+    mgr._refresh()
+
+    assert validate_calls == 1
+    assert mgr.public_working_count() == 2
 
 
 def test_backup_proxy_is_last_resort_when_public_proxies_exist(tmp_path: Path) -> None:
